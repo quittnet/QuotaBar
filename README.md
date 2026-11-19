@@ -4,6 +4,8 @@ QuotaBar shows Codex and Claude usage in the macOS menu bar. **Amount Left** is 
 
 <img src="docs/images/dropdown.png" width="332" alt="Codex and Claude percentages in the macOS menu bar above the open QuotaBar dropdown, which shows usage limits and reset countdowns.">
 
+Live usage requires a signed-in command-line interface (CLI) for each provider you enable. QuotaBar detects supported bundled CLIs automatically. The first time it detects a missing CLI, it opens the dropdown with that provider’s installation guide. Follow the guide, sign in, then click **Refresh**. [Install Codex CLI](https://developers.openai.com/codex/cli/) · [Install Claude Code](https://code.claude.com/docs/en/quickstart)
+
 Choose **Settings → Help** for a quick guide to clicks, shortcuts, and usage readings. Click the menu bar item to open or close the dropdown. With both providers enabled, the dropdown shows both providers’ limits above Details, even with a single menu-bar badge. In Details, select Codex or Claude to switch between their token totals and reset controls. An unavailable reading opens its details with either click. Each current usage bar shows a countdown to its reported reset. Refresh and Settings stay in the bottom-right corner. Expand **Details** once to see available resets and local token history together. QuotaBar remembers whether Details is expanded across providers and launches.
 
 Use **Settings → Providers** to choose ChatGPT (Codex) only, Claude only, or both. A single-provider choice hides the other provider and stops its usage checks. You can change this at any time.

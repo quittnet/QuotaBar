@@ -25,6 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private final class ProviderState {
         var reading: QuotaReading?
         var failure: String?
+        var missingCLI = false
         var refreshing = false
         var generation = 0
         var needsVerification = false
@@ -189,7 +190,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return Dashboard(
             display: display,
             summaries: enabledProviders.map {
-                Dashboard.Summary(display: display(for: $0), failure: state(for: $0).failure)
+                Dashboard.Summary(
+                    display: display(for: $0), failure: state(for: $0).failure, missingCLI: state(for: $0).missingCLI)
             }, nextAutoRefresh: nextRefreshDate,
             selectProvider: { [weak self] in self?.selectProvider($0) },
             providerSelection: providerSelection,
@@ -641,6 +643,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let retryOnFailure = retryLaunchReadOnFailure.remove(source) != nil
             switch result {
             case .success(let reading):
+                state.missingCLI = false
                 state.reading = reading
                 state.needsVerification = false
                 state.failure = nil
@@ -651,6 +654,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 state.retryAt = source == .codex && resets.awaitingUpdatedBalance ? Date().addingTimeInterval(15) : nil
             case .failure(let error):
+                state.missingCLI =
+                    (error as? QuotaError) == .codexNotFound || (error as? ClaudeUsageClient.Failure) == .notInstalled
                 state.failure =
                     (error as? LocalizedError)?.errorDescription
                     ?? "Couldn’t read \(source.name) limits. Try refreshing."
@@ -667,7 +672,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 state.retryAt = Date().addingTimeInterval(delay)
                 if retryOnFailure { refresh(source: source) }
             }
-            if enabledProviders.contains(source) { updateViews() }
+            if enabledProviders.contains(source) {
+                updateViews()
+                if state.missingCLI, !defaults.bool(forKey: "didPresentCLISetup"), let button = item?.button {
+                    if !dropdown.isVisible {
+                        dashboard.rootView = makePanel()
+                        dropdown.show(under: button)
+                    }
+                    if dropdown.isVisible { defaults.set(true, forKey: "didPresentCLISetup") }
+                }
+            }
         }
     }
 

@@ -5,6 +5,7 @@ struct Dashboard: View {
     struct Summary {
         let display: QuotaDisplay
         let failure: String?
+        let missingCLI: Bool
     }
 
     let display: QuotaDisplay
@@ -55,7 +56,7 @@ struct Dashboard: View {
                     Divider().padding(.vertical, 12)
                 }
                 VStack(alignment: .leading, spacing: 0) {
-                    limitSection(summary.display, failure: summary.failure)
+                    limitSection(summary.display, failure: summary.failure, missingCLI: summary.missingCLI)
                 }
                 .accessibilityElement(children: .contain)
                 .accessibilityIdentifier("quota-summary-" + summary.display.provider.rawValue)
@@ -74,7 +75,7 @@ struct Dashboard: View {
     }
 
     @ViewBuilder
-    private func limitSection(_ display: QuotaDisplay, failure: String?) -> some View {
+    private func limitSection(_ display: QuotaDisplay, failure: String?, missingCLI: Bool) -> some View {
         HStack(alignment: .firstTextBaseline) {
             Text(display.provider.name)
                 .font(.system(size: 15, weight: .semibold))
@@ -87,7 +88,22 @@ struct Dashboard: View {
         }
         .padding(.bottom, 12)
 
-        if let restriction = display.restrictionMessage {
+        if missingCLI {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(
+                    display.provider == .codex
+                        ? "Install the Codex command-line interface (CLI), sign in with ChatGPT, then click Refresh."
+                        : "Install the Claude Code command-line interface (CLI), sign in with your Claude subscription, then click Refresh."
+                )
+                .fixedSize(horizontal: false, vertical: true)
+                Link(
+                    display.provider == .codex ? "Codex CLI installation guide" : "Claude Code installation guide",
+                    destination: display.provider == .codex
+                        ? URL(string: "https://developers.openai.com/codex/cli/")!
+                        : URL(string: "https://code.claude.com/docs/en/quickstart")!)
+            }
+            .font(.callout)
+        } else if let restriction = display.restrictionMessage {
             Text(restriction).font(.callout).foregroundStyle(.secondary)
         } else if let failure, !display.refreshing {
             Label(failure, systemImage: "exclamationmark.circle")
