@@ -38,3 +38,4 @@ Tests/PresentationChecks.swift
 Tests/RefreshChecks.swift
 Tests/ResetFlowChecks.swift
 Tests/TokenChecks.swift
+docs/images/dropdown.png

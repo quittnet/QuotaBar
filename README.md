@@ -2,6 +2,8 @@
 
 QuotaBar shows Codex and Claude usage in the macOS menu bar. **Amount Left** is the default. Secondary-click the menu bar item (two-finger click or Control-click), or click the percentage inside the dropdown, to switch between **Amount Left** and **Amount Used**. You can also choose **Settings → Show Percentage As**. The choice applies to both providers and survives relaunch. Each status reading uses the most constrained active usage window.
 
+<img src="docs/images/dropdown.png" width="316" alt="QuotaBar dropdown showing the remaining Codex weekly limit and Claude five-hour and weekly limits, with a reset countdown beneath each bar.">
+
 Choose **Settings → Help** for a quick guide to clicks, shortcuts, and usage readings. Click the menu bar item to open or close the dropdown. With both providers enabled, the dropdown shows both providers’ limits above Details, even with a single menu-bar badge. In Details, select Codex or Claude to switch between their token totals and reset controls. An unavailable reading opens its details with either click. Each current usage bar shows a countdown to its reported reset. Refresh and Settings stay in the bottom-right corner. Expand **Details** once to see available resets and local token history together. QuotaBar remembers whether Details is expanded across providers and launches.
 
 Use **Settings → Providers** to choose ChatGPT (Codex) only, Claude only, or both. A single-provider choice hides the other provider and stops its usage checks. You can change this at any time.
