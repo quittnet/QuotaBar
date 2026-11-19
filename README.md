@@ -1,0 +1,49 @@
+# QuotaBar
+
+QuotaBar shows Codex and Claude usage in the macOS menu bar. **Amount Left** is the default. Secondary-click the menu bar item (two-finger click or Control-click), or click the percentage inside the dropdown, to switch between **Amount Left** and **Amount Used**. You can also choose **Settings → Show Percentage As**. The choice applies to both providers and survives relaunch. Each status reading uses the most constrained active usage window.
+
+Choose **Settings → Help** for a quick guide to clicks, shortcuts, and usage readings. Click the menu bar item to open or close the dropdown. With both providers enabled, the dropdown shows both providers’ limits above Details, even with a single menu-bar badge. In Details, select Codex or Claude to switch between their token totals and reset controls. An unavailable reading opens its details with either click. Each current usage bar shows a countdown to its reported reset. Refresh and Settings stay in the bottom-right corner. Expand **Details** once to see available resets and local token history together. QuotaBar remembers whether Details is expanded across providers and launches.
+
+Use **Settings → Providers** to choose ChatGPT (Codex) only, Claude only, or both. A single-provider choice hides the other provider and stops its usage checks. You can change this at any time.
+
+Open **Settings** to change the menu-bar layout. **Both Providers** shows both logos and percentages side by side. **Logo and Percentage** and **Percentage Only** show the selected provider. On first launch, QuotaBar looks for local history directories. If it finds both providers, it shows both. If it finds neither, it starts with Codex.
+
+Enabled providers refresh at launch, every three minutes, after wake, and when the Mac reconnects or switches networks. Three dots pulse while QuotaBar waits for a current reading, or stay still when Reduce Motion is enabled. While the Mac is offline, the Codex badge shows a dash. Click the refresh button or press ⌘R in the dropdown for an immediate update and a new three-minute countdown. Hover over a percentage for its source and report time. After a failed read, a scheduled reset, a reported Codex restriction, or 3 minutes 15 seconds without a new report, the menu shows a dash. Details identifies historical readings by time. Provider activity between refreshes can change the actual balance.
+
+A failed quota read withdraws the menu percentage and shows the reason in the compact dropdown. Transient Codex failures retry after 5, 15, 30, then 60 seconds until a read succeeds. The regular three-minute check and manual refresh can run sooner. When offline, QuotaBar waits for a network connection. A rejected request prompts sign-in only if the CLI confirms it. Read retries never spend reset credits.
+
+## Codex
+
+QuotaBar asks the installed, signed-in Codex CLI for account limits. When Codex reports available usage resets, the dropdown shows their count and next known expiry. Choose **Use Reset** and then **Use 1 Reset** to spend one on eligible Codex limits. QuotaBar selects the available credit with the earliest reported expiry when details are available. Codex chooses the credit when it supplies only a count. After a connection interruption, **Retry Same Reset…** reuses the saved request so the same action can be applied only once.
+
+## Claude
+
+Enable Claude in **Settings → Providers** and sign in to a supported Claude Code CLI with your subscription. QuotaBar asks the local CLI for account usage on launch, every three minutes, on wake or reconnect, and when you press Refresh or ⌘R. Claude Code handles the account request in the background. It does not need an open Terminal window or a chat message. The reported five-hour and weekly limits are account-wide. Local token totals cover Claude Code history on this Mac. Claude Code supplies scheduled reset times. Manual Claude resets are unavailable in QuotaBar.
+
+The automatic check uses Claude Code’s version-dependent usage control request. If the installed CLI reports that the request is unsupported, QuotaBar can still read the older status-line feed. **Connect Claude Code** in that mode preserves existing status-line output. Upgrading Claude Code enables automatic checks on supported versions. A failed account read hides the current percentage until the next successful check. [Claude Code usage command](https://code.claude.com/docs/en/commands) · [Claude Code status-line fields](https://code.claude.com/docs/en/statusline#rate-limits)
+
+## Token history
+
+The dropdown shows tokens recorded on this Mac for the selected provider, across all retained history, the last 30 days, the last 7 days, yesterday, and today. The 7-day and 30-day ranges include today. Yesterday covers the previous local calendar day. Token totals refresh every three minutes, when the dropdown opens, and while it stays open. Missing records are shown as unavailable, and incomplete scans are marked as partial. A saved Claude lifetime total can still appear when transcripts are missing.
+
+Codex totals include local active and archived sessions, including compressed logs when zstd is installed. Claude totals include Claude Code project and subagent transcripts, counting input, cache creation, cache reads, and output once per response. Removing a local transcript removes its contribution on the next scan. When available, **All time · Claude /stats** shows the lifetime total saved by Claude Code itself. It can include older activity and repeated response entries. **All retained sessions** and the four date ranges count each response once.
+
+## Privacy and permissions
+
+QuotaBar runs under the signed-in macOS user. It reads enabled providers’ local session logs to count tokens. The Codex cache contains file paths, session and response identifiers, timestamps, and token counts. The Claude quota cache contains reported windows, timestamps, and hashed session identifiers. QuotaBar does not save prompt or response text in these caches. Reset recovery stores request identifiers, credit references, and account fingerprints locally.
+
+QuotaBar has no analytics service or direct usage-data upload. It requests subscription limits through the installed provider CLIs, which handle their own authentication and network traffic. Connecting the legacy Claude Code status-line feed updates the user’s status-line settings after an explicit click and keeps a private backup of the previous settings. A Codex reset requires a separate confirmation.
+
+## Build and checks
+
+On macOS 14 or later with Xcode Command Line Tools, run `./build.sh` and open `build/QuotaBar.app`. To start the app at login on another Mac, add it under System Settings → General → Login Items & Extensions.
+
+Run `./check.sh` for compiler checks and quota, reset, presentation, and token fixtures. With Swift 6 command-line tools, `./check.sh --lint` also checks Swift style, shell syntax, and the bundle property list. Run `./check.sh --live` in a logged-in macOS session to exercise the menu-bar button, switch providers, and fetch live Codex account limits. The optional capture paths are PNGs for the Codex dropdown, Claude dropdown, light menu bar, and dark menu bar, followed by the combined compact dropdown and its Codex and Claude Details views, in that order.
+
+Run `./check.sh --timing` in a logged-in macOS session for a three-minute test with isolated histories and simulated readings. It checks automatic updates with the dropdown closed, a network failure, and recovery on a wake notification.
+
+Run `./check.sh --network` to exercise startup without connectivity, reconnects, network switches, and late responses from a previous connection using simulated readings.
+
+For screenshots with simulated quota readings and isolated token history, run `QUOTABAR_TEST_FIXTURES=1 ./check.sh --live` with the desired capture paths. Ordinary live checks and screenshots can contain the current user’s usage.
+
+Run `./package.sh` with a release directory to build the app and source archives from the release manifest. The local build is ad-hoc signed. Distribution outside the Mac App Store with a verified publisher requires Developer ID signing and Apple notarization. [Apple distribution guidance](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
