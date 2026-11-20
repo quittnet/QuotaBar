@@ -839,21 +839,28 @@ enum MenuChecks {
             abs(contentSize.height - fittingSize.height) <= 1,
             "Hosting view height \(contentSize.height) differs from fitting height \(fittingSize.height).")
         guard let content = dropdown.contentView,
-            let scroll = content.subviews.compactMap({ $0 as? NSScrollView }).first,
+            let body = host.view.superview,
             let footer = content.subviews.compactMap({ $0 as? NSHostingView<AnyView> }).first
-        else { preconditionFailure("The panel needs a separate body scroll view and fixed footer.") }
-        precondition(scroll.documentView === host.view)
+        else { preconditionFailure("The panel needs a fixed body and footer.") }
+        precondition(body.superview === content && host.view.enclosingScrollView == nil)
         precondition(footer.window === dropdown && footer.frame.height > 0)
         precondition(abs(footer.frame.minY) <= 1 && abs(footer.frame.maxX - content.bounds.maxX) <= 1)
         precondition(abs(footer.frame.width - contentSize.width) <= 1)
-        precondition(abs(scroll.frame.minY - footer.frame.maxY) <= 1)
-        precondition(abs(scroll.frame.maxY - content.bounds.maxY) <= 1)
+        precondition(abs(body.frame.minY - footer.frame.maxY) <= 1)
+        precondition(abs(body.frame.maxY - content.bounds.maxY) <= 1)
         guard let screen = dropdown.screen else { preconditionFailure("The dropdown needs a screen.") }
         let availableHeight = screen.visibleFrame.insetBy(dx: 4, dy: 4).height
         precondition(
             abs(dropdown.frame.height - min(ceil(contentSize.height) + footer.frame.height, availableHeight)) <= 1,
             "The panel must fit its body and fixed footer within the screen.")
-        precondition(scroll.contentView.bounds.height <= contentSize.height + 1)
+        let frame = body.frame
+        let bounds = host.view.bounds
+        for delta: Int32 in [40, -40] {
+            let wheel = CGEvent(
+                scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: delta, wheel2: 0, wheel3: 0)!
+            host.view.scrollWheel(with: NSEvent(cgEvent: wheel)!)
+            precondition(body.frame == frame && host.view.bounds == bounds)
+        }
 
     }
 
@@ -863,7 +870,7 @@ enum MenuChecks {
         checkContentFits(host, in: dropdown)
         let expanded = dropdown.frame
         guard let footer = dropdown.contentView?.subviews.compactMap({ $0 as? NSHostingView<AnyView> }).first else {
-            preconditionFailure("The dropdown footer must stay outside its scrolling body.")
+            preconditionFailure("The dropdown footer must stay below its fixed body.")
         }
         let footerFrame = footer.frame
         precondition(expanded.height > compact.height && abs(expanded.maxY - compact.maxY) <= 1)

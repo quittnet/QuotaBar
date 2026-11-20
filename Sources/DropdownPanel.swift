@@ -4,7 +4,7 @@ import SwiftUI
 @MainActor
 final class DropdownPanel: NSPanel {
     private let dashboard: NSHostingController<Dashboard>
-    private let scroll = NSScrollView()
+    private let body = NSView()
     private let footer: NSHostingView<AnyView>
     private weak var anchor: NSStatusBarButton?
     private var globalClick: Any?
@@ -49,13 +49,9 @@ final class DropdownPanel: NSPanel {
         let container = NSViewController()
         container.view = surface
         container.addChild(dashboard)
-        scroll.drawsBackground = false
-        scroll.hasVerticalScroller = true
-        scroll.scrollerStyle = .overlay
-        scroll.autohidesScrollers = true
-        surface.addSubview(scroll)
+        surface.addSubview(body)
         surface.addSubview(footer)
-        scroll.documentView = dashboard.view
+        body.addSubview(dashboard.view)
         contentViewController = container
     }
 
@@ -87,8 +83,13 @@ final class DropdownPanel: NSPanel {
             invalidateShadow()
         }
         footer.frame = NSRect(x: 0, y: 0, width: width, height: footerHeight)
-        scroll.frame = NSRect(x: 0, y: footerHeight, width: width, height: max(0, height - footerHeight))
-        dashboard.view.setFrameSize(NSSize(width: width, height: ceil(size.height)))
+        let bodyHeight = ceil(size.height)
+        let availableHeight = max(0, height - footerHeight)
+        let scale = min(1, availableHeight / max(1, bodyHeight))
+        body.frame = NSRect(
+            x: (width - width * scale) / 2, y: footerHeight, width: width * scale, height: availableHeight)
+        body.bounds = NSRect(x: 0, y: 0, width: width, height: bodyHeight)
+        dashboard.view.frame = body.bounds
     }
 
     override func cancelOperation(_ sender: Any?) { dismiss() }
