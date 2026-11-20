@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 @MainActor
@@ -10,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var menuLayout: MenuBarLayout
     private(set) var percentageMode: PercentageMode
     private(set) var detailsExpanded: Bool
+    private var updaterObservation: AnyCancellable?
     private var badges: MenuBarBadges?
     private var lastStatusClickTime: TimeInterval?
     private var modeFeedbackTimer: Timer?
@@ -121,6 +123,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         dashboard = NSHostingController(rootView: makePanel())
         dashboard.sizingOptions = []
         dropdown = DropdownPanel(dashboard: dashboard)
+        updaterObservation = UpdateController.shared.objectWillChange.sink { [weak self] _ in
+            Task { @MainActor in self?.updateViews() }
+        }
+        UpdateController.shared.start()
         dropdown.onDismiss = { [weak self] in self?.resets.cancel() }
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(wokeUp),
@@ -215,6 +221,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             cancelReset: { [weak self] in self?.cancelReset() },
             confirmReset: { [weak self] in self?.confirmReset() },
             refresh: { [weak self] in self?.refreshFromPanel() },
+            checkForUpdates: { [weak self] in
+                self?.dropdown.dismiss()
+                NSApp.activate()
+                UpdateController.shared.checkForUpdates()
+            },
             showHelp: { [weak self] in self?.showHelp() },
             quit: { NSApp.terminate(nil) })
     }

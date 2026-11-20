@@ -33,6 +33,17 @@ private final class ClaudeFixture: @unchecked Sendable {
     }
 }
 
+private final class FixtureReads: @unchecked Sendable {
+    private let lock = NSLock()
+    private var counts: [UsageProvider: Int] = [:]
+
+    func record(_ provider: UsageProvider) {
+        lock.withLock { counts[provider, default: 0] += 1 }
+    }
+
+    func count(_ provider: UsageProvider) -> Int { lock.withLock { counts[provider, default: 0] } }
+}
+
 // Run in a logged-in macOS session. Only this temporary test app's own views are inspected.
 @main
 enum MenuChecks {
@@ -66,6 +77,8 @@ enum MenuChecks {
         case checkingConfirmationFrame(NSRect)
         case waitingForRefresh(Date)
         case waitingForMock
+        case startingStress
+        case waitingForStress(Int, Int, Date)
     }
 
     @MainActor static func main() {
@@ -73,10 +86,14 @@ enum MenuChecks {
         let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(
             "QuotaBar-check-" + UUID().uuidString)
         let mock = MockRedemption()
+        let reads = FixtureReads()
         let claude = ClaudeFixture()
         let suite = "QuotaBar-menu-test-" + UUID().uuidString
         let preferences = UserDefaults(suiteName: suite)!
         let useFixtures = ProcessInfo.processInfo.environment["QUOTABAR_TEST_FIXTURES"] == "1"
+        let stress = ProcessInfo.processInfo.environment["QUOTABAR_STRESS"] == "1"
+        precondition(!stress || useFixtures, "UI stress requires isolated provider fixtures.")
+        if stress { setbuf(stdout, nil) }
         defer { preferences.removePersistentDomain(forName: suite) }
         // Launch with Claude selected so the initial Codex reading must load in the background.
         preferences.set(UsageProvider.claude.rawValue, forKey: "selectedProvider")
@@ -88,6 +105,7 @@ enum MenuChecks {
                 guard useFixtures else {
                     return try QuotaSource.read(includeCountOnlyIdentity: includeCountOnlyIdentity)
                 }
+                reads.record(.codex)
                 let now = Date()
                 return QuotaReading(
                     fetchedAt: now,
@@ -96,7 +114,11 @@ enum MenuChecks {
                         QuotaWindow(minutes: 10080, remaining: 46, resetsAt: now.addingTimeInterval(86400)),
                     ],
                     resetCredits: .init(availableCount: 1), resetCountOnlyFingerprint: "test-account")
-            }, readClaude: { claude.get() },
+            },
+            readClaude: {
+                reads.record(.claude)
+                return claude.get()
+            },
             redeem: { mock.submit($0) })
         let initialLayout: MenuBarLayout = UsageProvider.detected().count > 1 ? .both : .percentage
         precondition(controller.menuLayout == initialLayout)
@@ -120,6 +142,11 @@ enum MenuChecks {
                     exit(1)
                 }
                 guard let item = controller.item, let button = item.button else { return }
+                if case .waitingForStress(_, _, let started) = step {
+                    precondition(
+                        Date().timeIntervalSince(started) < 10,
+                        "The provider refresh burst did not settle within ten seconds.")
+                }
                 if case .startingCombined = step {
                     precondition(controller.provider == .claude)
                     if initialLayout == .percentage {
@@ -419,9 +446,14 @@ enum MenuChecks {
                     step = .opening
                     return
                 }
-                guard !button.title.isEmpty else { return }
-                precondition(item.isVisible && button.window != nil && button.image == nil)
-                precondition((button.title.last == "%" || button.title == "···") && !button.title.contains(" "))
+                switch step {
+                case .waitingForStress:
+                    break
+                default:
+                    guard !button.title.isEmpty else { return }
+                    precondition(item.isVisible && button.window != nil && button.image == nil)
+                    precondition((button.title.last == "%" || button.title == "···") && !button.title.contains(" "))
+                }
                 if case .opening = step {
                     guard button.title != "–%", button.title != "···", controller.tokenTotals != nil else { return }
                     print("The percentage-only status item is attached.")
@@ -613,6 +645,53 @@ enum MenuChecks {
                     precondition(host.rootView.resetNotice == "Reset applied." && mock.count == 1)
                     print(
                         "Confirmation, cancellation, one simulated redemption, double-click guard and refresh passed.")
+                    if stress {
+                        step = .startingStress
+                        return
+                    }
+                    finish(dropdown: dropdown, scratch: scratch, preferencesSuite: suite, app: app)
+                    return
+                case .startingStress:
+                    guard host.rootView.summaries.allSatisfy({ !$0.display.refreshing }),
+                        !host.rootView.countingTokens
+                    else { return }
+                    let codexBefore = reads.count(.codex)
+                    let claudeBefore = reads.count(.claude)
+                    stressInteractions(controller, button: button, preferences: preferences, app: app)
+                    precondition(mock.count == 1)
+                    step = .waitingForStress(codexBefore, claudeBefore, Date())
+                    return
+                case .waitingForStress(let codexBefore, let claudeBefore, _):
+                    guard
+                        host.rootView.summaries.allSatisfy({ $0.display.hasCurrentPercentage && !$0.display.refreshing }
+                        ),
+                        !host.rootView.countingTokens
+                    else { return }
+                    precondition((1...2).contains(reads.count(.codex) - codexBefore))
+                    precondition((1...2).contains(reads.count(.claude) - claudeBefore))
+                    precondition(host.rootView.summaries.map(\.display.title) == ["46%", "52%"])
+                    precondition(mock.count == 1 && host.rootView.resetPhase == .ready)
+                    for _ in 0..<100 {
+                        controller.handleClick(on: button, at: nil, secondaryClick: true)
+                        precondition(controller.percentageMode == .used && dropdown.isVisible)
+                        controller.handleClick(on: button, at: nil, secondaryClick: true)
+                        precondition(controller.percentageMode == .remaining && dropdown.isVisible)
+                    }
+                    checkContentFits(host, in: dropdown)
+                    let restored = AppDelegate(defaults: preferences)
+                    precondition(restored.providerSelection == .both && restored.provider == .codex)
+                    precondition(restored.menuLayout == .both && restored.percentageMode == .remaining)
+                    precondition(!restored.detailsExpanded)
+                    host.rootView.showHelp()
+                    guard let help = app.windows.first(where: { $0.title == "QuotaBar Help" }) else {
+                        preconditionFailure("Help must open its window.")
+                    }
+                    precondition(help.isVisible && !dropdown.isVisible)
+                    help.performClose(nil)
+                    precondition(!help.isVisible)
+                    print(
+                        "UI stress passed: 60 settings/provider/layout cycles, 200 secondary clicks, 121 refresh requests, fixed scroll bounds, saved preferences, and at most two reads per provider."
+                    )
                     finish(dropdown: dropdown, scratch: scratch, preferencesSuite: suite, app: app)
                     return
                 }
@@ -621,6 +700,63 @@ enum MenuChecks {
             }
         }
         withExtendedLifetime(controller) { app.run() }
+    }
+
+    @MainActor private static func stressInteractions(
+        _ controller: AppDelegate, button: NSStatusBarButton, preferences: UserDefaults, app: NSApplication
+    ) {
+        let host = controller.dashboard!
+        let dropdown = controller.dropdown!
+        for iteration in 0..<60 {
+            let selection = ProviderSelection.allCases[iteration % ProviderSelection.allCases.count]
+            host.rootView.selectProviderSelection(selection)
+            precondition(controller.providerSelection == selection)
+            let expectedProviders = selection.singleProvider.map { [$0] } ?? UsageProvider.allCases
+            checkSummaryProviders(controller, expected: expectedProviders)
+            if let single = selection.singleProvider {
+                precondition(controller.provider == single && controller.menuLayout != .both)
+                host.rootView.selectLayout(.both)
+                precondition(controller.menuLayout != .both)
+            } else {
+                for provider in UsageProvider.allCases {
+                    host.rootView.selectProvider(provider)
+                    precondition(controller.provider == provider)
+                }
+                for layout in MenuBarLayout.allCases {
+                    host.rootView.selectLayout(layout)
+                    precondition(controller.menuLayout == layout)
+                    precondition(preferences.string(forKey: "menuBarLayout") == layout.rawValue)
+                }
+            }
+            for mode in PercentageMode.allCases {
+                host.rootView.selectPercentageMode(mode)
+                precondition(controller.percentageMode == mode)
+                precondition(preferences.string(forKey: "percentageMode") == mode.rawValue)
+            }
+            for expanded in [true, false] {
+                host.rootView.setDetailsExpanded(expanded)
+                precondition(controller.detailsExpanded == expanded)
+                checkContentFits(host, in: dropdown)
+            }
+            let modeBeforeClick = controller.percentageMode
+            button.performClick(nil)
+            precondition(!dropdown.isVisible && controller.percentageMode == modeBeforeClick)
+            button.performClick(nil)
+            precondition(dropdown.isVisible && controller.percentageMode == modeBeforeClick)
+            host.rootView.refresh()
+            sendKey("r", code: 15, modifiers: .command, to: dropdown, in: app)
+            if let next = host.rootView.nextAutoRefresh {
+                precondition((175...181).contains(next.timeIntervalSinceNow))
+            } else {
+                preconditionFailure("Refreshing must restart the countdown.")
+            }
+        }
+        host.rootView.selectProviderSelection(.both)
+        host.rootView.selectProvider(.codex)
+        host.rootView.selectLayout(.both)
+        host.rootView.selectPercentageMode(.remaining)
+        host.rootView.setDetailsExpanded(false)
+        host.rootView.refresh()
     }
 
     @MainActor private static func checkCombinedButton(_ item: NSStatusItem, button: NSStatusBarButton) -> String {

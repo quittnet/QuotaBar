@@ -61,6 +61,8 @@ final class UsageResets {
 
     private func restore() {
         do {
+            let receipts = try readCompletions()
+            hasCountOnlyReceipt = receipts.contains { $0.credit == nil }
             if let saved = try Self.read(ResetAttempt.self, at: file) {
                 if pending != saved || phase != .uncertain {
                     notice = "The last reset is unconfirmed. Retry the same request to check it."
@@ -69,9 +71,7 @@ final class UsageResets {
                 completedBalance = nil
                 phase = .uncertain
             } else {
-                let receipts = try readCompletions()
                 completedBalance = receipts.first
-                hasCountOnlyReceipt = receipts.contains { $0.credit == nil }
                 pending = nil
                 phase = .ready
                 notice = nil

@@ -47,6 +47,22 @@ QuotaBar runs under the signed-in macOS user. It reads enabled providers’ loca
 
 QuotaBar has no analytics service or direct usage-data upload. It requests subscription limits through the installed provider CLIs, which handle their own authentication and network traffic. Connecting the legacy Claude Code status-line feed updates the user’s status-line settings after an explicit click and keeps a private backup of the previous settings. A Codex reset requires a separate confirmation.
 
+## App updates
+
+Open the dropdown and choose **Settings → Check for Updates…**. If a newer release is available, choose **Install Update**, then **Install and Relaunch** when prompted. QuotaBar verifies the signed update feed and download before installing. You can enable **Automatically Check for Updates** to receive notifications. Usage refresh and ⌘R only refresh your usage.
+
+Users on v1.7.5 or earlier must download the first updater-enabled release manually. Move it to Applications and follow the first-launch instructions above. Subsequent updates use the installed app. [QuotaBar releases](https://github.com/quittnet/QuotaBar/releases)
+
+### Preparing an update
+
+The free release path uses Sparkle’s Ed25519 signature and ad-hoc macOS signing. The project contains the public key in `Resources/UpdatePublicKey.txt`. Its paired private key belongs in the release maintainer’s login Keychain under the Sparkle account `quotabar-updates`. Keep a secure backup of that key so future releases can update existing installations. [Sparkle signing guide](https://sparkle-project.org/documentation/#eddsa-ed25519-signatures)
+
+1. Increase the version and build number in `Resources/Info.plist`. Sparkle compares the integer build number.
+2. On the Apple Silicon release Mac, run `./check.sh --lint` and `./release-update.sh`. The script writes the signed app archive, signed feed and checksums under `release-updates/v<VERSION>/`.
+3. To publish, attach **QuotaBar-macOS.zip**, **appcast.xml**, and **SHA256SUMS.txt** from that same directory to the matching GitHub release tag, then mark it latest. The archive must match the exact bytes signed in the feed. The build and release scripts only create local files.
+
+For a notarized release, set `QUOTABAR_SIGN_IDENTITY` to your Developer ID Application identity and `QUOTABAR_NOTARY_PROFILE` to your notarytool Keychain profile before running the release script. [Apple Developer ID setup](https://developer.apple.com/developer-id/)
+
 ## Build and checks
 
 On macOS 14 or later with Xcode Command Line Tools, run `./build.sh` and open `build/QuotaBar.app`. To start the app at login on another Mac, add it under System Settings → General → Login Items & Extensions.
@@ -55,10 +71,20 @@ Run `./check.sh` for compiler checks and quota, reset, presentation, and token f
 
 After updating Claude Code, run `./check.sh --claude-live` on a Mac signed in to a supported Claude subscription. It reads the installed CLI once and checks both menu-bar percentage modes. The output omits account details and percentages. The ordinary test suite runs offline using fixtures. The release packaging script runs those tests against the staged source before building the downloadable app.
 
+Run `./check.sh --logic-stress` to check percentage accuracy at report and reset boundaries, account restrictions across relaunches, and reset decisions across simulated event sequences. It runs without opening windows or contacting either provider.
+
+Run `./check.sh --stress` for the window-free stress suite. It uses simulated providers and temporary histories to check percentage accuracy, token accounting, and simultaneous reset confirmations across separate processes.
+
+Run `./check.sh --stress-gui` separately in a dedicated macOS graphical session or a macOS VM with Accessibility access for the runner. This suite opens windows and drives the menu bar. A second Mission Control Space shares the same menu bar and focus. Allow several minutes for launch and onboarding, provider and display settings, dropdown and keyboard interaction bursts, network changes, the three-minute refresh deadline, and signed updates served on localhost. The first updater test may download the pinned Sparkle tools. Actual subscriptions, real reset credits, and macOS login-item configuration are outside the stress suites.
+
+Run `./check.sh --update-stress` for window-free updater tests. It exercises QuotaBar’s update reminders and checks Sparkle against disposable signed feeds on localhost. The first run may download the pinned Sparkle toolset.
+
+Run `./Tests/UpdaterChecks.sh` in a logged-in macOS session with Accessibility access for the test runner. It uses disposable apps, a local feed, and a temporary signing key to test installation, relaunch, and rejection of an altered update.
+
 Run `./check.sh --timing` in a logged-in macOS session for a three-minute test with isolated histories and simulated readings. It checks automatic updates with the dropdown closed, a network failure, and recovery on a wake notification.
 
 Run `./check.sh --network` to exercise startup without connectivity, reconnects, network switches, and late responses from a previous connection using simulated readings.
 
 For screenshots with simulated quota readings and isolated token history, run `QUOTABAR_TEST_FIXTURES=1 ./check.sh --live` with the desired capture paths. Ordinary live checks and screenshots can contain the current user’s usage.
 
-Run `./package.sh` with a release directory to build the app and source archives from the release manifest. The local build is ad-hoc signed. Distribution outside the Mac App Store with a verified publisher requires Developer ID signing and Apple notarization. [Apple distribution guidance](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
+Run `./package.sh` with a release directory to build the app and source archives from the release manifest. The default local build includes the updater. Use the signed archive and feed from the release procedure above for distribution through the updater. Distribution outside the Mac App Store with a verified publisher requires Developer ID signing and Apple notarization. [Apple distribution guidance](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)

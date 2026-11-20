@@ -8,6 +8,8 @@ struct Dashboard: View {
         let missingCLI: Bool
     }
 
+    private var updater: UpdateController { .shared }
+
     let display: QuotaDisplay
     let summaries: [Summary]
     let nextAutoRefresh: Date?
@@ -37,6 +39,7 @@ struct Dashboard: View {
     let cancelReset: () -> Void
     let confirmReset: () -> Void
     let refresh: () -> Void
+    let checkForUpdates: () -> Void
     let showHelp: () -> Void
     let quit: () -> Void
 
@@ -60,6 +63,11 @@ struct Dashboard: View {
                 }
                 .accessibilityElement(children: .contain)
                 .accessibilityIdentifier("quota-summary-" + summary.display.provider.rawValue)
+            }
+
+            if let version = updater.pendingUpdateVersion {
+                Button("Update to QuotaBar \(version)…", action: checkForUpdates)
+                    .padding(.top, 10)
             }
 
             Divider().padding(.top, 12)
@@ -282,6 +290,17 @@ struct Dashboard: View {
                     .labelsHidden()
                 }
                 Divider()
+                if updater.supported {
+                    Toggle(
+                        "Automatically Check for Updates",
+                        isOn: Binding(
+                            get: { updater.automaticallyChecksForUpdates },
+                            set: { updater.automaticallyChecksForUpdates = $0 })
+                    )
+                    Button("Check for Updates…", action: checkForUpdates)
+                        .disabled(!updater.canCheckForUpdates)
+                    Divider()
+                }
                 Button("Help", action: showHelp)
                 Button("Quit QuotaBar", action: quit)
                     .keyboardShortcut("q")

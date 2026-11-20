@@ -29,7 +29,7 @@ while IFS= read -r file; do
 done < release-files.txt
 "${stage}/source/QuotaBar/check.sh"
 "${stage}/source/QuotaBar/build.sh" "${stage}/app"
-(cd "${stage}/app" && zip -X -q -r "${stage}/QuotaBar-macOS.zip" QuotaBar.app)
+(cd "${stage}/app" && zip -X -y -q -r "${stage}/QuotaBar-macOS.zip" QuotaBar.app)
 (cd "${stage}/source" && zip -X -q -r "${stage}/QuotaBar-source.zip" QuotaBar)
 unzip -t -q "${stage}/QuotaBar-macOS.zip"
 unzip -t -q "${stage}/QuotaBar-source.zip"
