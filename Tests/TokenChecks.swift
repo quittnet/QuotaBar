@@ -23,6 +23,21 @@ struct TokenChecks {
         try FileManager.default.createDirectory(at: archive, withIntermediateDirectories: true)
         try expect(history, now: now, all: 0, month: 0, week: 0, today: 0, retained: false)
 
+        // Santiago advanced its clocks at midnight on September 8, 2024.
+        var santiago = Calendar(identifier: .gregorian)
+        santiago.timeZone = TimeZone(identifier: "America/Santiago")!
+        let transitionDay = ISO8601DateFormatter().date(from: "2024-09-08T16:00:00Z")!
+        let transitionHistory = TokenHistory(home: root, calendar: santiago)
+        let transitionLog = sessions.appendingPathComponent("rollout-transition.jsonl")
+        let transitionRows = [
+            metadata("transition"),
+            response("2024-08-10T04:30:00Z", thread: "transition", response: "month", tokens: 11),
+            response("2024-09-02T04:30:00Z", thread: "transition", response: "week", tokens: 7),
+        ]
+        try (transitionRows.joined(separator: "\n") + "\n").write(to: transitionLog, atomically: true, encoding: .utf8)
+        try expect(transitionHistory, now: transitionDay, all: 18, month: 18, week: 7, today: 0)
+        try FileManager.default.removeItem(at: transitionLog)
+
         let parent = sessions.appendingPathComponent("rollout-parent.jsonl")
         let parentRows =
             [

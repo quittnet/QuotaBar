@@ -11,8 +11,8 @@ struct TokenDayBoundaries {
     init(now: Date, calendar: Calendar) {
         today = calendar.startOfDay(for: now)
         yesterday = calendar.date(byAdding: .day, value: -1, to: today).map(calendar.startOfDay(for:)) ?? today
-        week = calendar.date(byAdding: .day, value: -6, to: today) ?? today
-        month = calendar.date(byAdding: .day, value: -29, to: today) ?? today
+        week = calendar.date(byAdding: .day, value: -6, to: today).map(calendar.startOfDay(for:)) ?? today
+        month = calendar.date(byAdding: .day, value: -29, to: today).map(calendar.startOfDay(for:)) ?? today
     }
 }
 
