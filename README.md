@@ -5,9 +5,9 @@
 > [!IMPORTANT]
 > **If macOS says it can’t verify QuotaBar or its developer**, dismiss the alert. Go to **System Settings → Privacy & Security**, scroll to **Security**, find **QuotaBar**, and click **Open Anyway**. Confirm when prompted. This approves only QuotaBar. Use these steps only for a copy you trust from the official release.
 
-**Install on Apple Silicon Macs running macOS 14 or later.** Download **QuotaBar-macOS.zip**, unzip it, move **QuotaBar.app** to Applications, and try opening it once. That first attempt makes the approval option appear if Gatekeeper blocks the app. [Download QuotaBar 1.7.5](https://github.com/quittnet/QuotaBar/releases/tag/v1.7.5)
+**Install on Apple Silicon Macs running macOS 14 or later.** Download **QuotaBar-macOS.zip**, unzip it, move **QuotaBar.app** to Applications, and try opening it once. That first attempt makes the approval option appear if Gatekeeper blocks the app. [Download the latest QuotaBar beta](https://github.com/quittnet/QuotaBar/releases/latest)
 
-Version 1.7.5 is ad-hoc signed and hasn’t been notarized by Apple. If the alert says the app **will damage your computer**, stop and follow Apple’s guidance. [Apple’s guide to opening Mac apps safely](https://support.apple.com/en-us/102445)
+The current beta is ad-hoc signed and hasn’t been notarized by Apple. If the alert says the app **will damage your computer**, stop and follow Apple’s guidance. [Apple’s guide to opening Mac apps safely](https://support.apple.com/en-us/102445)
 
 QuotaBar shows Codex and Claude usage in the macOS menu bar. **Amount Left** is the default. Secondary-click the menu bar item (two-finger click or Control-click), or click the percentage inside the dropdown, to switch between **Amount Left** and **Amount Used**. You can also choose **Settings → Show Percentage As**. The choice applies to both providers and survives relaunch. Each status reading uses the most constrained active usage window.
 
