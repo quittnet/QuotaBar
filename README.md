@@ -5,9 +5,9 @@
 > [!IMPORTANT]
 > **If macOS says it can’t verify QuotaBar or its developer**, dismiss the alert. Go to **System Settings → Privacy & Security**, scroll to **Security**, find **QuotaBar**, and click **Open Anyway**. Confirm when prompted. This approves only QuotaBar. Use these steps only for a copy you trust from the official release.
 
-**Install on Apple Silicon Macs running macOS 14 or later.** Download **QuotaBar-macOS.zip**, unzip it, move **QuotaBar.app** to Applications, and try opening it once. That first attempt makes the approval option appear if Gatekeeper blocks the app. [Download QuotaBar 1.7.4](https://github.com/quittnet/QuotaBar/releases/tag/v1.7.4)
+**Install on Apple Silicon Macs running macOS 14 or later.** Download **QuotaBar-macOS.zip**, unzip it, move **QuotaBar.app** to Applications, and try opening it once. That first attempt makes the approval option appear if Gatekeeper blocks the app. [Download QuotaBar 1.7.5](https://github.com/quittnet/QuotaBar/releases/tag/v1.7.5)
 
-Version 1.7.4 is ad-hoc signed and hasn’t been notarized by Apple. If the alert says the app **will damage your computer**, stop and follow Apple’s guidance. [Apple’s guide to opening Mac apps safely](https://support.apple.com/en-us/102445)
+Version 1.7.5 is ad-hoc signed and hasn’t been notarized by Apple. If the alert says the app **will damage your computer**, stop and follow Apple’s guidance. [Apple’s guide to opening Mac apps safely](https://support.apple.com/en-us/102445)
 
 QuotaBar shows Codex and Claude usage in the macOS menu bar. **Amount Left** is the default. Secondary-click the menu bar item (two-finger click or Control-click), or click the percentage inside the dropdown, to switch between **Amount Left** and **Amount Used**. You can also choose **Settings → Show Percentage As**. The choice applies to both providers and survives relaunch. Each status reading uses the most constrained active usage window.
 
@@ -31,7 +31,7 @@ QuotaBar asks the installed, signed-in Codex CLI for account limits. When Codex 
 
 ## Claude
 
-Enable Claude in **Settings → Providers** and sign in to a supported Claude Code CLI with your subscription. QuotaBar asks the local CLI for account usage on launch, every three minutes, on wake or reconnect, and when you press Refresh or ⌘R. Claude Code handles the account request in the background. It does not need an open Terminal window or a chat message. The reported five-hour and weekly limits are account-wide. Local token totals cover Claude Code history on this Mac. Claude Code supplies scheduled reset times. Manual Claude resets are unavailable in QuotaBar.
+Enable Claude in **Settings → Providers** and sign in to a supported Claude Code CLI with your subscription. QuotaBar asks the local CLI for account usage on launch, every three minutes, on wake or reconnect, and when you press Refresh or ⌘R. Claude Code handles the account request in the background. It does not need an open Terminal window or a chat message. The reported five-hour and weekly limits are account-wide. Local token totals cover Claude Code history on this Mac. A reported percentage can arrive before Claude assigns a reset time. The percentage appears immediately and the countdown appears when Claude supplies a time. Manual Claude resets are unavailable in QuotaBar.
 
 The automatic check uses Claude Code’s version-dependent usage control request. If the installed CLI reports that the request is unsupported, QuotaBar can still read the older status-line feed. **Connect Claude Code** in that mode preserves existing status-line output. Upgrading Claude Code enables automatic checks on supported versions. A failed account read hides the current percentage until the next successful check. [Claude Code usage command](https://code.claude.com/docs/en/commands) · [Claude Code status-line fields](https://code.claude.com/docs/en/statusline#rate-limits)
 
@@ -52,6 +52,8 @@ QuotaBar has no analytics service or direct usage-data upload. It requests subsc
 On macOS 14 or later with Xcode Command Line Tools, run `./build.sh` and open `build/QuotaBar.app`. To start the app at login on another Mac, add it under System Settings → General → Login Items & Extensions.
 
 Run `./check.sh` for compiler checks and quota, reset, presentation, and token fixtures. With Swift 6 command-line tools, `./check.sh --lint` also checks Swift style, shell syntax, and the bundle property list. Run `./check.sh --live` in a logged-in macOS session to exercise the menu-bar button, switch providers, and fetch live Codex account limits. The optional capture paths are PNGs for the Codex dropdown, Claude dropdown, light menu bar, and dark menu bar, followed by the combined compact dropdown and its Codex and Claude Details views, in that order.
+
+After updating Claude Code, run `./check.sh --claude-live` on a Mac signed in to a supported Claude subscription. It reads the installed CLI once and checks both menu-bar percentage modes. The output omits account details and percentages. The ordinary test suite runs offline using fixtures. The release packaging script runs those tests against the staged source before building the downloadable app.
 
 Run `./check.sh --timing` in a logged-in macOS session for a three-minute test with isolated histories and simulated readings. It checks automatic updates with the dropdown closed, a network failure, and recovery on a wake notification.
 

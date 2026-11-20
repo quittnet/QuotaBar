@@ -135,7 +135,7 @@ struct Dashboard: View {
                     Text(claudeSetupError)
                 } else {
                     Text(
-                        "Update Claude Code for automatic usage checks. This version can only show reports from an active session."
+                        "This Claude Code client doesn’t support automatic usage checks. QuotaBar can read reports from an active Claude Code session."
                     )
                 }
                 if !claudeConfigured || claudeSetupError != nil {

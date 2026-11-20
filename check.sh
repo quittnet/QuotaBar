@@ -3,8 +3,8 @@ set -eu
 cd "$(dirname "$0")"
 target_arch=$(uname -m)
 case "${1:-}" in
-    ""|--live|--lint|--timing|--network) ;;
-    *) echo "Usage: $0 [--lint | --timing | --network | --live [capture paths...]]" >&2; exit 64 ;;
+    ""|--claude-live|--live|--lint|--timing|--network) ;;
+    *) echo "Usage: $0 [--claude-live | --lint | --timing | --network | --live [capture paths...]]" >&2; exit 64 ;;
 esac
 checks_dir=$(mktemp -d "${TMPDIR:-/tmp}/quotabar-check.XXXXXX")
 trap 'rm -r "${checks_dir}"' EXIT
@@ -13,6 +13,15 @@ compile() {
         -strict-concurrency=complete -warnings-as-errors -target "${target_arch}-apple-macosx14.0" -parse-as-library "$@"
 }
 compile -typecheck Sources/*.swift
+compile_claude_usage() {
+    compile Sources/QuotaCore.swift Sources/Presentation.swift Sources/ClaudeUsageClient.swift \
+        Tests/ClaudeUsageChecks.swift -o "${checks_dir}/claude-usage"
+}
+if [ "${1:-}" = "--claude-live" ]; then
+    compile_claude_usage
+    "${checks_dir}/claude-usage" --live
+    exit 0
+fi
 if [ "${1:-}" = "--lint" ]; then
     sh -n build.sh
     sh -n check.sh
@@ -59,7 +68,7 @@ compile Sources/PrivateFile.swift Sources/TokenHistory.swift Tests/TokenChecks.s
 "${checks_dir}/tokens"
 compile Sources/PrivateFile.swift Sources/QuotaCore.swift Sources/ClaudeQuota.swift Tests/ClaudeQuotaChecks.swift -o "${checks_dir}/claude-quota"
 "${checks_dir}/claude-quota"
-compile Sources/QuotaCore.swift Sources/ClaudeUsageClient.swift Tests/ClaudeUsageChecks.swift -o "${checks_dir}/claude-usage"
+compile_claude_usage
 "${checks_dir}/claude-usage"
 compile Sources/PrivateFile.swift Sources/TokenHistory.swift Sources/ClaudeTokenHistory.swift Tests/ClaudeTokenChecks.swift -o "${checks_dir}/claude-tokens"
 "${checks_dir}/claude-tokens"

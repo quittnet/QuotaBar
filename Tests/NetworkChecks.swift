@@ -61,7 +61,7 @@ private final class ClaudeNetworkReadings: @unchecked Sendable {
     var count: Int { lock.withLock { calls } }
     var oldFinished: Bool { lock.withLock { finishedOld } }
 
-    func read() -> QuotaReading {
+    func read() throws -> QuotaReading {
         let call = lock.withLock {
             calls += 1
             return calls
@@ -69,6 +69,12 @@ private final class ClaudeNetworkReadings: @unchecked Sendable {
         if call == 3 {
             precondition(finishOldReading.wait(timeout: .now() + 10) == .success)
             lock.withLock { finishedOld = true }
+        }
+        if call == 6 || call == 7 {
+            let used = call == 6 ? "null" : "17"
+            let report =
+                #"{"rate_limits_available":true,"rate_limits":{"five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":\#(used)}}}"#
+            return try ClaudeUsageClient.parse(Data(report.utf8), now: Date())
         }
         let remaining = [1: 64.0, 2: 54.0, 3: 99.0, 4: 44.0, 5: 34.0][call]
         guard let remaining else { preconditionFailure("Unexpected Claude read") }
@@ -104,7 +110,7 @@ enum NetworkChecks {
         let disabledClaude = ClaudeNetworkReadings()
         let controller = AppDelegate(
             resetStore: UsageResets(file: root.appendingPathComponent("pending.json")), defaults: preferences,
-            monitorNetwork: false, readCodex: { _ in try readings.codex() }, readClaude: { disabledClaude.read() },
+            monitorNetwork: false, readCodex: { _ in try readings.codex() }, readClaude: { try disabledClaude.read() },
             redeem: { _ in preconditionFailure("Unexpected reset") })
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
@@ -288,7 +294,7 @@ enum NetworkChecks {
                         resetStore: UsageResets(file: root.appendingPathComponent("pending-claude.json")),
                         defaults: preferences, monitorNetwork: false,
                         readCodex: { _ in ClaudeNetworkReadings.reading(75) },
-                        readClaude: { claudeReadings.read() },
+                        readClaude: { try claudeReadings.read() },
                         redeem: { _ in preconditionFailure("Unexpected reset") })
                     claudeController = claude
                     claude.applicationDidFinishLaunching(
@@ -330,7 +336,7 @@ enum NetworkChecks {
                     precondition(claudeReadings.count == 4, "Reconnect must fetch a current Claude reading")
                     claude.networkChanged(available: true)
                     stage = 19
-                default:
+                case 19:
                     guard let claude = claudeController,
                         claude.item.button?.toolTip?.contains("34% remaining") == true
                     else { return }
@@ -339,6 +345,21 @@ enum NetworkChecks {
                         "Claude refreshed at launch, manual refresh, reconnect and network switch; disabled Claude stayed idle."
                     )
                     print("An obsolete Claude response was discarded while offline.")
+                    claude.dashboard.rootView.refresh()
+                    stage = 20
+                case 20:
+                    guard let claude = claudeController, let label = claude.item.button?.toolTip,
+                        label.contains("Current Claude limits unavailable")
+                    else { return }
+                    precondition(!label.contains("34% remaining") && label.contains("75% remaining"))
+                    claude.dashboard.rootView.refresh()
+                    stage = 21
+                default:
+                    guard let claude = claudeController, let label = claude.item.button?.toolTip,
+                        label.contains("Weekly limit, 83% remaining")
+                    else { return }
+                    precondition(claudeReadings.count == 7 && label.contains("75% remaining"))
+                    print("An invalid Claude percentage was hidden, and an undated fresh report restored the badge.")
                     claude.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
                     NSStatusBar.system.removeStatusItem(claude.item)
                     preferences.removePersistentDomain(forName: suite)

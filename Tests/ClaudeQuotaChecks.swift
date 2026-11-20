@@ -154,6 +154,25 @@ struct ClaudeQuotaChecks {
         precondition(reading(after: 63) == nil)
         let replayCache = try String(contentsOf: file, encoding: .utf8)
         precondition(!replayCache.contains("private-terminal"))
+        let idleFile = directory.appendingPathComponent("idle-quota.json")
+        let idleReport =
+            #"{"rate_limits":{"five_hour":{"used_percentage":0,"resets_at":null},"seven_day":{"used_percentage":1,"resets_at":1800000900}}}"#
+        try ClaudeQuotaSource.capture(statusLine: Data(idleReport.utf8), file: idleFile, now: start)
+        let idleReading = try ClaudeQuotaSource.read(file: idleFile, now: start)
+        precondition(idleReading?.windows.map(\.remaining) == [100, 99])
+        precondition(idleReading?.windows.first?.resetsAt == nil)
+        let missingReset = idleReport.replacingOccurrences(of: #","resets_at":null"#, with: "")
+        try ClaudeQuotaSource.capture(
+            statusLine: Data(missingReset.utf8), file: idleFile, now: start.addingTimeInterval(1))
+        let missingResetReading = try ClaudeQuotaSource.read(file: idleFile, now: start.addingTimeInterval(1))
+        precondition(missingResetReading?.windows.count == 2)
+        for badReset in [#""bad-date""#, "true", "-1", "1e999"] {
+            let malformedReset = idleReport.replacingOccurrences(of: "null", with: badReset)
+            try ClaudeQuotaSource.capture(
+                statusLine: Data(malformedReset.utf8), file: idleFile, now: start.addingTimeInterval(2))
+            let malformedReading = try ClaudeQuotaSource.read(file: idleFile, now: start.addingTimeInterval(2))
+            precondition(malformedReading == nil)
+        }
         print("Claude quota fixtures passed")
     }
 }

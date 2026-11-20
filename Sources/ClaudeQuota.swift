@@ -141,13 +141,13 @@ enum ClaudeQuotaSource {
         }
 
         func activeWindows(at date: Date) -> [QuotaWindow] {
-            windows.filter { $0.resetsAt.map { $0 > date } == true }
+            windows.filter { $0.resetsAt.map { $0 > date } ?? true }
         }
     }
 
     private struct Window: Codable, Equatable {
         let usedPercentage: Double
-        let resetsAt: Double
+        let resetsAt: Double?
 
         private enum CodingKeys: String, CodingKey {
             case usedPercentage = "used_percentage"
@@ -157,15 +157,17 @@ enum ClaudeQuotaSource {
         init(from decoder: Decoder) throws {
             let values = try decoder.container(keyedBy: CodingKeys.self)
             usedPercentage = try values.decode(Double.self, forKey: .usedPercentage)
-            resetsAt = try values.decode(Double.self, forKey: .resetsAt)
-            guard (0...100).contains(usedPercentage), resetsAt > 0, resetsAt < Date.distantFuture.timeIntervalSince1970
+            resetsAt = try values.decodeIfPresent(Double.self, forKey: .resetsAt)
+            guard (0...100).contains(usedPercentage),
+                resetsAt.map({ $0 > 0 && $0 < Date.distantFuture.timeIntervalSince1970 }) ?? true
             else {
                 throw ReadError()
             }
         }
 
         func quota(minutes: Int) -> QuotaWindow {
-            QuotaWindow(minutes: minutes, used: usedPercentage, resetsAt: Date(timeIntervalSince1970: resetsAt))
+            QuotaWindow(
+                minutes: minutes, used: usedPercentage, resetsAt: resetsAt.map(Date.init(timeIntervalSince1970:)))
         }
     }
 }

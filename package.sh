@@ -27,6 +27,7 @@ while IFS= read -r file; do
     mkdir -p "${stage}/source/QuotaBar/$(dirname "${file}")"
     cp -X "${file}" "${stage}/source/QuotaBar/${file}"
 done < release-files.txt
+"${stage}/source/QuotaBar/check.sh"
 "${stage}/source/QuotaBar/build.sh" "${stage}/app"
 (cd "${stage}/app" && zip -X -q -r "${stage}/QuotaBar-macOS.zip" QuotaBar.app)
 (cd "${stage}/source" && zip -X -q -r "${stage}/QuotaBar-source.zip" QuotaBar)

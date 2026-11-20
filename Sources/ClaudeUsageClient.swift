@@ -18,7 +18,7 @@ enum ClaudeUsageClient {
             case .timedOut:
                 return "The Claude usage check timed out. QuotaBar will try again."
             case .invalidResponse:
-                return "Claude returned an unrecognized usage reading. Update Claude Code and try again."
+                return "QuotaBar couldn’t read Claude’s usage report. Check /usage in Claude Code."
             }
         }
     }
@@ -80,10 +80,14 @@ enum ClaudeUsageClient {
         var windows: [QuotaWindow] = []
         for (minutes, window) in [(300, limits.fiveHour), (10_080, limits.sevenDay)] {
             guard let window else { continue }
-            guard let used = window.utilization, used.isFinite, (0...100).contains(used),
-                let timestamp = window.resetsAt, let reset = isoDate(timestamp)
-            else { throw Failure.invalidResponse }
-            guard reset > now else { continue }
+            guard let used = window.utilization, used.isFinite, (0...100).contains(used) else {
+                throw Failure.invalidResponse
+            }
+            let reset = try window.resetsAt.map { timestamp in
+                guard let date = isoDate(timestamp) else { throw Failure.invalidResponse }
+                return date
+            }
+            if let reset, reset <= now { continue }
             windows.append(QuotaWindow(minutes: minutes, used: used, resetsAt: reset))
         }
         guard !windows.isEmpty else { throw Failure.unavailable }
