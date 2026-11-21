@@ -9,27 +9,36 @@ final class NetworkChanges: NSObject, CWEventDelegate {
     private var monitor: NWPathMonitor?
     private var store: SCDynamicStore?
     private var wifi: CWWiFiClient?
-    private var wifiEvents: [CWEventType] = []
-    private var onChange: (@MainActor (Bool) -> Void)?
-    private var pathSignature: String?
-    private var configuration: NSDictionary?
-    private var connected: Bool?
-    private var lastDelivered: Bool?
+    var onChange: (@MainActor (Bool) -> Void)?
+    private struct Signature: Equatable {
+        var connected: Bool?
+        var interfaceTypes = Set<NWInterface.InterfaceType>()
+        var routes: [Route] = []
+    }
+
+    private struct Route: Equatable {
+        let interface: String?
+        let service: String?
+        let router: String?
+
+        init(_ fields: [String: Any]?) {
+            interface = fields?["PrimaryInterface"] as? String
+            service = fields?["PrimaryService"] as? String
+            router = fields?["Router"] as? String
+        }
+    }
+
+    private var current = Signature()
+    private var wifiCandidates = Set<String>()
+    private var otherInterfaces = Set<String>()
+    private var delivered: Signature?
+    private var pendingSSIDInterfaces = Set<String>()
     private var pending: Timer?
 
-    private static let keys = [
-        "State:/Network/Global/IPv4", "State:/Network/Global/IPv6", "State:/Network/Global/DNS",
-    ]
-    private static let patterns = [
-        "State:/Network/Service/.*/IPv4", "State:/Network/Service/.*/IPv6", "State:/Network/Service/.*/DNS",
-        "State:/Network/Interface/.*/Link",
-    ]
+    private static let keys = ["State:/Network/Global/IPv4", "State:/Network/Global/IPv6"]
 
-    private static let notificationPatterns = patterns + ["State:/Network/Interface/.*/AirPort"]
-
-    func start(onChange: @escaping @MainActor (Bool) -> Void) {
+    func start() {
         stop()
-        self.onChange = onChange
         let monitor = NWPathMonitor()
         self.monitor = monitor
         monitor.pathUpdateHandler = { [weak self, weak monitor] path in
@@ -44,29 +53,22 @@ final class NetworkChanges: NSObject, CWEventDelegate {
         )
         store = SCDynamicStoreCreate(
             nil, "QuotaBar Network Changes" as CFString,
-            { _, changedKeys, info in
+            { _, _, info in
                 guard let info else { return }
                 MainActor.assumeIsolated {
-                    Unmanaged<NetworkChanges>.fromOpaque(info).takeUnretainedValue().configurationChanged(
-                        changedKeys as? [String] ?? [])
+                    Unmanaged<NetworkChanges>.fromOpaque(info).takeUnretainedValue().readRoutes()
                 }
             }, &context)
         if let store {
-            configuration = SCDynamicStoreCopyMultiple(store, Self.keys as CFArray, Self.patterns as CFArray)
-            SCDynamicStoreSetNotificationKeys(store, Self.keys as CFArray, Self.notificationPatterns as CFArray)
+            SCDynamicStoreSetNotificationKeys(store, Self.keys as CFArray, nil)
             SCDynamicStoreSetDispatchQueue(store, .main)
+            readRoutes()
         }
         let wifi = CWWiFiClient()
         self.wifi = wifi
         wifi.delegate = self
-        for event: CWEventType in [.powerDidChange, .linkDidChange, .ssidDidChange, .bssidDidChange] {
-            do {
-                try wifi.startMonitoringEvent(with: event)
-                wifiEvents.append(event)
-            } catch {
-                // Path and configuration notifications remain available if Wi-Fi events are restricted.
-            }
-        }
+        // A change of access point within one Wi-Fi network does not change provider access.
+        try? wifi.startMonitoringEvent(with: .ssidDidChange)
         monitor.start(queue: .main)
     }
 
@@ -79,64 +81,94 @@ final class NetworkChanges: NSObject, CWEventDelegate {
         store = nil
         if let wifi {
             wifi.delegate = nil
-            for event in wifiEvents { try? wifi.stopMonitoringEvent(with: event) }
+            try? wifi.stopMonitoringEvent(with: .ssidDidChange)
         }
         wifi = nil
-        wifiEvents = []
-        onChange = nil
-        pathSignature = nil
-        configuration = nil
-        connected = nil
-        lastDelivered = nil
+        current = Signature()
+        wifiCandidates = []
+        otherInterfaces = []
+        delivered = nil
+        pendingSSIDInterfaces.removeAll()
     }
 
     private func pathChanged(_ path: NWPath) {
-        let interfaces = path.availableInterfaces.map { "\($0.name):\($0.type)" }.sorted().joined(separator: ",")
-        let signature = "\(path.status)|\(interfaces)|\(path.supportsIPv4)|\(path.supportsIPv6)|\(path.supportsDNS)"
-        guard signature != pathSignature else { return }
-        pathSignature = signature
+        let active = path.availableInterfaces.filter { path.usesInterfaceType($0.type) }
         // An on-demand VPN may need an outgoing request to establish its connection.
-        connected = path.status != .unsatisfied
+        updatePath(
+            connected: path.status != .unsatisfied, interfaceTypes: Set(active.map(\.type)),
+            wifiInterfaces: Set(active.filter { $0.type == .wifi }.map(\.name)),
+            otherInterfaces: Set(path.availableInterfaces.filter { $0.type == .other }.map(\.name)))
+    }
+
+    func updatePath(
+        connected: Bool, interfaceTypes: Set<NWInterface.InterfaceType>, wifiInterfaces: Set<String>,
+        otherInterfaces: Set<String> = []
+    ) {
+        wifiCandidates = wifiInterfaces
+        self.otherInterfaces = otherInterfaces
+        guard current.connected != connected || current.interfaceTypes != interfaceTypes else { return }
+        current.connected = connected
+        current.interfaceTypes = interfaceTypes
         scheduleChange()
     }
 
-    private func configurationChanged(_ changedKeys: [String]) {
-        guard let store else { return }
-        let next: NSDictionary? = SCDynamicStoreCopyMultiple(store, Self.keys as CFArray, Self.patterns as CFArray)
-        guard next != configuration || changedKeys.contains(where: { $0.hasSuffix("/AirPort") }) else { return }
-        configuration = next
+    private func readRoutes() {
+        guard let store, let values = SCDynamicStoreCopyMultiple(store, Self.keys as CFArray, nil) else { return }
+        updateRoutes(values as NSDictionary)
+    }
+
+    func updateRoutes(_ values: NSDictionary) {
+        let routes = Self.keys.map { Route(values[$0] as? [String: Any]) }
+        guard routes != current.routes else { return }
+        current.routes = routes
         scheduleChange()
     }
 
     private func scheduleChange() {
-        guard let connected, onChange != nil else { return }
+        guard let connected = current.connected, onChange != nil else { return }
         pending?.invalidate()
         pending = nil
         if !connected {
-            guard lastDelivered != false else { return }
-            lastDelivered = false
+            pendingSSIDInterfaces.removeAll()
+            guard delivered?.connected != false else { return }
+            delivered = current
             onChange?(false)
             return
         }
-        // DHCP, DNS, the default route and Wi-Fi can each announce the same switch.
+        guard current != delivered || !pendingSSIDInterfaces.isEmpty else { return }
+        // The route and Wi-Fi can announce the same switch. Deliver the settled state once.
         let timer = Timer(timeInterval: 0.75, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.pending = nil
-                self.lastDelivered = self.connected == true
-                self.onChange?(self.connected == true)
+                let switched =
+                    self.current != self.delivered || self.pendingSSIDInterfaces.contains(where: self.usesWifi)
+                self.pendingSSIDInterfaces.removeAll()
+                guard switched else { return }
+                self.delivered = self.current
+                self.onChange?(true)
             }
         }
         pending = timer
         RunLoop.main.add(timer, forMode: .common)
     }
 
-    nonisolated func powerStateDidChangeForWiFiInterface(withName interfaceName: String) { wifiChanged() }
-    nonisolated func linkDidChangeForWiFiInterface(withName interfaceName: String) { wifiChanged() }
-    nonisolated func ssidDidChangeForWiFiInterface(withName interfaceName: String) { wifiChanged() }
-    nonisolated func bssidDidChangeForWiFiInterface(withName interfaceName: String) { wifiChanged() }
+    private func usesWifi(_ interfaceName: String) -> Bool {
+        guard current.connected == true, wifiCandidates.contains(interfaceName) else { return false }
+        let routeInterfaces = current.routes.compactMap(\.interface)
+        if routeInterfaces.contains(interfaceName) { return true }
+        guard wifiCandidates.count == 1 else { return false }
+        // A VPN can own the default route while Wi-Fi is its only physical transport.
+        return routeInterfaces.isEmpty
+            || (current.interfaceTypes.subtracting([.other]) == [.wifi]
+                && routeInterfaces.allSatisfy(otherInterfaces.contains))
+    }
 
-    nonisolated private func wifiChanged() {
-        Task { @MainActor [weak self] in self?.scheduleChange() }
+    nonisolated func ssidDidChangeForWiFiInterface(withName interfaceName: String) {
+        Task { @MainActor [weak self] in
+            guard let self, usesWifi(interfaceName) else { return }
+            pendingSSIDInterfaces.insert(interfaceName)
+            scheduleChange()
+        }
     }
 }

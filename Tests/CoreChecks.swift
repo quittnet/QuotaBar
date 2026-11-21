@@ -103,7 +103,12 @@ enum CoreChecks {
                 """)
         }
         for restriction in [
-            #""spendControlReached":true"#, #""rateLimitReachedType":"workspace_owner_credits_depleted""#,
+            #""spendControlReached":true"#,
+            #""rateLimitReachedType":"rate_limit_reached""#,
+            #""rateLimitReachedType":"workspace_owner_credits_depleted""#,
+            #""rateLimitReachedType":"workspace_member_credits_depleted""#,
+            #""rateLimitReachedType":"workspace_owner_usage_limit_reached""#,
+            #""rateLimitReachedType":"workspace_member_usage_limit_reached""#,
         ] {
             let blocked = try read(
                 """
@@ -111,10 +116,65 @@ enum CoreChecks {
                 """)
             precondition(blocked.ordinaryUsageAllowed == false && blocked.windows.first?.remaining == 80)
         }
+        let futureRestriction = try read(
+            """
+            {
+                "ordinaryUsageAllowed":true,
+                "rateLimitsByLimitId":{"codex":{
+                    "primary":{"usedPercent":97,"windowDurationMins":300},
+                    "secondary":{"usedPercent":85,"windowDurationMins":10080},
+                    "rateLimitReachedType":"future_plan_limit"
+                }},
+                "rateLimits":{"limitId":"codex","primary":{"usedPercent":2,"windowDurationMins":300}}
+            }
+            """)
+        precondition(futureRestriction.ordinaryUsageAllowed == false)
+        precondition(futureRestriction.windows.map(\.remaining) == [3, 15])
+        let futureRestrictionWithoutWindows = try read(
+            """
+            {"rateLimitsByLimitId":{"codex":{"rateLimitReachedType":"future_plan_limit"}},
+             "rateLimits":{"limitId":"codex","primary":{"usedPercent":2}}}
+            """)
+        precondition(futureRestrictionWithoutWindows.ordinaryUsageAllowed == false)
+        precondition(futureRestrictionWithoutWindows.windows.isEmpty)
+        let futureLegacyRestriction = try read(
+            """
+            {"ordinaryUsageAllowed":true,"rateLimitsByLimitId":{"codex":null},
+             "rateLimits":{"limitId":"codex","primary":{"usedPercent":97},"rateLimitReachedType":"future_plan_limit"}}
+            """)
+        precondition(futureLegacyRestriction.ordinaryUsageAllowed == false)
+        precondition(futureLegacyRestriction.windows.map(\.remaining) == [3])
         let blocked = try read(#"{"ordinaryUsageAllowed":false,"rateLimits":{}}"#)
         let allowed = try read(#"{"ordinaryUsageAllowed":true,"rateLimits":{"primary":{"usedPercent":2}}}"#)
+        let nullReason = try read(
+            """
+            {"ordinaryUsageAllowed":true,"rateLimits":{"primary":{"usedPercent":2},"rateLimitReachedType":null}}
+            """)
         precondition(blocked.ordinaryUsageAllowed == false && blocked.windows.isEmpty)
         precondition(allowed.ordinaryUsageAllowed == true && weeklyOnly.ordinaryUsageAllowed == nil)
+        precondition(nullReason.ordinaryUsageAllowed == true && nullReason.windows == allowed.windows)
+        for reason in ["false", "true", "3", "{}", "[]"] {
+            let selected = """
+                {"primary":{"usedPercent":97},"rateLimitReachedType":\(reason)}
+                """
+            let report = try read(
+                """
+                {"ordinaryUsageAllowed":true,"rateLimitsByLimitId":{"codex":\(selected)},
+                 "rateLimits":{"limitId":"codex","primary":{"usedPercent":22}}}
+                """)
+            precondition(report.ordinaryUsageAllowed == false && report.windows.map(\.remaining) == [3])
+            let selectedOnly = try read(
+                """
+                {"ordinaryUsageAllowed":true,"rateLimitsByLimitId":{"codex":\(selected)}}
+                """)
+            precondition(selectedOnly.ordinaryUsageAllowed == false && selectedOnly.windows == report.windows)
+            let legacy = try read(
+                """
+                {"ordinaryUsageAllowed":true,"rateLimits":\(selected)}
+                """)
+            precondition(legacy.ordinaryUsageAllowed == false && legacy.windows == report.windows)
+        }
+        print("Codex non-string reasons: selected windows and restriction preserved with and without a legacy bucket.")
         for bucket in [#""invalid""#, #"{"primary":{"usedPercent":"invalid"}}"#] {
             let fallback = try read(
                 """
@@ -358,6 +418,9 @@ enum CoreChecks {
                 let childPID = requests.compactMap { $0["mockPID"] as? Int32 }.first!
                 precondition(kill(childPID, 0) == -1 && errno == ESRCH, "Timed-out mock server still alive")
             }
+            if identity?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+                precondition(requests.isEmpty)
+            }
             let claims = requests.filter { $0["method"] as? String == "account/rateLimitResetCredit/consume" }
             precondition(claims.count == (sends ? 1 : 0))
             if identity != nil, scenario != "initFail" {
@@ -377,11 +440,17 @@ enum CoreChecks {
             }
         }
 
+        try claim("initFail", expected: .accountChanged, creditID: originalCredit, sends: false)
+        try claim("initFail", expected: .accountChanged, creditID: originalCredit, identity: " ", sends: false)
+        try claim(
+            "missingAccount", expected: .accountChanged, creditID: originalCredit, identity: workspace, sends: false)
+        try claim(
+            "mismatchedAccount", expected: .accountChanged, creditID: originalCredit, identity: workspace, sends: false)
         try claim("reset", expected: .reset, creditID: originalCredit, identity: workspace)
         try claim("alreadyRedeemed", expected: .reset, creditID: originalCredit, identity: workspace)
         try claim("alreadyRedeemed", expected: .reset, identity: user)
         try claim("nothingToReset", expected: .nothingToReset, identity: user)
-        try claim("noCredit", expected: .noCredit, creditID: originalCredit)
+        try claim("noCredit", expected: .noCredit, creditID: originalCredit, identity: workspace)
         try claim("mismatchedAccount", expected: .accountChanged, identity: user, sends: false)
         try claim("missingAccount", expected: .accountChanged, identity: user, sends: false)
         try claim("otherUser", expected: .accountChanged, identity: user, sends: false)
@@ -390,14 +459,15 @@ enum CoreChecks {
         try claim("userLookupFailed", expected: .failedBeforeSending, identity: user, sends: false)
         try claim("reset", expected: .accountChanged, identity: workspace, sends: false)
         try claim("reset", expected: .accountChanged, sends: false)
-        try claim("methodNotFound", expected: .unavailable, creditID: originalCredit)
-        try claim("unsupported", expected: .unavailable, creditID: originalCredit)
-        try claim("initFail", expected: .failedBeforeSending, creditID: originalCredit, sends: false)
-        try claim("drop", expected: .unknown, creditID: originalCredit)
-        try claim("stall", expected: .unknown, creditID: originalCredit)
-        try claim("ignoresTermination", expected: .unknown, creditID: originalCredit)
-        try claim("serverError", expected: .unknown, creditID: originalCredit)
-        try claim("futureOutcome", expected: .unknown, creditID: originalCredit)
+        try claim("methodNotFound", expected: .unavailable, creditID: originalCredit, identity: workspace)
+        try claim("unsupported", expected: .unavailable, creditID: originalCredit, identity: workspace)
+        try claim(
+            "initFail", expected: .failedBeforeSending, creditID: originalCredit, identity: workspace, sends: false)
+        try claim("drop", expected: .unknown, creditID: originalCredit, identity: workspace)
+        try claim("stall", expected: .unknown, creditID: originalCredit, identity: workspace)
+        try claim("ignoresTermination", expected: .unknown, creditID: originalCredit, identity: workspace)
+        try claim("serverError", expected: .unknown, creditID: originalCredit, identity: workspace)
+        try claim("futureOutcome", expected: .unknown, creditID: originalCredit, identity: workspace)
     }
 
     private static func mockAppServer() throws {

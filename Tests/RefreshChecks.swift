@@ -58,7 +58,7 @@ enum RefreshChecks {
         let metadata = #"{"type":"session_meta","payload":{"id":"refresh"}}"# + "\n"
         try (metadata + record("first", count: 11)).write(to: session, atomically: true, encoding: .utf8)
 
-        let suite = "QuotaBar-refresh-test-" + UUID().uuidString
+        let suite = testPreferencesDomain()
         let preferences = UserDefaults(suiteName: suite)!
         preferences.set("both", forKey: "menuBarLayout")
         let fixture = Readings()
@@ -173,7 +173,7 @@ enum RefreshChecks {
     }
 
     @MainActor private static func checkAccountSwitches() {
-        let suite = "QuotaBar.restriction-check.\(UUID().uuidString)"
+        let suite = testPreferencesDomain()
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let controller = AppDelegate(defaults: defaults)
@@ -191,5 +191,6 @@ enum RefreshChecks {
         _ = needsConfirmation(nil, false)
         _ = needsConfirmation("second-user", true)
         precondition(needsConfirmation(nil, nil) && needsConfirmation("first-user", nil))
+        precondition(!needsConfirmation("second-user", nil))
     }
 }

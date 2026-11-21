@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import SQLite3
 
 @main
 struct ClaudeTokenChecks {
@@ -157,7 +158,60 @@ struct ClaudeTokenChecks {
         try edit.close()
         try append(padding + "\n", to: parent)
         try expect(history, now: now, all: 8, month: 8, week: 8, today: 8)
+        try checkCacheRecovery(home: home, calendar: calendar, now: now)
+        try checkLockedCache(home: home, calendar: calendar, now: now)
         print("Claude Code token history checks passed.")
+    }
+
+    private static func checkLockedCache(home: URL, calendar: Calendar, now: Date) throws {
+        let cache = home.appendingPathComponent("healthy.sqlite")
+        var bytesRead = 0
+        func reader() -> ClaudeTokenHistory {
+            ClaudeTokenHistory(home: home, cacheURL: cache, calendar: calendar, didReadBytes: { bytesRead += $0 })
+        }
+        try expect(reader(), now: now, all: 8, month: 8, week: 8, today: 8)
+        precondition(bytesRead > 0)
+        bytesRead = 0
+
+        let warm = reader()
+        var writer: OpaquePointer?
+        precondition(sqlite3_open(cache.path, &writer) == SQLITE_OK)
+        defer { sqlite3_close(writer) }
+        precondition(sqlite3_exec(writer, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK)
+        do {
+            _ = try warm.read(now: now)
+            preconditionFailure("A busy index must defer the scan")
+        } catch let error as ClaudeHistoryIndex.Failure where error.isContention {}
+        precondition(sqlite3_exec(writer, "ROLLBACK", nil, nil, nil) == SQLITE_OK)
+        try expect(warm, now: now, all: 8, month: 8, week: 8, today: 8)
+        try expect(reader(), now: now, all: 8, month: 8, week: 8, today: 8)
+        precondition(bytesRead == 0, "A temporary lock must not trigger another scan")
+        precondition(!FileManager.default.fileExists(atPath: cache.appendingPathExtension("rebuilt").path))
+    }
+
+    private static func checkCacheRecovery(home: URL, calendar: Calendar, now: Date) throws {
+        let cache = home.appendingPathComponent("damaged.sqlite")
+        let damaged = Data("damaged cache".utf8)
+        try damaged.write(to: cache)
+        precondition(chmod(cache.path, 0o600) == 0)
+        var bytesRead = 0
+        func reader() -> ClaudeTokenHistory {
+            ClaudeTokenHistory(home: home, cacheURL: cache, calendar: calendar, didReadBytes: { bytesRead += $0 })
+        }
+        try expect(reader(), now: now, all: 8, month: 8, week: 8, today: 8)
+        precondition(bytesRead > 0)
+        bytesRead = 0
+        try expect(reader(), now: now, all: 8, month: 8, week: 8, today: 8)
+        precondition(bytesRead == 0, "A damaged cache should only require one rebuild")
+        let original = try Data(contentsOf: cache)
+        precondition(original == damaged)
+        let rebuilt = cache.appendingPathExtension("rebuilt")
+        let content = try Data(contentsOf: rebuilt)
+        for text in ["edited", "claude-model", "2026-11-18T07:00:00Z", home.path] {
+            precondition(content.range(of: Data(text.utf8)) == nil, "Readable source data entered the token index")
+        }
+        var info = stat()
+        precondition(stat(rebuilt.path, &info) == 0 && info.st_mode & 0o777 == 0o600)
     }
 
     private static func expect(

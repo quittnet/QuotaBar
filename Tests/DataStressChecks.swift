@@ -159,8 +159,9 @@ struct DataStressChecks {
             try files.removeItem(at: projects.appendingPathComponent("copy-\(index).jsonl"))
         }
         try expect(restarted, claude, now: now, expected: expected)
-        let cached = try String(contentsOf: cache, encoding: .utf8)
-        precondition(!cached.contains("PRIVATE_STRESS_TEXT"))
+        let cached = try Data(contentsOf: cache.appendingPathExtension("sqlite"))
+        precondition(cached.starts(with: "SQLite format 3".utf8))
+        precondition(cached.range(of: Data("PRIVATE_STRESS_TEXT".utf8)) == nil)
     }
 
     private static func expect(_ codex: TokenHistory, _ claude: ClaudeTokenHistory, now: Date, expected: Ledger) throws

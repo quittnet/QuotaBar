@@ -1,6 +1,7 @@
 import CryptoKit
 import Darwin
 import Foundation
+import SQLite3
 
 struct TokenDayBoundaries {
     let today: Date
@@ -41,11 +42,20 @@ final class TokenHistory {
     private let home: URL
     private let cacheURL: URL?
     private let calendar: Calendar?
+    private let didReadBytes: ((Int) -> Void)?
+    private let compression: CompressedLogConfiguration
+    private var nextCompressedPath: String?
     private let decoder = JSONDecoder()
     private let dates = ISO8601DateFormatter()
     private let wholeSecondDates = ISO8601DateFormatter()
     private var files: [String: HistoryFile] = [:]
-    private var loaded = false
+    private var skips: [String: ArchiveSkip] = [:]
+    private var diskCache: CodexHistoryCache?
+    private var maximumCacheBytes = 128 * 1024 * 1024
+    private var pendingWrites = Set<String>()
+    private var checkCacheIntegrity = false
+    private var checkedLegacy = false
+    private var legacyRevision: LogFingerprint?
 
     init() {
         let environment = ProcessInfo.processInfo.environment
@@ -56,26 +66,38 @@ final class TokenHistory {
         cacheURL = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
             .appendingPathComponent("app.quotabar.QuotaBar", isDirectory: true)
             .appendingPathComponent("token-history.json")
+        didReadBytes = nil
         calendar = nil
+        compression = CompressedLogConfiguration()
         dates.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     }
 
-    init(home: URL, cacheURL: URL? = nil, calendar: Calendar) {
+    init(
+        home: URL, cacheURL: URL? = nil, calendar: Calendar,
+        compression: CompressedLogConfiguration = CompressedLogConfiguration(),
+        maximumCacheBytes: Int = 128 * 1024 * 1024, didReadBytes: ((Int) -> Void)? = nil
+    ) {
         self.home = home
         self.cacheURL = cacheURL
         self.calendar = calendar
+        self.didReadBytes = didReadBytes
+        self.compression = compression
+        self.maximumCacheBytes = maximumCacheBytes
         dates.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     }
 
     func read(now: Date = Date()) throws -> TokenTotals {
         loadCache()
+        var changed = Set<String>()
+        let decoderFile = compression.binary.flatMap(DecoderRevision.init)
         let fm = FileManager.default
         var foundRoot = false
         var enumerationFailed = false
-        var updated = false
         var readable = 0
         var candidates = 0
         var next: [String: HistoryFile] = [:]
+        var nextSkips: [String: ArchiveSkip] = [:]
+        var archives: [(url: URL, fingerprint: LogFingerprint)] = []
 
         for directory in ["sessions", "archived_sessions"] {
             let root = home.appendingPathComponent(directory, isDirectory: true)
@@ -114,10 +136,21 @@ final class TokenHistory {
                     let fingerprint = LogFingerprint(info)
                     if let previous = files[path], previous.fingerprint == fingerprint {
                         next[path] = previous
+                    } else if compressed {
+                        if let skip = skips[path],
+                            skip.applies(
+                                to: fingerprint, decoder: decoderFile, budget: compression.maximumBytes, at: now)
+                        {
+                            nextSkips[path] = skip
+                            enumerationFailed = true
+                        } else {
+                            archives.append((url, fingerprint))
+                        }
+                        continue
                     } else {
                         next[path] = try scan(
-                            url, compressed: compressed, fingerprint: fingerprint, previous: files[path])
-                        updated = true
+                            url, fingerprint: fingerprint, previous: files[path])
+                        changed.insert(path)
                     }
                     readable += 1
                 } catch {
@@ -125,47 +158,144 @@ final class TokenHistory {
                 }
             }
         }
+        // Rotate after reaching the shared budget so one slow or oversized archive cannot starve later ones.
+        archives.sort { $0.url.path < $1.url.path }
+        let start = nextCompressedPath.flatMap { path in archives.firstIndex { $0.url.path >= path } } ?? 0
+        nextCompressedPath = nil
+        let budget = CompressedLogBudget(compression)
+        for step in archives.indices {
+            let index = (start + step) % archives.count
+            let archive = archives[index]
+            if budget.exhausted {
+                nextCompressedPath = archive.url.path
+                enumerationFailed = true
+                break
+            }
+            let startedWithFullBudget = budget.remainingBytes == compression.maximumBytes
+            do {
+                next[archive.url.path] = try scan(archive.url, fingerprint: archive.fingerprint, budget: budget)
+                readable += 1
+                changed.insert(archive.url.path)
+            } catch {
+                enumerationFailed = true
+                if case CompressedLogError.byteLimitExceeded = error, startedWithFullBudget {
+                    nextSkips[archive.url.path] = ArchiveSkip(
+                        fingerprint: archive.fingerprint, limit: compression.maximumBytes)
+                } else if case CompressedLogError.decoderRejected = error, let decoderFile {
+                    nextSkips[archive.url.path] = ArchiveSkip(
+                        fingerprint: archive.fingerprint, decoder: decoderFile, failedAt: now)
+                }
+                if budget.exhausted && step > 0 {
+                    // Give an interrupted archive one attempt with a full budget on the next refresh.
+                    nextCompressedPath = archive.url.path
+                    break
+                }
+            }
+        }
+        let oldKeys = Set(files.keys).union(skips.keys)
+        let newKeys = Set(next.keys).union(nextSkips.keys)
+        let removed = oldKeys.subtracting(newKeys)
+        for (path, skip) in nextSkips where skips[path] != skip { changed.insert(path) }
+        files = next
+        skips = nextSkips
+        if cacheURL != nil {
+            pendingWrites.formUnion(removed)
+            pendingWrites.formUnion(changed)
+            persistChanges()
+        }
         guard foundRoot, readable > 0 || (candidates == 0 && !enumerationFailed) else {
             throw TokenHistoryError.unavailable
         }
-        updated = updated || files.keys != next.keys
-        files = next
-        if updated { saveCache() }
         return totals(now: now, partial: enumerationFailed)
     }
 
+    private struct DiskEntry: Codable {
+        let file: HistoryFile?
+        let skip: ArchiveSkip?
+    }
+
     private func loadCache() {
-        guard !loaded else { return }
-        loaded = true
-        guard let cacheURL, let data = try? PrivateFile.read(cacheURL, maximumBytes: 128 * 1024 * 1024),
+        guard let cacheURL else { return }
+        let homePath = home.standardizedFileURL.path
+        if diskCache == nil,
+            let db = CodexHistoryCache(
+                url: cacheURL.appendingPathExtension("sqlite"), home: homePath,
+                maximumBytes: maximumCacheBytes, checkIntegrity: checkCacheIntegrity)
+        {
+            var added = Set<String>()
+            let status = db.load { path, data in
+                guard files[path] == nil, skips[path] == nil, !pendingWrites.contains(path),
+                    let entry = try? decoder.decode(DiskEntry.self, from: data)
+                else { return }
+                if let file = entry.file, file.valid(for: path) {
+                    files[path] = file
+                    added.insert(path)
+                } else if let skip = entry.skip {
+                    skips[path] = skip
+                    added.insert(path)
+                }
+            }
+            if status == SQLITE_DONE {
+                diskCache = db
+                checkCacheIntegrity = false
+            } else {
+                for path in added {
+                    files[path] = nil
+                    skips[path] = nil
+                }
+                if status == SQLITE_CORRUPT || status == SQLITE_NOTADB { checkCacheIntegrity = true }
+            }
+        }
+        guard !checkedLegacy else { return }
+        checkedLegacy = true
+        var info = stat()
+        guard lstat(cacheURL.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_uid == geteuid(),
+            let data = try? PrivateFile.read(cacheURL, maximumBytes: 128 * 1024 * 1024),
             let cache = try? decoder.decode(HistoryCache.self, from: data),
-            cache.version == HistoryCache.currentVersion, cache.home == home.standardizedFileURL.path
+            cache.version == HistoryCache.currentVersion, cache.home == homePath
         else { return }
-        files = cache.files.filter { path, file in
-            file.fingerprint.size >= 0
-                && (path.hasSuffix(".jsonl.zst") || file.offset <= UInt64(file.fingerprint.size))
-                && file.events.allSatisfy { $0.total >= 0 && ($0.counter?.last ?? 0) >= 0 }
+        legacyRevision = LogFingerprint(info)
+        for (path, file) in cache.files where files[path] == nil && skips[path] == nil && file.valid(for: path) {
+            files[path] = file
+            pendingWrites.insert(path)
+        }
+        if let old = cache.archiveOverflows {
+            for (path, revision) in old.fingerprints where files[path] == nil && skips[path] == nil {
+                skips[path] = ArchiveSkip(fingerprint: revision, limit: old.maximumBytes)
+                pendingWrites.insert(path)
+            }
         }
     }
 
-    private func saveCache() {
-        guard let cacheURL else { return }
-        let cache = HistoryCache(
-            version: HistoryCache.currentVersion, home: home.standardizedFileURL.path, files: files)
-        guard let data = try? JSONEncoder().encode(cache) else { return }
-        do {
-            try FileManager.default.createDirectory(
-                at: cacheURL.deletingLastPathComponent(), withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
-            try data.write(to: cacheURL, options: .atomic)
-        } catch {
-            // The in-memory index remains valid when the cache is unavailable.
+    private func persistChanges() {
+        guard let diskCache else { return }
+        // Free pages first, even when a new log is too large to fit the cache.
+        let removed = pendingWrites.filter { files[$0] == nil && skips[$0] == nil }
+        let paths = Array(removed) + pendingWrites.subtracting(removed).sorted()
+        let encoder = JSONEncoder()
+        let status = diskCache.save(paths: paths) { path in
+            guard files[path] != nil || skips[path] != nil else { return nil }
+            return try encoder.encode(DiskEntry(file: files[path], skip: skips[path]))
+        } acknowledge: { completed in
+            pendingWrites.subtract(completed)
+        }
+        if status == SQLITE_CORRUPT || status == SQLITE_NOTADB {
+            self.diskCache = nil
+            checkCacheIntegrity = true
+            pendingWrites.formUnion(files.keys)
+            pendingWrites.formUnion(skips.keys)
+        }
+        if status == SQLITE_OK, let legacyRevision, pendingWrites.isEmpty, let cacheURL {
+            var info = stat()
+            if lstat(cacheURL.path, &info) == 0, LogFingerprint(info) == legacyRevision {
+                try? FileManager.default.removeItem(at: cacheURL)
+            }
+            self.legacyRevision = nil
         }
     }
 
     private func scan(
-        _ url: URL, compressed: Bool, fingerprint: LogFingerprint, previous: HistoryFile?
+        _ url: URL, fingerprint: LogFingerprint, previous: HistoryFile? = nil, budget: CompressedLogBudget? = nil
     ) throws -> HistoryFile {
         let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
         guard descriptor >= 0 else { throw TokenHistoryError.unavailable }
@@ -178,72 +308,64 @@ final class TokenHistory {
             throw TokenHistoryError.unavailable
         }
 
-        if compressed {
-            let decoder = try CompressedLog(input: stream)
-            var file = HistoryFile(fingerprint: fingerprint)
-            try scanLines(into: &file, read: decoder.read)
-            try decoder.finish()
+        if let budget {
+            let decoder = try CompressedLog(input: stream, configuration: compression, budget: budget)
+            defer { decoder.close() }
+            let result = Result {
+                var file = HistoryFile(fingerprint: fingerprint)
+                file.offset = try readTokenLogLines(read: decoder.read) { accept($0, into: &file) }
+                try decoder.finish()
+                return file
+            }
             var endInfo = stat()
-            guard fstat(descriptor, &endInfo) == 0, LogFingerprint(endInfo) == fingerprint else {
+            guard lstat(url.path, &endInfo) == 0, LogFingerprint(endInfo) == fingerprint else {
                 throw TokenHistoryError.unavailable
             }
-            return file
+            return try result.get()
         }
 
-        var file = HistoryFile(fingerprint: fingerprint)
+        let opened = LogFingerprint(info)
+        var file = HistoryFile(fingerprint: opened)
         var prefix = TokenLogPrefix()
-        if let previous, previous.fingerprint.sameFile(as: fingerprint),
+        if let previous, previous.fingerprint.sameFile(as: opened),
             previous.fingerprint.size >= 0, previous.offset <= UInt64(previous.fingerprint.size),
-            fingerprint.size > previous.fingerprint.size
+            opened.size > previous.fingerprint.size
         {
-            try prefix.extend(in: stream, to: previous.offset)
+            try prefix.extend(in: stream, to: previous.offset, didReadBytes: didReadBytes)
             if prefix.digest == previous.anchor {
                 file = previous
-                file.fingerprint = fingerprint
+                file.fingerprint = opened
             } else {
                 prefix = TokenLogPrefix()
             }
         }
-        try stream.seek(toOffset: file.offset)
-        var remaining = UInt64(fingerprint.size) - file.offset
-        try scanLines(into: &file) {
-            guard remaining > 0 else { return Data() }
-            let data = try stream.read(upToCount: Int(min(remaining, 256 * 1024))) ?? Data()
-            guard !data.isEmpty else { throw TokenHistoryError.unavailable }
-            remaining -= UInt64(data.count)
-            return data
-        }
-        try prefix.extend(in: stream, to: file.offset)
-        file.anchor = prefix.digest
-        var endInfo = stat()
-        guard fstat(descriptor, &endInfo) == 0, LogFingerprint(endInfo) == LogFingerprint(info) else {
-            throw TokenHistoryError.unavailable
-        }
+        let snapshot = try readTokenLogSnapshot(
+            stream, at: url, opened: info, from: file.offset, prefix: prefix, didReadBytes: didReadBytes
+        ) { accept($0, into: &file) }
+        file.offset = snapshot.offset
+        file.anchor = snapshot.anchor
         return file
     }
 
-    private func scanLines(into file: inout HistoryFile, read: () throws -> Data) throws {
-        let committed = try readTokenLogLines(read: read) { line in
-            switch line {
-            case .complete(let data):
-                accept(data, into: &file)
-            case .oversized(let prefix):
-                // Codex normally writes its outer discriminator ahead of the payload. Large tool
-                // output and image records can safely be skipped once that header is established.
-                struct Header: Decodable { let type: String }
-                let marker = Data(#""payload""#.utf8)
-                if let key = prefix.range(of: marker) {
-                    let header = prefix[..<key.lowerBound] + Data(#""payload":null}"#.utf8)
-                    if let type = try? decoder.decode(Header.self, from: header).type,
-                        ["response_item", "dynamic_tools_updated"].contains(type)
-                    {
-                        return
-                    }
+    private func accept(_ line: TokenLogLine, into file: inout HistoryFile) {
+        switch line {
+        case .complete(let data):
+            accept(data, into: &file)
+        case .oversized(let prefix):
+            // Codex normally writes its outer discriminator ahead of the payload. Large tool
+            // output and image records can safely be skipped once that header is established.
+            struct Header: Decodable { let type: String }
+            let marker = Data(#""payload""#.utf8)
+            if let key = prefix.range(of: marker) {
+                let header = prefix[..<key.lowerBound] + Data(#""payload":null}"#.utf8)
+                if let type = try? decoder.decode(Header.self, from: header).type,
+                    ["response_item", "dynamic_tools_updated"].contains(type)
+                {
+                    return
                 }
-                file.partial = true
             }
+            file.partial = true
         }
-        file.offset += committed
     }
 
     private func accept(_ line: Data, into file: inout HistoryFile) {
@@ -436,9 +558,46 @@ private struct HistoryCache: Codable {
     let version: Int
     let home: String
     let files: [String: HistoryFile]
+    let archiveOverflows: ArchiveOverflowCache?
+}
+
+private struct ArchiveOverflowCache: Codable {
+    let maximumBytes: Int
+    let fingerprints: [String: LogFingerprint]
+}
+
+private struct DecoderRevision: Codable, Equatable {
+    let path: String
+    let fingerprint: LogFingerprint
+
+    init?(_ url: URL) {
+        var info = stat()
+        guard stat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { return nil }
+        path = url.path
+        fingerprint = LogFingerprint(info)
+    }
+}
+
+private struct ArchiveSkip: Codable, Equatable {
+    let fingerprint: LogFingerprint
+    var limit: Int?
+    var decoder: DecoderRevision?
+    var failedAt: Date?
+
+    func applies(to revision: LogFingerprint, decoder current: DecoderRevision?, budget: Int, at now: Date) -> Bool {
+        guard fingerprint == revision else { return false }
+        if let limit { return limit == budget }
+        guard let decoder, decoder == current, let failedAt else { return false }
+        return (0..<86_400).contains(now.timeIntervalSince(failedAt))
+    }
 }
 
 private struct HistoryFile: Codable {
+    func valid(for path: String) -> Bool {
+        fingerprint.size >= 0 && (path.hasSuffix(".jsonl.zst") || offset <= UInt64(fingerprint.size))
+            && events.allSatisfy { $0.total >= 0 && ($0.counter?.last ?? 0) >= 0 }
+    }
+
     var fingerprint: LogFingerprint
     var offset: UInt64 = 0
     var anchor = Data()
@@ -478,59 +637,131 @@ private struct LogFingerprint: Codable, Equatable {
 }
 
 // A growing JSONL file may also have been edited in place. Verify every committed byte
-// before reusing parsed events, hashing each range once per changed-file check.
+// before reusing parsed events.
 struct TokenLogPrefix {
     private var hash = SHA256()
-    private var offset: UInt64 = 0
+    let start: UInt64
+    private var offset: UInt64
+    init(start: UInt64 = 0) {
+        self.start = start
+        offset = start
+    }
     var digest: Data { Data(hash.finalize()) }
 
-    mutating func extend(in stream: FileHandle, to end: UInt64) throws {
+    mutating func update(_ bytes: Data) {
+        hash.update(data: bytes)
+        offset += UInt64(bytes.count)
+    }
+
+    mutating func extend(in stream: FileHandle, to end: UInt64, didReadBytes: ((Int) -> Void)? = nil) throws {
         try stream.seek(toOffset: offset)
         while offset < end {
             let limit = Int(min(end - offset, 256 * 1024))
-            guard let bytes = try stream.read(upToCount: limit), !bytes.isEmpty else {
+            guard let bytes = try autoreleasepool(invoking: { try stream.read(upToCount: limit) }), !bytes.isEmpty
+            else {
                 throw TokenHistoryError.unavailable
             }
-            hash.update(data: bytes)
-            offset += UInt64(bytes.count)
+            update(bytes)
+            didReadBytes?(bytes.count)
         }
     }
 }
 
+// Sample a fixed length so an active writer cannot indefinitely extend this refresh.
+func readTokenLogSnapshot(
+    _ stream: FileHandle, at url: URL, opened: stat, from offset: UInt64, prefix initial: TokenLogPrefix,
+    didReadBytes: ((Int) -> Void)?, continuingOversizedLine: Bool = false,
+    observe: ((Data, UInt64) -> Void)? = nil, verifyCachedPrefix: (() throws -> Bool)? = nil,
+    accept: (TokenLogLine) throws -> Void
+) throws -> (offset: UInt64, anchor: Data) {
+    var remaining = UInt64(opened.st_size) - offset
+    var prefix = initial
+    var committedPrefix = initial
+    try stream.seek(toOffset: offset)
+    let committed = try readTokenLogLines(
+        read: {
+            guard remaining > 0 else { return Data() }
+            let bytes = try stream.read(upToCount: Int(min(remaining, 256 * 1024))) ?? Data()
+            guard !bytes.isEmpty else { throw TokenHistoryError.unavailable }
+            observe?(bytes, UInt64(opened.st_size) - remaining)
+            remaining -= UInt64(bytes.count)
+            didReadBytes?(bytes.count)
+            return bytes
+        },
+        observeChunk: { bytes, boundary in
+            if boundary > bytes.startIndex {
+                prefix.update(bytes[..<boundary])
+                committedPrefix = prefix
+            }
+            prefix.update(bytes[boundary...])
+        }, continuingOversizedLine: continuingOversizedLine, accept: accept)
+    let end = offset + committed
+    let anchor = committedPrefix.digest
+    var current = stat()
+    guard lstat(url.path, &current) == 0 else { throw TokenHistoryError.unavailable }
+    var before = LogFingerprint(opened)
+    var after = LogFingerprint(current)
+    // Allow a second append during verification, but never chase an active writer indefinitely.
+    for _ in 0..<2 where before != after {
+        guard before.sameFile(as: after), after.size > before.size else { throw TokenHistoryError.unavailable }
+        before = after
+        // Validate both the reused checkpoint and every newly parsed committed byte on a racing append.
+        guard try verifyCachedPrefix?() != false else { throw TokenHistoryError.unavailable }
+        var checked = TokenLogPrefix(start: initial.start)
+        try checked.extend(in: stream, to: end, didReadBytes: didReadBytes)
+        guard checked.digest == anchor, lstat(url.path, &current) == 0 else { throw TokenHistoryError.unavailable }
+        after = LogFingerprint(current)
+    }
+    guard before == after else { throw TokenHistoryError.unavailable }
+    return (end, anchor)
+}
+
 // Consume only newline-committed records. A trailing fragment is re-read after the writer appends.
 enum TokenLogLine {
+    static let maximumSize = 16 * 1024 * 1024
     case complete(Data)
     case oversized(prefix: Data)
 }
 
-func readTokenLogLines(read: () throws -> Data, accept: (TokenLogLine) -> Void) throws -> UInt64 {
-    let maximumLineSize = 16 * 1024 * 1024
+func readTokenLogLines(
+    read: () throws -> Data, observeChunk: ((Data, Data.Index) -> Void)? = nil, continuingOversizedLine: Bool = false,
+    accept: (TokenLogLine) throws -> Void
+) throws -> UInt64 {
+    var alreadyOversized = continuingOversizedLine
     var pending = Data()
     var lineLength = 0
     var committed: UInt64 = 0
     while true {
-        let chunk = try read()
-        guard !chunk.isEmpty else { return committed }
-        var start = chunk.startIndex
-        while let newline = chunk[start...].firstIndex(of: 10) {
-            let segment = chunk[start..<newline]
-            lineLength += segment.count
-            if lineLength > maximumLineSize {
-                accept(.oversized(prefix: Data(pending.prefix(1024))))
-            } else if pending.isEmpty {
-                accept(.complete(segment))
-            } else {
-                pending.append(segment)
-                accept(.complete(pending))
+        // FileHandle and Foundation decoders can leave autoreleased objects alive for the entire scan.
+        let reachedEnd = try autoreleasepool {
+            let chunk = try read()
+            guard !chunk.isEmpty else { return true }
+            var start = chunk.startIndex
+            while let newline = chunk[start...].firstIndex(of: 10) {
+                let segment = chunk[start..<newline]
+                lineLength += segment.count
+                if alreadyOversized || lineLength > TokenLogLine.maximumSize {
+                    try accept(.oversized(prefix: Data(pending.prefix(1024))))
+                } else if pending.isEmpty {
+                    try accept(.complete(segment))
+                } else {
+                    pending.append(segment)
+                    try accept(.complete(pending))
+                }
+                committed += UInt64(lineLength) + 1
+                pending.removeAll(keepingCapacity: true)
+                lineLength = 0
+                alreadyOversized = false
+                start = newline + 1
             }
-            committed += UInt64(lineLength) + 1
-            pending.removeAll(keepingCapacity: true)
-            lineLength = 0
-            start = newline + 1
+            // start is the boundary after the last committed newline, or startIndex if there was none.
+            observeChunk?(chunk, start)
+            let tail = chunk[start...]
+            lineLength += tail.count
+            if !alreadyOversized && lineLength <= TokenLogLine.maximumSize { pending.append(tail) }
+            return false
         }
-        let tail = chunk[start...]
-        lineLength += tail.count
-        if lineLength <= maximumLineSize { pending.append(tail) }
+        if reachedEnd { return committed }
     }
 }
 
@@ -702,19 +933,49 @@ private func cappedSum(_ lhs: Int64, _ rhs: Int64, partial: inout Bool) -> Int64
     return sum
 }
 
+struct CompressedLogConfiguration {
+    var maximumBytes = 256 * 1024 * 1024
+    var timeout: TimeInterval = 15
+    var executable: URL?
+
+    var binary: URL? {
+        executable
+            ?? ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd", "/usr/bin/zstd"].first {
+                FileManager.default.isExecutableFile(atPath: $0)
+            }.map { URL(fileURLWithPath: $0) }
+    }
+}
+
+private final class CompressedLogBudget {
+    var remainingBytes: Int
+    let deadline: DispatchTime
+    var exhausted: Bool { remainingBytes == 0 || DispatchTime.now() >= deadline }
+
+    init(_ configuration: CompressedLogConfiguration) {
+        remainingBytes = configuration.maximumBytes
+        deadline = .now() + configuration.timeout
+    }
+}
+
+private enum CompressedLogError: Error {
+    case byteLimitExceeded, decoderRejected
+}
+
 private final class CompressedLog {
     private let process = Process()
     private let reader: FileHandle
     private let exited = DispatchSemaphore(value: 0)
+    private let budget: CompressedLogBudget
 
-    init(input: FileHandle) throws {
-        let binary = ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd", "/usr/bin/zstd"].first {
-            FileManager.default.isExecutableFile(atPath: $0)
-        }
-        guard let binary else { throw TokenHistoryError.unavailable }
+    init(input: FileHandle, configuration: CompressedLogConfiguration, budget: CompressedLogBudget) throws {
+        self.budget = budget
+        guard let binary = configuration.binary else { throw TokenHistoryError.unavailable }
         let pipe = Pipe()
         reader = pipe.fileHandleForReading
-        process.executableURL = URL(fileURLWithPath: binary)
+        let fd = reader.fileDescriptor
+        let flags = fcntl(fd, F_GETFL)
+        guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else { throw TokenHistoryError.unavailable }
+        process.executableURL = binary
         process.arguments = ["-d", "-c", "-q"]
         process.standardInput = input
         process.standardOutput = pipe
@@ -724,15 +985,49 @@ private final class CompressedLog {
         try process.run()
     }
 
-    deinit {
+    func close() {
         try? reader.close()
-        if process.isRunning { process.terminate() }
+        // The decoder is disposable. A child that hangs or ignores signals must not hold the history queue.
+        if process.isRunning {
+            _ = Darwin.kill(process.processIdentifier, SIGKILL)
+            _ = exited.wait(timeout: .now() + .milliseconds(250))
+        }
     }
 
-    func read() throws -> Data { try reader.read(upToCount: 256 * 1024) ?? Data() }
+    func read() throws -> Data {
+        let fd = reader.fileDescriptor
+        while true {
+            let now = DispatchTime.now()
+            guard now < budget.deadline else { throw TokenHistoryError.unavailable }
+            let remaining = budget.deadline.uptimeNanoseconds - now.uptimeNanoseconds
+            var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let ready = poll(&descriptor, 1, Int32((remaining + 999_999) / 1_000_000))
+            if ready < 0, errno == EINTR { continue }
+            guard ready > 0, descriptor.revents & Int16(POLLIN | POLLHUP) != 0 else {
+                throw TokenHistoryError.unavailable
+            }
+            // Probe one byte past the budget to distinguish exact-limit EOF from excess output.
+            var bytes = Data(count: min(64 * 1024, budget.remainingBytes + 1))
+            let count = bytes.withUnsafeMutableBytes { raw in Darwin.read(fd, raw.baseAddress, raw.count) }
+            if count < 0, errno == EINTR || errno == EAGAIN { continue }
+            guard count >= 0 else { throw TokenHistoryError.unavailable }
+            guard count <= budget.remainingBytes else {
+                budget.remainingBytes = 0
+                guard DispatchTime.now() < budget.deadline, process.isRunning || process.terminationStatus == 0 else {
+                    throw TokenHistoryError.unavailable
+                }
+                throw CompressedLogError.byteLimitExceeded
+            }
+            budget.remainingBytes -= count
+            bytes.count = count
+            return bytes
+        }
+    }
 
     func finish() throws {
-        exited.wait()
-        guard process.terminationStatus == 0 else { throw TokenHistoryError.unavailable }
+        guard DispatchTime.now() < budget.deadline, exited.wait(timeout: budget.deadline) == .success,
+            process.terminationReason == .exit
+        else { throw TokenHistoryError.unavailable }
+        guard process.terminationStatus == 0 else { throw CompressedLogError.decoderRejected }
     }
 }

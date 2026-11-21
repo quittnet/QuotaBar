@@ -2,12 +2,16 @@ import Foundation
 
 actor LocalTokenReader {
     private lazy var codex = TokenHistory()
-    private lazy var claude = ClaudeTokenHistory()
+    private var claude: (profile: URL, history: ClaudeTokenHistory)?
 
-    func totals(for provider: UsageProvider, now: Date) throws -> TokenTotals {
+    func totals(for provider: UsageProvider, now: Date, claudeProfile: URL) throws -> TokenTotals {
         switch provider {
         case .codex: return try codex.read(now: now)
-        case .claude: return try claude.read(now: now)
+        case .claude:
+            if let claude, claude.profile == claudeProfile { return try claude.history.read(now: now) }
+            let history = ClaudeTokenHistory(profile: claudeProfile)
+            claude = (claudeProfile, history)
+            return try history.read(now: now)
         }
     }
 }

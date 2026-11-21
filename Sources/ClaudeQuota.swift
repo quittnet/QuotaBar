@@ -3,9 +3,32 @@ import Darwin
 import Foundation
 
 enum ClaudeQuotaSource {
-    static let cacheFile = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("app.quotabar.QuotaBar/claude", isDirectory: true)
-        .appendingPathComponent("quota.json")
+    struct CaptureOrder: Codable, Sendable {
+        let boot: UUID
+        let ticks: UInt64
+
+        private static let bootID: UUID? = {
+            var bytes = [UInt8](repeating: 0, count: 37)
+            var size = bytes.count
+            guard sysctlbyname("kern.bootsessionuuid", &bytes, &size, nil, 0) == 0 else { return nil }
+            return UUID(uuidString: String(decoding: bytes.prefix { $0 != 0 }, as: UTF8.self))
+        }()
+
+        static func current() -> Self? {
+            let ticks = mach_continuous_time()
+            return bootID.map { Self(boot: $0, ticks: ticks) }
+        }
+    }
+
+    static var cacheFile: URL { cacheFile(for: ClaudeProfile.directory) }
+
+    static func cacheFile(for profile: URL) -> URL {
+        let path = profile.resolvingSymlinksInPath().standardizedFileURL.path
+        let key = SHA256.hash(data: Data(path.utf8)).map { String(format: "%02x", $0) }.joined()
+        return FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("app.quotabar.QuotaBar/claude", isDirectory: true)
+            .appendingPathComponent(key + ".json")
+    }
 
     static func read(file: URL = cacheFile, now: Date = Date()) throws -> QuotaReading? {
         guard let snapshot = try load(file), (snapshot.lastRecordedAt ?? snapshot.observedAt) <= now else { return nil }
@@ -15,23 +38,31 @@ enum ClaudeQuotaSource {
     }
 
     /// Accepts the documented Claude Code status-line JSON. Never persists the original input.
-    static func capture(statusLine: Data, file: URL = cacheFile, now: Date = Date()) throws {
+    static func capture(
+        statusLine: Data, file: URL = cacheFile, order: CaptureOrder? = .current(), now: Date = Date(),
+        currentDate: () -> Date = Date.init
+    ) throws {
         let payload: StatusLine
         do {
             payload = try JSONDecoder().decode(StatusLine.self, from: statusLine)
         } catch {
-            try invalidate(file: file, now: now)
+            try invalidate(file: file, order: order, now: now, currentDate: currentDate)
             throw error
         }
         let limits = payload.rateLimits.flatMap { $0.activeWindows(at: now).isEmpty ? nil : $0 }
-        try record(limits, sessionID: payload.sessionID, file: file, now: now)
+        try record(limits, sessionID: payload.sessionID, file: file, order: order, now: now, currentDate: currentDate)
     }
 
-    static func invalidate(file: URL = cacheFile, now: Date = Date()) throws {
-        try record(nil, sessionID: nil, file: file, now: now)
+    static func invalidate(
+        file: URL = cacheFile, order: CaptureOrder? = .current(), now: Date = Date(),
+        currentDate: () -> Date = Date.init
+    ) throws {
+        try record(nil, sessionID: nil, file: file, order: order, now: now, currentDate: currentDate)
     }
 
-    private static func record(_ limits: Limits?, sessionID: String?, file: URL, now: Date) throws {
+    private static func record(
+        _ limits: Limits?, sessionID: String?, file: URL, order: CaptureOrder?, now: Date, currentDate: () -> Date
+    ) throws {
         try FileManager.default.createDirectory(
             at: file.deletingLastPathComponent(), withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
@@ -41,9 +72,22 @@ enum ClaudeQuotaSource {
         guard lock >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
         defer { close(lock) }
         guard flock(lock, LOCK_EX) == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
-        // The next valid report can replace a damaged cache.
-        let previous = try? load(file)
-        if let previous, (previous.lastRecordedAt ?? previous.observedAt) > now { return }
+        let lockedAt = currentDate()
+        guard now <= lockedAt else { return }
+        var previous = try? load(file)
+        if let saved = previous {
+            if let order, let prior = saved.order {
+                // Ticks survive sleep but reset at boot. An impossible future tick cannot establish ordering.
+                if prior.boot == order.boot && prior.ticks <= mach_continuous_time() && order.ticks <= prior.ticks {
+                    return
+                }
+            } else {
+                // Legacy caches and systems without a boot ID have only wall-clock ordering.
+                let recorded = saved.lastRecordedAt ?? saved.observedAt
+                if recorded <= lockedAt && recorded > now { return }
+            }
+            if saved.observedAt > now { previous = nil }
+        }
         var accepted = limits
         var sessions = previous?.recentSessions ?? []
         if let id = sessionID, !id.isEmpty {
@@ -62,7 +106,7 @@ enum ClaudeQuotaSource {
         let observedAt = sameBalance ? previous?.observedAt ?? now : now
         // Even an unchanged report advances ordering, without advancing the time of the quota observation.
         let snapshot = Snapshot(
-            observedAt: observedAt, lastRecordedAt: now, limits: accepted, unavailable: accepted == nil,
+            observedAt: observedAt, lastRecordedAt: now, order: order, limits: accepted, unavailable: accepted == nil,
             recentSessions: sessions)
         let data = try JSONEncoder().encode(snapshot)
         try data.write(to: file, options: .atomic)
@@ -111,6 +155,7 @@ enum ClaudeQuotaSource {
         let observedAt: Date
         // A later terminal can report the same snapshot without making its quota data fresher.
         let lastRecordedAt: Date?
+        let order: CaptureOrder?
         let limits: Limits?
         let unavailable: Bool?
         let recentSessions: [SessionReport]?

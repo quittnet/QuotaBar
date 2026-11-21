@@ -101,7 +101,7 @@ enum NetworkChecks {
 
     @MainActor static func main() {
         let root = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
-        let suite = "QuotaBar-network-test-" + UUID().uuidString
+        let suite = testPreferencesDomain()
         let preferences = UserDefaults(suiteName: suite)!
         preferences.set("codex", forKey: "selectedProvider")
         preferences.set("codex", forKey: "providerSelection")

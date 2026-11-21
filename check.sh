@@ -8,19 +8,29 @@ case "${1:-}" in
 esac
 checks_dir=$(mktemp -d "${TMPDIR:-/tmp}/quotabar-check.XXXXXX")
 sparkle=
+QUOTABAR_TEST_PREFERENCES=
+preference_snapshot="${checks_dir}/real-preferences.json"
+python3 Tests/PreferenceDomainChecks.py snapshot "${preference_snapshot}"
 cleanup() {
+    status=$?
+    python3 Tests/PreferenceDomainChecks.py verify "${preference_snapshot}" || status=1
     rm -r "${checks_dir}"
+    if [ -n "${QUOTABAR_TEST_PREFERENCES}" ]; then rm -r "${QUOTABAR_TEST_PREFERENCES}"; fi
     if [ -n "${sparkle}" ]; then rm -r "${sparkle}"; fi
+    exit "${status}"
 }
 trap cleanup EXIT
+# cfprefsd can read an absolute suite here even when the runner's per-user TMPDIR is sandboxed.
+QUOTABAR_TEST_PREFERENCES=$(mktemp -d /private/tmp/quotabar-preferences.XXXXXX)
+export QUOTABAR_TEST_PREFERENCES
 compile() {
-    xcrun swiftc -module-cache-path "${TMPDIR:-/tmp}/quotabar-build-modules" -swift-version 5 \
+    xcrun swiftc -module-cache-path "${checks_dir}/modules" -swift-version 5 \
         -strict-concurrency=complete -warnings-as-errors -target "${target_arch}-apple-macosx14.0" -parse-as-library "$@"
 }
 compile -typecheck Sources/*.swift
 compile_claude_usage() {
-    compile Sources/QuotaCore.swift Sources/Presentation.swift Sources/ClaudeUsageClient.swift \
-        Tests/ClaudeUsageChecks.swift -o "${checks_dir}/claude-usage"
+    compile Sources/ClaudeProfile.swift Sources/ProviderExecutable.swift Sources/ProviderProcess.swift Sources/QuotaCore.swift Sources/Presentation.swift Sources/ClaudeUsageClient.swift \
+        Tests/TestPreferences.swift Tests/ClaudeUsageChecks.swift -o "${checks_dir}/claude-usage"
 }
 if [ "${1:-}" = "--claude-live" ]; then
     compile_claude_usage
@@ -28,13 +38,18 @@ if [ "${1:-}" = "--claude-live" ]; then
     exit 0
 fi
 if [ "${1:-}" = "--lint" ]; then
+    sh -n sign-quotabar.sh
     sh -n build.sh
     sh -n check.sh
     sh -n package.sh
     sh -n fetch-sparkle.sh
     sh -n release-update.sh
     sh -n Tests/UpdaterChecks.sh
-    if command -v shellcheck >/dev/null 2>&1; then shellcheck --enable=all -s sh build.sh check.sh package.sh fetch-sparkle.sh release-update.sh Tests/UpdaterChecks.sh; fi
+    if command -v shellcheck >/dev/null 2>&1; then
+        shellcheck --enable=all -s sh sign-quotabar.sh build.sh check.sh package.sh fetch-sparkle.sh release-update.sh Tests/UpdaterChecks.sh
+    else
+        echo 'Warning: shellcheck is unavailable. Skipped shell script linting with shellcheck.' >&2
+    fi
     plutil -lint Resources/Info.plist
     xcrun swift-format lint --strict --recursive Sources Tests
     exit 0
@@ -48,14 +63,19 @@ compile_app_check() {
         if [ "${source_file}" != "Sources/Main.swift" ]; then set -- "$@" "${source_file}"; fi
     done
     cp -R Resources/ProviderLogos "${checks_dir}/ProviderLogos"
-    compile "$@" "${test_entry}" -o "${binary}"
+    compile "$@" Tests/TestPreferences.swift "${test_entry}" -o "${binary}"
+}
+offline_run() {
+    mkdir -p "${checks_dir}/profile" "${checks_dir}/codex" "${checks_dir}/claude"
+    HOME="${checks_dir}/profile" CFFIXED_USER_HOME="${checks_dir}/profile" CODEX_HOME="${checks_dir}/codex" \
+        CLAUDE_CONFIG_DIR="${checks_dir}/claude" "$@"
 }
 logic_stress() {
     compile_app_check Tests/QuotaLogicChecks.swift "${checks_dir}/quota-logic"
-    "${checks_dir}/quota-logic"
-    compile Sources/PrivateFile.swift Sources/QuotaCore.swift Sources/Presentation.swift Sources/UsageResets.swift \
+    offline_run "${checks_dir}/quota-logic"
+    compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/ProviderExecutable.swift Sources/ProviderProcess.swift Sources/QuotaCore.swift Sources/Presentation.swift Sources/UsageResets.swift \
         Tests/ResetLogicStressChecks.swift -o "${checks_dir}/reset-logic"
-    "${checks_dir}/reset-logic"
+    offline_run "${checks_dir}/reset-logic"
 }
 update_stress() {
     sparkle=$(./fetch-sparkle.sh)
@@ -63,9 +83,10 @@ update_stress() {
     compile -F "${sparkle}" -framework Sparkle -Xlinker -rpath -Xlinker "${sparkle}" \
         Sources/Updater.swift Tests/UpdateStateChecks.swift -o "${checks_dir}/update-state"
     "${checks_dir}/update-state"
-    compile -F "${sparkle}" -framework Sparkle -Xlinker -rpath -Xlinker "${sparkle}" \
+    compile -F "${sparkle}" -framework Sparkle -Xlinker -rpath -Xlinker '@executable_path/../Frameworks' \
         Tests/UpdateFeedChecks.swift -o "${checks_dir}/Probe.app/Contents/MacOS/Probe"
     python3 Tests/UpdateProbeChecks.py "${checks_dir}" "${sparkle}"
+    python3 Tests/LibraryConstraintChecks.py "${checks_dir}" "${sparkle}"
 }
 if [ "${1:-}" = "--update-stress" ]; then
     update_stress
@@ -107,32 +128,43 @@ if [ "${1:-}" = "--network" ]; then
         "${checks_dir}/network" "${checks_dir}"
     exit 0
 fi
-compile Sources/PrivateFile.swift Sources/ClaudeConnection.swift Tests/ClaudeConnectionChecks.swift -o "${checks_dir}/claude-connection"
-"${checks_dir}/claude-connection"
-compile Sources/QuotaCore.swift Tests/CoreChecks.swift -o "${checks_dir}/core"
-"${checks_dir}/core"
-compile Sources/QuotaCore.swift Sources/Presentation.swift Tests/PresentationChecks.swift -o "${checks_dir}/presentation"
-"${checks_dir}/presentation"
-compile Sources/PrivateFile.swift Sources/QuotaCore.swift Sources/Presentation.swift Sources/UsageResets.swift Tests/ResetFlowChecks.swift -o "${checks_dir}/resets"
-"${checks_dir}/resets"
-compile Sources/PrivateFile.swift Sources/TokenHistory.swift Tests/TokenChecks.swift -o "${checks_dir}/tokens"
-"${checks_dir}/tokens"
-compile Sources/PrivateFile.swift Sources/QuotaCore.swift Sources/ClaudeQuota.swift Tests/ClaudeQuotaChecks.swift -o "${checks_dir}/claude-quota"
-"${checks_dir}/claude-quota"
+compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/ClaudeSettingsDocument.swift Sources/ClaudeConnection.swift Tests/TestPreferences.swift Tests/ClaudeConnectionChecks.swift -o "${checks_dir}/claude-connection"
+offline_run "${checks_dir}/claude-connection"
+compile Sources/ClaudeProfile.swift Sources/ProviderExecutable.swift Sources/ProviderProcess.swift Sources/QuotaCore.swift Tests/CoreChecks.swift -o "${checks_dir}/core"
+offline_run "${checks_dir}/core"
+compile Sources/ClaudeProfile.swift Sources/ProviderExecutable.swift Sources/ProviderProcess.swift Sources/QuotaCore.swift Sources/Presentation.swift Tests/TestPreferences.swift Tests/PresentationChecks.swift -o "${checks_dir}/presentation"
+offline_run "${checks_dir}/presentation"
+compile Sources/NetworkChanges.swift Tests/NetworkSignalChecks.swift -o "${checks_dir}/network-signals"
+offline_run "${checks_dir}/network-signals"
+compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/ProviderExecutable.swift Sources/ProviderProcess.swift Sources/QuotaCore.swift Sources/Presentation.swift Sources/UsageResets.swift Tests/ResetFlowChecks.swift -o "${checks_dir}/resets"
+offline_run "${checks_dir}/resets"
+compile Sources/PrivateFile.swift Sources/CodexHistoryCache.swift Sources/TokenHistory.swift Tests/TokenChecks.swift -o "${checks_dir}/tokens"
+offline_run "${checks_dir}/tokens"
+compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/ProviderExecutable.swift Sources/ProviderProcess.swift Sources/QuotaCore.swift Sources/ClaudeQuota.swift Tests/ClaudeQuotaChecks.swift -o "${checks_dir}/claude-quota"
+offline_run "${checks_dir}/claude-quota"
 compile_claude_usage
-"${checks_dir}/claude-usage"
-compile Sources/PrivateFile.swift Sources/TokenHistory.swift Sources/ClaudeTokenHistory.swift Tests/ClaudeTokenChecks.swift -o "${checks_dir}/claude-tokens"
-"${checks_dir}/claude-tokens"
+offline_run "${checks_dir}/claude-usage"
+compile Sources/ClaudeProfile.swift Sources/ProviderExecutable.swift Sources/ProviderProcess.swift Sources/QuotaCore.swift Sources/Presentation.swift Sources/ClaudeUsageClient.swift \
+    Tests/ProviderProcessChecks.swift -o "${checks_dir}/provider-process"
+offline_run "${checks_dir}/provider-process"
+compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/CodexHistoryCache.swift Sources/TokenHistory.swift Sources/ClaudeHistoryIndex.swift Sources/ClaudeTokenHistory.swift Tests/ClaudeTokenChecks.swift -o "${checks_dir}/claude-tokens"
+offline_run "${checks_dir}/claude-tokens"
+compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/CodexHistoryCache.swift Sources/TokenHistory.swift Sources/ClaudeHistoryIndex.swift Sources/ClaudeTokenHistory.swift \
+    Tests/LiveTokenHistoryChecks.swift -o "${checks_dir}/live-token-history"
+offline_run "${checks_dir}/live-token-history"
+compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/CodexHistoryCache.swift Sources/TokenHistory.swift Sources/ClaudeHistoryIndex.swift Sources/ClaudeTokenHistory.swift \
+    Tests/ClaudeHistoryMemoryChecks.swift -o "${checks_dir}/claude-history-memory"
+offline_run "${checks_dir}/claude-history-memory"
 if [ "${1:-}" = "--stress" ]; then
     logic_stress
     echo 'Exercising quota and token histories under load.'
-    compile Sources/PrivateFile.swift Sources/QuotaCore.swift Sources/Presentation.swift Sources/ClaudeUsageClient.swift \
-        Sources/TokenHistory.swift Sources/ClaudeTokenHistory.swift Tests/DataStressChecks.swift -o "${checks_dir}/data-stress"
-    "${checks_dir}/data-stress"
+    compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/ProviderExecutable.swift Sources/ProviderProcess.swift Sources/QuotaCore.swift Sources/Presentation.swift Sources/ClaudeUsageClient.swift \
+        Sources/CodexHistoryCache.swift Sources/TokenHistory.swift Sources/ClaudeHistoryIndex.swift Sources/ClaudeTokenHistory.swift Tests/DataStressChecks.swift -o "${checks_dir}/data-stress"
+    offline_run "${checks_dir}/data-stress"
     echo 'Racing reset confirmations from separate processes.'
-    compile Sources/PrivateFile.swift Sources/QuotaCore.swift Sources/Presentation.swift Sources/UsageResets.swift \
+    compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/ProviderExecutable.swift Sources/ProviderProcess.swift Sources/QuotaCore.swift Sources/Presentation.swift Sources/UsageResets.swift \
         Tests/ResetContentionChecks.swift -o "${checks_dir}/reset-contention"
-    "${checks_dir}/reset-contention"
+    offline_run "${checks_dir}/reset-contention"
     echo 'All window-free stress checks passed.'
     exit 0
 fi

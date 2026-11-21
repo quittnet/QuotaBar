@@ -4,13 +4,52 @@ import Foundation
 @main
 struct ClaudeUsageChecks {
     static func main() throws {
+        let environment = ProcessInfo.processInfo.environment
+        if let nativePath = environment["QUOTABAR_MOCK_NATIVE_PATH"], environment["PATH"] != nativePath {
+            exit(1)
+        }
         if CommandLine.arguments.contains("-p") {
             try serveMock()
             return
         }
-        if CommandLine.arguments.dropFirst().elementsEqual(["--live"]) {
+        if CommandLine.arguments.contains("app-server") {
+            try serveCodexMock()
+            return
+        }
+        if CommandLine.arguments.count == 5, CommandLine.arguments[1] == "--selected-cli" {
+            let name = CommandLine.arguments[2]
+            let file = URL(fileURLWithPath: CommandLine.arguments[3])
+            guard let home = environment["CFFIXED_USER_HOME"], file.path.hasPrefix(home + "/") else { exit(1) }
+            // Let the normal provider entry point see the parent fixture without writing standard defaults.
+            let suite = CommandLine.arguments[4]
+            guard let selection = UserDefaults(suiteName: suite)?.persistentDomain(forName: suite) else { exit(1) }
+            UserDefaults.standard.setVolatileDomain(selection, forName: UserDefaults.argumentDomain)
+            guard ProviderExecutable.hasSelection(name),
+                ProviderExecutable.selected(name) == file.resolvingSymlinksInPath()
+            else { exit(1) }
+            let reading =
+                name == "codex" ? try QuotaSource.read(timeout: .seconds(2)) : try ClaudeUsageClient.read(timeout: 2)
+            precondition(reading.windows.first?.used == 37)
+            return
+        }
+        if CommandLine.arguments.dropFirst().first == "--npm-cli" {
+            let provider = CommandLine.arguments[2]
             do {
-                let reading = try ClaudeUsageClient.read()
+                try checkNPMCLI(provider: provider)
+            } catch {
+                print("Npm-style \(provider) launch failed: \(error)")
+                exit(1)
+            }
+            return
+        }
+        if CommandLine.arguments.dropFirst().elementsEqual(["--live"]) {
+            // Discover the CLI as a fresh install would. The test binary's own preferences domain can hold
+            // CLI choices left by older fixture runs that point at deleted temporary files.
+            let suite = testPreferencesDomain()
+            let isolated = UserDefaults(suiteName: suite)!
+            defer { isolated.removePersistentDomain(forName: suite) }
+            do {
+                let reading = try ClaudeUsageClient.read(defaults: isolated)
                 let now = Date()
                 guard let peak = reading.windows.map(\.used).max() else { throw ClaudeUsageClient.Failure.unavailable }
                 for mode in PercentageMode.allCases {
@@ -133,9 +172,133 @@ struct ClaudeUsageChecks {
                 precondition(Date().timeIntervalSince(start) < 3)
             }
         }
+        try checkConfigurationDirectory(executable: executable)
+        try checkNPMCLI(provider: "codex")
+        try checkNPMCLI(provider: "claude")
         print(
             "Claude control checks passed: no conversation turns, exact aggregate windows, malformed data rejection, unsupported protocol, bounded output, EOF, and timeout cleanup."
         )
+    }
+
+    private static func checkNPMCLI(provider: String) throws {
+        let files = FileManager.default
+        let directory = files.temporaryDirectory.appendingPathComponent("quotabar CLI " + UUID().uuidString)
+        try files.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? files.removeItem(at: directory) }
+        func script(_ name: String, _ content: String) throws -> URL {
+            let url = directory.appendingPathComponent(name)
+            try Data(content.utf8).write(to: url)
+            try files.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+            return url
+        }
+        let cliModule = try script("cli.js", "#!/usr/bin/env node\n")
+        let cli = directory.appendingPathComponent(provider)
+        try files.createSymbolicLink(at: cli, withDestinationURL: cliModule)
+        _ = try script(
+            "node",
+            """
+            #!/bin/sh
+            [ "$1" = "$QUOTABAR_MOCK_NPM_CLI" ] || exit 1
+            shift
+            exec "$QUOTABAR_MOCK_NPM_PROBE" "$@"
+
+            """)
+        let previousPath = ProcessInfo.processInfo.environment["PATH"]
+        let probe = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+        setenv("QUOTABAR_MOCK_NPM_CLI", cli.path, 1)
+        setenv("QUOTABAR_MOCK_NPM_PROBE", probe.path, 1)
+        defer {
+            if let previousPath { setenv("PATH", previousPath, 1) } else { unsetenv("PATH") }
+            unsetenv("QUOTABAR_MOCK_NPM_CLI")
+            unsetenv("QUOTABAR_MOCK_NPM_PROBE")
+            unsetenv("QUOTABAR_MOCK_NATIVE_PATH")
+        }
+        func read(executable: URL, path: String) throws {
+            setenv("PATH", path, 1)
+            let reading =
+                provider == "codex"
+                ? try QuotaSource.read(executable: executable, timeout: .seconds(2))
+                : try ClaudeUsageClient.read(executable: executable, timeout: 2)
+            precondition(reading.windows.first?.used == 37)
+        }
+        let guiPath = "/usr/bin:/bin:/usr/sbin:/sbin"
+        try read(executable: cli, path: guiPath)
+        let competing = directory.appendingPathComponent("competing", isDirectory: true)
+        try files.createDirectory(at: competing, withIntermediateDirectories: false)
+        _ = try script("competing/node", "#!/bin/sh\nexit 1\n")
+        let competingPath = "\(competing.path):\(guiPath):\(directory.path)"
+        try read(executable: cli, path: ".::" + competingPath)
+        let native = directory.appendingPathComponent("native-" + provider)
+        try files.createSymbolicLink(at: native, withDestinationURL: probe)
+        for path in [guiPath, competingPath] {
+            setenv("QUOTABAR_MOCK_NATIVE_PATH", path, 1)
+            try read(executable: native, path: ".::" + path)
+        }
+
+        let versions = directory.appendingPathComponent("nvm/versions/node", isDirectory: true)
+        for version in ["v9.12.0", "v22.1.0", "v22.12.0", "v99.0.0-invalid"] {
+            let bin = versions.appendingPathComponent("\(version)/bin", isDirectory: true)
+            try files.createDirectory(at: bin, withIntermediateDirectories: true)
+            try files.createSymbolicLink(at: bin.appendingPathComponent(provider), withDestinationURL: cliModule)
+        }
+        let paths = ProviderCLIPaths(
+            home: directory,
+            environment: ["PATH": ".::\(guiPath)", "NVM_DIR": directory.appendingPathComponent("nvm").path])
+        let suite = testPreferencesDomain()
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        precondition(paths.executable(named: provider, preferred: [native], defaults: defaults) == nil)
+        let chosen = versions.appendingPathComponent("v22.12.0/bin/\(provider)")
+        try ProviderExecutable.choose(chosen, name: provider, defaults: defaults)
+        precondition(
+            paths.executable(named: provider, preferred: [], defaults: defaults) == chosen.resolvingSymlinksInPath())
+        let chosenBin = chosen.deletingLastPathComponent()
+        try files.createSymbolicLink(at: chosenBin.appendingPathComponent("node"), withDestinationURL: probe)
+        let selectedCheck = Process()
+        selectedCheck.executableURL = probe
+        precondition(defaults.synchronize())
+        selectedCheck.arguments = ["--selected-cli", provider, chosen.path, suite]
+        var environment = ProcessInfo.processInfo.environment
+        environment.removeValue(forKey: "QUOTABAR_MOCK_NATIVE_PATH")
+        environment["HOME"] = directory.path
+        environment["CFFIXED_USER_HOME"] = directory.path
+        environment["CLAUDE_CONFIG_DIR"] = directory.path
+        environment["CODEX_HOME"] = directory.path
+        environment["PATH"] = guiPath
+        selectedCheck.environment = environment
+        try selectedCheck.run()
+        selectedCheck.waitUntilExit()
+        precondition(
+            selectedCheck.terminationStatus == 0, "Selected CLI must work through the provider’s normal entry point")
+        let selectedEnv = paths.childEnvironment(
+            for: chosen.resolvingSymlinksInPath(), named: provider, defaults: defaults)
+        precondition(selectedEnv["PATH"]?.components(separatedBy: ":").first == chosenBin.path)
+        try Data("#!/usr/bin/env node\n// new version\n".utf8).write(to: cliModule)
+        precondition(paths.executable(named: provider, preferred: [], defaults: defaults) == nil)
+        try ProviderExecutable.choose(chosen, name: provider, defaults: defaults)
+        precondition(
+            paths.executable(named: provider, preferred: [], defaults: defaults) == chosen.resolvingSymlinksInPath())
+        try files.removeItem(at: chosen)
+        try files.createSymbolicLink(at: chosen, withDestinationURL: probe)
+        precondition(paths.executable(named: provider, preferred: [], defaults: defaults) == nil)
+        ProviderExecutable.useAutomatic(provider, defaults: defaults)
+        precondition(paths.executable(named: provider, preferred: [], defaults: defaults) == nil)
+        let childPath = paths.childEnvironment(for: cli)["PATH"]
+        precondition(childPath == "\(directory.path):\(guiPath)")
+    }
+
+    private static func serveCodexMock() throws {
+        while let line = readLine() {
+            let request = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+            let reply: String
+            switch request?["method"] as? String {
+            case "initialize": reply = #"{"id":1,"result":{}}"#
+            case "account/rateLimits/read":
+                reply = #"{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":37,"windowDurationMins":300}}}}"#
+            default: continue
+            }
+            try FileHandle.standardOutput.write(contentsOf: Data((reply + "\n").utf8))
+        }
     }
 
     private static func expect(_ failure: ClaudeUsageClient.Failure, _ run: () throws -> Void) throws {
@@ -145,6 +308,52 @@ struct ClaudeUsageChecks {
         } catch let error as ClaudeUsageClient.Failure {
             precondition(String(describing: error) == String(describing: failure))
         }
+    }
+
+    /// The default ~/.claude profile must reach Claude Code without CLAUDE_CONFIG_DIR, or Claude Code
+    /// reads a separate, signed-out .claude.json and keychain item and reports no subscription limits.
+    private static func checkConfigurationDirectory(executable: URL) throws {
+        let suite = testPreferencesDomain()
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let home = URL(fileURLWithPath: "/Users/fixture", isDirectory: true)
+        func child(_ environment: [String: String]) -> String? {
+            ClaudeProfile.childConfigurationDirectory(defaults: defaults, environment: environment, home: home)
+        }
+        precondition(child([:]) == nil, "The default profile must not set CLAUDE_CONFIG_DIR.")
+        precondition(child(["CLAUDE_CONFIG_DIR": "/Users/fixture/.claude"]) == "/Users/fixture/.claude")
+        precondition(child(["CLAUDE_CONFIG_DIR": "/Volumes/work/claude"]) == "/Volumes/work/claude")
+        for standard in ["/Users/fixture/.claude", "/Users/fixture/.claude/", "/Users/fixture/./.claude"] {
+            ClaudeProfile.select(URL(fileURLWithPath: standard, isDirectory: true), defaults: defaults)
+            precondition(child([:]) == nil, "Selecting \(standard) must keep Claude Code's default profile.")
+        }
+        ClaudeProfile.select(URL(fileURLWithPath: "/Users/fixture/work-claude", isDirectory: true), defaults: defaults)
+        precondition(child([:]) == "/Users/fixture/work-claude")
+        ClaudeProfile.select(nil, defaults: defaults)
+
+        // The real read path omits the variable for the default profile and passes a configured one.
+        let record = FileManager.default.temporaryDirectory.appendingPathComponent("claude-env-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: record) }
+        let inherited = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"]
+        defer { if let inherited { setenv("CLAUDE_CONFIG_DIR", inherited, 1) } }
+        setenv("QUOTABAR_CLAUDE_TEST_MODE", "success", 1)
+        setenv("QUOTABAR_CLAUDE_ENV_RECORD", record.path, 1)
+        defer {
+            unsetenv("QUOTABAR_CLAUDE_TEST_MODE")
+            unsetenv("QUOTABAR_CLAUDE_ENV_RECORD")
+        }
+        unsetenv("CLAUDE_CONFIG_DIR")
+        let standardDirectory = ClaudeProfile.directory.path
+        precondition(standardDirectory.hasSuffix("/.claude") && ClaudeProfile.childConfigurationDirectory() == nil)
+        _ = try ClaudeUsageClient.read(executable: executable, timeout: 2)
+        let omitted = try String(contentsOf: record, encoding: .utf8)
+        precondition(omitted == "<unset>", "Default profile passed CLAUDE_CONFIG_DIR=\(omitted).")
+        let custom = FileManager.default.temporaryDirectory.appendingPathComponent("custom-claude").path
+        setenv("CLAUDE_CONFIG_DIR", custom, 1)
+        _ = try ClaudeUsageClient.read(executable: executable, timeout: 2)
+        let passed = try String(contentsOf: record, encoding: .utf8)
+        precondition(passed == custom)
+        print("Claude default profile reaches Claude Code without CLAUDE_CONFIG_DIR; custom profiles pass it.")
     }
 
     private static func serveMock() throws {
@@ -168,6 +377,10 @@ struct ClaudeUsageChecks {
         let query = request["request"] as? [String: Any]
         precondition(query?["subtype"] as? String == "get_usage" && query?["skip_behaviors"] as? Bool == true)
         let mode = ProcessInfo.processInfo.environment["QUOTABAR_CLAUDE_TEST_MODE"]
+        if let record = ProcessInfo.processInfo.environment["QUOTABAR_CLAUDE_ENV_RECORD"] {
+            let value = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"] ?? "<unset>"
+            try Data(value.utf8).write(to: URL(fileURLWithPath: record))
+        }
         if mode == "hang" {
             sleep(10)
             return

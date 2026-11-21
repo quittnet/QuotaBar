@@ -8,7 +8,7 @@ enum ClaudeUsageClient {
         var errorDescription: String? {
             switch self {
             case .notInstalled:
-                return "Install Claude Code and sign in with your Claude subscription to check limits."
+                return "Choose your installed Claude Code CLI or install it and sign in."
             case .unsupported:
                 return "Update Claude Code to enable automatic subscription limit checks."
             case .accountUnavailable:
@@ -23,9 +23,13 @@ enum ClaudeUsageClient {
         }
     }
 
-    static func read(executable: URL? = nil, timeout: TimeInterval = 15) throws -> QuotaReading {
-        guard let executable = executable ?? executableURL() else { throw Failure.notInstalled }
-        let process = Process()
+    static func read(
+        executable: URL? = nil, timeout: TimeInterval = 15, defaults: UserDefaults = .standard
+    ) throws -> QuotaReading {
+        let paths = ProviderCLIPaths()
+        guard let executable = executable ?? executableURL(paths: paths, defaults: defaults) else {
+            throw Failure.notInstalled
+        }
         let input = Pipe()
         let output = Pipe()
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -33,30 +37,25 @@ enum ClaudeUsageClient {
         try FileManager.default.createDirectory(
             at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: directory) }
-        process.executableURL = executable
-        process.arguments = [
+        var environment = paths.childEnvironment(for: executable, named: "claude", defaults: defaults)
+        environment["CLAUDE_CONFIG_DIR"] = ClaudeProfile.childConfigurationDirectory()
+        let arguments = [
             "-p", "--safe-mode", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
             "--no-session-persistence", "--strict-mcp-config", "--tools", "", "--setting-sources", "",
             "--settings", "{\"disableAllHooks\":true}",
         ]
-        process.currentDirectoryURL = directory
-        process.standardInput = input
-        process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-        let exited = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in exited.signal() }
-        do { try process.run() } catch { throw Failure.unavailable }
+        let process: ProviderProcess
+        do {
+            process = try ProviderProcess(
+                executable: executable, arguments: arguments, environment: environment, directory: directory,
+                input: input, output: output)
+        } catch { throw Failure.unavailable }
+        var failed = true
         let writer = input.fileHandleForWriting
         let reader = output.fileHandleForReading
         defer {
             try? writer.close()
-            if exited.wait(timeout: .now() + .milliseconds(100)) == .timedOut, process.isRunning {
-                process.terminate()
-                if exited.wait(timeout: .now() + .milliseconds(250)) == .timedOut, process.isRunning {
-                    _ = Darwin.kill(process.processIdentifier, SIGKILL)
-                    _ = exited.wait(timeout: .now() + .milliseconds(250))
-                }
-            }
+            process.finish(failed: failed, graceMilliseconds: 100)
             try? reader.close()
         }
         for descriptor in [writer.fileDescriptor, reader.fileDescriptor] {
@@ -69,7 +68,9 @@ enum ClaudeUsageClient {
         // Control requests do not enter the conversation or trigger a model response.
         _ = try transport.request(id: "initialize", request: ["subtype": "initialize"])
         let data = try transport.request(id: "usage", request: ["subtype": "get_usage", "skip_behaviors": true])
-        return try parse(data, now: Date())
+        let result = try parse(data, now: Date())
+        failed = false
+        return result
     }
 
     static func parse(_ data: Data, now: Date) throws -> QuotaReading {
@@ -129,16 +130,13 @@ enum ClaudeUsageClient {
         }
     }
 
-    private static func executableURL() -> URL? {
-        let home = FileManager.default.homeDirectoryForCurrentUser
+    private static func executableURL(paths: ProviderCLIPaths, defaults: UserDefaults) -> URL? {
         let candidates = [
             URL(fileURLWithPath: "/opt/homebrew/bin/claude"), URL(fileURLWithPath: "/usr/local/bin/claude"),
-            home.appendingPathComponent(".local/bin/claude"),
+            paths.home.appendingPathComponent(".local/bin/claude"),
             URL(fileURLWithPath: "/Applications/Claude.app/Contents/Resources/claude"),
         ]
-        let custom = (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":")
-            .filter { $0.hasPrefix("/") }.map { URL(fileURLWithPath: String($0)).appendingPathComponent("claude") }
-        return (candidates + custom).first { FileManager.default.isExecutableFile(atPath: $0.path) }
+        return paths.executable(named: "claude", preferred: candidates, defaults: defaults)
     }
 
     private struct Transport {

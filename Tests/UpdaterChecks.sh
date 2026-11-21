@@ -19,7 +19,7 @@ let root = URL(fileURLWithPath: CommandLine.arguments[1])
 try key.rawRepresentation.base64EncodedData().write(to: root.appendingPathComponent("private"))
 try key.publicKey.rawRepresentation.base64EncodedData().write(to: root.appendingPathComponent("public"))
 SWIFT
-xcrun swift -module-cache-path "${TMPDIR:-/tmp}/quotabar-build-modules" "${root}/Keys.swift" "${root}"
+xcrun swift -module-cache-path "${root}/modules" "${root}/Keys.swift" "${root}"
 chmod 600 "${root}/private"
 cat > "${root}/Main.swift" <<'SWIFT'
 import AppKit
@@ -39,8 +39,14 @@ import Foundation
                 precondition(UpdateController.shared.automaticallyChecksForUpdates == enabled)
             }
         }
-        Timer.scheduledTimer(withTimeInterval: 1, repeats: false) { _ in
-            MainActor.assumeIsolated { UpdateController.shared.checkForUpdates() }
+        // checkForUpdates() does nothing until Sparkle can check. A helper left by the previous test app can
+        // delay that, so retry once per second instead of relying on a single request after launch.
+        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { timer in
+            MainActor.assumeIsolated {
+                guard UpdateController.shared.canCheckForUpdates else { return }
+                timer.invalidate()
+                UpdateController.shared.checkForUpdates()
+            }
         }
         app.run()
     }
@@ -57,16 +63,13 @@ server=http.server.ThreadingHTTPServer(('127.0.0.1',0),handler)
 server.serve_forever()
 PY
 server_pid=$!
-for attempt in $(seq 1 50); do
+for _ in $(seq 1 50); do
     [ ! -f "${root}/port" ] || break
     sleep 0.1
 done
 test -f "${root}/port"
 port=$(cat "${root}/port")
-cat > "${root}/entitlements.plist" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>com.apple.security.cs.disable-library-validation</key><true/></dict></plist>
-PLIST
-xcrun swiftc -module-cache-path "${TMPDIR:-/tmp}/quotabar-build-modules" -parse-as-library \
+xcrun swiftc -module-cache-path "${root}/modules" -parse-as-library \
     -F "${sparkle}" -framework Sparkle -Xlinker -rpath -Xlinker '@executable_path/../Frameworks' \
     Sources/Updater.swift "${root}/Main.swift" -o "${root}/QuotaBarUpdateCheck"
 for build in 1 2; do
@@ -77,16 +80,10 @@ for build in 1 2; do
     python3 - "${app}/Contents/Info.plist" "${root}" "${build}" "${port}" <<'PY'
 import plistlib,sys,pathlib
 path,root,build,port=sys.argv[1:]
-info=dict(CFBundleIdentifier='app.quotabar.update-check',CFBundleName='QuotaBar Update Check',CFBundleExecutable='QuotaBarUpdateCheck',CFBundleVersion=build,CFBundleShortVersionString='0.0.'+build,CFBundlePackageType='APPL',LSMinimumSystemVersion='14.0',QuotaBarTestRoot=root,SUPublicEDKey=pathlib.Path(root,'public').read_text(),SUFeedURL=f'http://127.0.0.1:{port}/appcast.xml',SUEnableAutomaticChecks=False,SUAutomaticallyUpdate=False,SUVerifyUpdateBeforeExtraction=True,SURequireSignedFeed=True,SUSignedFeedFailureExpirationInterval=0,NSAppTransportSecurity={'NSAllowsLocalNetworking':True,'NSAllowsArbitraryLoads':True})
+info=dict(SUDefaultsDomain=str(pathlib.Path(root, 'sparkle-preferences')),CFBundleIdentifier='app.quotabar.update-check',CFBundleName='QuotaBar Update Check',CFBundleExecutable='QuotaBarUpdateCheck',CFBundleVersion=build,CFBundleShortVersionString='0.0.'+build,CFBundlePackageType='APPL',LSMinimumSystemVersion='14.0',QuotaBarTestRoot=root,SUPublicEDKey=pathlib.Path(root,'public').read_text(),SUFeedURL=f'http://127.0.0.1:{port}/appcast.xml',SUEnableAutomaticChecks=False,SUAutomaticallyUpdate=False,SUVerifyUpdateBeforeExtraction=True,SURequireSignedFeed=True,SUSignedFeedFailureExpirationInterval=0,NSAppTransportSecurity={'NSAllowsLocalNetworking':True,'NSAllowsArbitraryLoads':True})
 with open(path,'wb') as file: plistlib.dump(info,file)
 PY
-    framework="${app}/Contents/Frameworks/Sparkle.framework/Versions/B"
-    for nested in "${framework}/XPCServices/Downloader.xpc" "${framework}/XPCServices/Installer.xpc" \
-        "${framework}/Autoupdate" "${framework}/Updater.app" "${app}/Contents/Frameworks/Sparkle.framework"; do
-        codesign --force --sign - --options runtime --timestamp=none "${nested}"
-    done
-    codesign --force --sign - --options runtime --entitlements "${root}/entitlements.plist" --timestamp=none "${app}"
-    codesign --verify --deep --strict "${app}"
+    ./sign-quotabar.sh "${app}" "${root}" -
 done
 ditto -c -k --norsrc --keepParent "${root}/build-2/QuotaBar Update Check.app" "${root}/feed/QuotaBar-macOS.zip"
 signature=$("${sparkle}/bin/sign_update" --ed-key-file "${root}/private" -p "${root}/feed/QuotaBar-macOS.zip")
@@ -97,7 +94,8 @@ root=pathlib.Path(sys.argv[1]); port,sig=sys.argv[2:]
 PY
 "${sparkle}/bin/sign_update" --ed-key-file "${root}/private" "${root}/feed/appcast.xml"
 ui() {
-    osascript - "$(cat "${root}/pid")" "$1" <<'APPLESCRIPT'
+    pid=$(cat "${root}/pid") || return 1
+    osascript - "${pid}" "$1" <<'APPLESCRIPT'
 on run argv
     tell application "System Events"
         tell first application process whose unix id is (item 1 of argv as integer)
@@ -108,10 +106,22 @@ on run argv
 end run
 APPLESCRIPT
 }
+# Sparkle can replace or close its window between steps, so retry a click briefly before failing.
+click() {
+    for _ in $(seq 1 50); do
+        # shellcheck disable=SC2310
+        if ui "$1" >/dev/null 2>&1; then return; fi
+        sleep 0.2
+    done
+    ui "$1"
+}
 wait_for() {
     expected=$1
-    for attempt in $(seq 1 100); do
-        if ui read 2>/dev/null | rg -iq "${expected}"; then return; fi
+    for _ in $(seq 1 100); do
+        # A missing window is expected while Sparkle prepares its UI. Both ui commands return errors explicitly.
+        # shellcheck disable=SC2310
+        window_text=$(ui read 2>/dev/null) || window_text=
+        if printf '%s\n' "${window_text}" | grep -Eiq "${expected}"; then return; fi
         sleep 0.2
     done
     ui read
@@ -127,36 +137,44 @@ launch_old() {
         mv "${root}/installed/QuotaBar Update Check.app" "${root}/previous-${1}.app"
     fi
     ditto --norsrc "${root}/build-1/QuotaBar Update Check.app" "${root}/installed/QuotaBar Update Check.app"
-    open -n "${root}/installed/QuotaBar Update Check.app"
+    mkdir -p "${root}/profile"
+    open -n --env "CFFIXED_USER_HOME=${root}/profile" --env "HOME=${root}/profile" "${root}/installed/QuotaBar Update Check.app"
     wait_for "${2:-new version}"
 }
+assert_installed_build() {
+    actual=$(plutil -extract CFBundleVersion raw "${root}/installed/QuotaBar Update Check.app/Contents/Info.plist")
+    test "${actual}" = "$1"
+}
 launch_old valid
-ui 'Install Update'
+click 'Install Update'
 wait_for 'Ready to Install'
-ui 'Install and Relaunch'
-for attempt in $(seq 1 100); do
+click 'Install and Relaunch'
+for _ in $(seq 1 100); do
     [ ! -f "${root}/launched-2" ] || break
     sleep 0.2
 done
-test "$(cat "${root}/launched-2")" = 2
-test "$(plutil -extract CFBundleVersion raw "${root}/installed/QuotaBar Update Check.app/Contents/Info.plist")" = 2
+relaunched=$(cat "${root}/launched-2")
+test "${relaunched}" = 2
+assert_installed_build 2
 printf 'Signed update installed and relaunched build 2.\n'
 if [ "${QUOTABAR_STRESS:-0}" = 1 ]; then
     wait_for 'up to date|latest version|newest version'
     mv "${root}/feed/appcast.xml" "${root}/saved-feed.xml"
     launch_old missing-feed 'Update Error|error occurred'
-    test "$(plutil -extract CFBundleVersion raw "${root}/installed/QuotaBar Update Check.app/Contents/Info.plist")" = 1
+    assert_installed_build 1
     mv "${root}/saved-feed.xml" "${root}/feed/appcast.xml"
     launch_old restored-feed
     printf 'Current build reported up to date. A missing feed surfaced an error; restoring the signed feed offered the update again.\n'
 fi
 printf 'tampered' >> "${root}/feed/QuotaBar-macOS.zip"
 launch_old tampered
-ui 'Install Update'
+click 'Install Update'
 wait_for 'improperly signed'
-test "$(plutil -extract CFBundleVersion raw "${root}/installed/QuotaBar Update Check.app/Contents/Info.plist")" = 1
+assert_installed_build 1
 printf 'Tampered update rejected, installed build remained 1.\n'
-ui 'Cancel Update'
+# Dismissing the rejection is cleanup only; the next launch replaces this process either way.
+# shellcheck disable=SC2310
+click 'Cancel Update' || printf 'The rejection window closed before Cancel Update; continuing with a fresh launch.\n'
 python3 - "${root}/feed/appcast.xml" <<'PYCODE'
 from pathlib import Path
 import sys
@@ -164,6 +182,7 @@ feed = Path(sys.argv[1])
 feed.write_text(feed.read_text().replace('Test Update', 'Tampered Update'))
 PYCODE
 launch_old invalid-feed 'Update Error'
-test "$(plutil -extract CFBundleVersion raw "${root}/installed/QuotaBar Update Check.app/Contents/Info.plist")" = 1
-if ui read | rg -q 'new version'; then exit 1; fi
+assert_installed_build 1
+window_text=$(ui read)
+if printf '%s\n' "${window_text}" | grep -q 'new version'; then exit 1; fi
 printf 'Tampered signed feed rejected before offering an update.\n'

@@ -16,16 +16,27 @@ struct Dashboard: View {
     let selectProvider: @MainActor @Sendable (UsageProvider) -> Void
     let providerSelection: ProviderSelection
     let selectProviderSelection: @MainActor @Sendable (ProviderSelection) -> Void
+    let chooseCLI: (UsageProvider) -> Void
+    let automaticCLI: (UsageProvider) -> Void
     let menuLayout: MenuBarLayout
     let selectLayout: @MainActor @Sendable (MenuBarLayout) -> Void
     let selectPercentageMode: @MainActor @Sendable (PercentageMode) -> Void
+    var menuBarLimits: [UsageProvider: MenuBarLimits] = [:]
+    /// Providers whose latest report includes a 5-hour window alongside another limit.
+    var fiveHourChoices: [UsageProvider] = []
+    var selectMenuBarLimits: (@MainActor @Sendable (MenuBarLimits, UsageProvider) -> Void)? = nil
     let detailsExpanded: Bool
     let setDetailsExpanded: @MainActor @Sendable (Bool) -> Void
     let claudeUsesLegacyReport: Bool
-    let claudeConfigured: Bool
+    let claudeConnectionStatus: ClaudeConnection.Status
     let connectingClaude: Bool
     let claudeSetupError: String?
     let connectClaude: () -> Void
+    let canDisconnectClaude: Bool
+    let disconnectClaude: () -> Void
+    let claudeProfilePath: String
+    let chooseClaudeProfile: () -> Void
+    let useDefaultClaudeProfile: () -> Void
     let failure: String?
     let tokens: TokenTotals?
     let tokenFailure: String?
@@ -34,6 +45,8 @@ struct Dashboard: View {
     let resetNotice: String?
     let resetBalanceUnconfirmed: Bool
     let resetRetry: Bool
+    let canReviewReset: Bool
+    let reviewReset: () -> Void
     let canUseReset: Bool
     let prepareReset: () -> Void
     let cancelReset: () -> Void
@@ -45,6 +58,23 @@ struct Dashboard: View {
 
     var canRefresh: Bool {
         !(display.refreshing && countingTokens) && resetPhase != .confirming && resetPhase != .submitting
+    }
+
+    var claudeSettingsAction: String? {
+        switch claudeConnectionStatus {
+        case .needsUpgrade: return "Upgrade Claude Code Connection"
+        case .configured: return "Reconnect Claude Code"
+        case .notConfigured: return nil
+        }
+    }
+
+    func claudeSetupAction(for display: QuotaDisplay) -> String? {
+        guard display.provider == .claude else { return nil }
+        if claudeConnectionStatus == .needsUpgrade { return claudeSettingsAction }
+        guard claudeUsesLegacyReport, !display.hasCurrentPercentage,
+            claudeConnectionStatus == .notConfigured || claudeSetupError != nil
+        else { return nil }
+        return "Connect Claude Code"
     }
 
     @Environment(\.colorScheme) private var colorScheme
@@ -100,10 +130,11 @@ struct Dashboard: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text(
                     display.provider == .codex
-                        ? "Install the Codex command-line interface (CLI), sign in with ChatGPT, then click Refresh."
-                        : "Install the Claude Code command-line interface (CLI), sign in with your Claude subscription, then click Refresh."
+                        ? "Choose your installed Codex CLI, or follow the guide to install it and sign in with ChatGPT."
+                        : "Choose your installed Claude Code CLI, or follow the guide to install it and sign in with your Claude subscription."
                 )
                 .fixedSize(horizontal: false, vertical: true)
+                Button("Choose Installed CLI…") { chooseCLI(display.provider) }
                 Link(
                     display.provider == .codex ? "Codex CLI installation guide" : "Claude Code installation guide",
                     destination: display.provider == .codex
@@ -137,17 +168,19 @@ struct Dashboard: View {
             }
         }
 
-        if display.provider == .claude && claudeUsesLegacyReport && !display.hasCurrentPercentage {
+        let showLegacyHelp = display.provider == .claude && claudeUsesLegacyReport && !display.hasCurrentPercentage
+        let action = claudeSetupAction(for: display)
+        if display.provider == .claude && (showLegacyHelp || action != nil || claudeSetupError != nil) {
             VStack(alignment: .leading, spacing: 6) {
                 if let claudeSetupError {
                     Text(claudeSetupError)
-                } else {
+                } else if showLegacyHelp {
                     Text(
                         "This Claude Code client doesn’t support automatic usage checks. QuotaBar can read reports from an active Claude Code session."
                     )
                 }
-                if !claudeConfigured || claudeSetupError != nil {
-                    Button(connectingClaude ? "Connecting…" : "Connect Claude Code", action: connectClaude)
+                if let action {
+                    Button(connectingClaude ? "Connecting…" : action, action: connectClaude)
                         .disabled(connectingClaude)
                         .help("Set up quota reporting in your Claude Code user settings")
                 }
@@ -207,7 +240,7 @@ struct Dashboard: View {
 
             if display.provider == .codex
                 && (display.reading?.resetCredits != nil || resetPhase != .ready || resetNotice != nil
-                    || resetBalanceUnconfirmed)
+                    || resetBalanceUnconfirmed || canReviewReset)
             {
                 Text("Usage resets").font(.headline).accessibilityAddTraits(.isHeader)
                 resetSection
@@ -264,8 +297,26 @@ struct Dashboard: View {
                     .labelsHidden()
                     .disabled(resetPhase == .submitting)
                 }
-                if claudeConfigured {
-                    Button("Reconnect Claude Code", action: connectClaude)
+                Menu("Command-Line Tools") {
+                    ForEach(UsageProvider.allCases, id: \.self) { source in
+                        Menu(source.name) {
+                            Button("Choose Trusted Executable…") { chooseCLI(source) }
+                            Button("Use Automatic Detection") { automaticCLI(source) }
+                        }
+                    }
+                }
+                if providerSelection != .codex {
+                    Menu("Claude Configuration Folder") {
+                        Text(claudeProfilePath)
+                        Button("Choose Folder…", action: chooseClaudeProfile)
+                        Button("Use Default Folder", action: useDefaultClaudeProfile)
+                    }.disabled(connectingClaude)
+                    if canDisconnectClaude {
+                        Button("Disconnect Claude Status Line", action: disconnectClaude).disabled(connectingClaude)
+                    }
+                }
+                if let action = claudeSettingsAction {
+                    Button(action, action: connectClaude)
                         .disabled(connectingClaude)
                 }
                 Divider()
@@ -277,6 +328,23 @@ struct Dashboard: View {
                     }
                     .pickerStyle(.inline)
                     .labelsHidden()
+                }
+                if let selectMenuBarLimits {
+                    ForEach(fiveHourChoices, id: \.self) { source in
+                        Divider()
+                        Section("\(source.name) in Menu Bar") {
+                            Picker(
+                                "\(source.name) in Menu Bar",
+                                selection: Binding(
+                                    get: { menuBarLimits[source] ?? .fiveHour },
+                                    set: { selectMenuBarLimits($0, source) })
+                            ) {
+                                ForEach(MenuBarLimits.allCases, id: \.self) { Text($0.title).tag($0) }
+                            }
+                            .pickerStyle(.inline)
+                            .labelsHidden()
+                        }
+                    }
                 }
                 Divider()
                 Section("Show Percentage As") {
@@ -337,7 +405,7 @@ struct Dashboard: View {
                     .font(.headline)
                 Text(
                     resetRetry
-                        ? "QuotaBar will reuse the original request so Codex can apply it only once."
+                        ? "QuotaBar will send the original request ID again. Check the outcome in Codex if you’re unsure whether it was applied."
                         : "This spends one reset if Codex can restore an eligible usage limit."
                 )
                 .font(.callout).foregroundStyle(.secondary)
@@ -371,6 +439,7 @@ struct Dashboard: View {
                     Text(hint).font(.callout).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                if canReviewReset { Button("Review Saved Reset…", action: reviewReset) }
                 if resetPhase == .submitting {
                     ProgressView().controlSize(.small).accessibilityLabel("Using reset")
                 } else if resetPhase == .uncertain {
@@ -393,7 +462,7 @@ struct Dashboard: View {
             let credits = reading.resetCredits, credits.canClaim(at: display.now)
         else { return nil }
         if display.refreshing { return "Checking the reset balance…" }
-        if credits.preferredCreditID(at: display.now) == nil && reading.resetCountOnlyFingerprint == nil {
+        if reading.resetOwner(for: credits.preferredCreditID(at: display.now)) == nil {
             return "Refresh limits so Codex can verify the account for this reset."
         }
         return "Waiting for Codex to update the reset balance."

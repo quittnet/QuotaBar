@@ -7,13 +7,10 @@ enum UsageProvider: String, CaseIterable, Sendable {
 
     static func detected(
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        home: URL = FileManager.default.homeDirectoryForCurrentUser
+        home: URL = FileManager.default.homeDirectoryForCurrentUser, defaults: UserDefaults = .standard
     ) -> [Self] {
         let files = FileManager.default
-        func hasHistory(_ key: String, directory: String, paths: [String]) -> Bool {
-            let base =
-                environment[key].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
-                ?? home.appendingPathComponent(directory)
+        func hasHistory(_ base: URL, paths: [String]) -> Bool {
             return paths.contains { path in
                 var isDirectory: ObjCBool = false
                 return files.fileExists(atPath: base.appendingPathComponent(path).path, isDirectory: &isDirectory)
@@ -22,8 +19,15 @@ enum UsageProvider: String, CaseIterable, Sendable {
         }
         return allCases.filter { provider in
             switch provider {
-            case .codex: return hasHistory("CODEX_HOME", directory: ".codex", paths: ["sessions", "archived_sessions"])
-            case .claude: return hasHistory("CLAUDE_CONFIG_DIR", directory: ".claude", paths: ["projects"])
+            case .codex:
+                let base =
+                    environment["CODEX_HOME"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
+                    ?? home.appendingPathComponent(".codex")
+                return hasHistory(base, paths: ["sessions", "archived_sessions"])
+            case .claude:
+                return hasHistory(
+                    ClaudeProfile.resolve(defaults: defaults, environment: environment, home: home), paths: ["projects"]
+                )
             }
         }
     }
@@ -63,6 +67,14 @@ enum MenuBarLayout: String, CaseIterable {
         case .both: return "Both Providers"
         }
     }
+}
+
+/// Which limits a provider shows in the menu bar when its account reports a 5-hour window.
+/// Plans differ and change over time, so the choice follows the windows each report contains.
+enum MenuBarLimits: String, CaseIterable {
+    case fiveHour, both
+
+    var title: String { self == .fiveHour ? "5-Hour Limit" : "5-Hour and Weekly" }
 }
 
 enum PercentageMode: String, CaseIterable {
@@ -107,6 +119,7 @@ struct QuotaDisplay {
     var percentageMode: PercentageMode = .remaining
 
     var restrictionUnconfirmed = false
+    var menuBarLimits: MenuBarLimits = .fiveHour
 
     var windows: [QuotaWindow] {
         (reading?.windows ?? []).sorted { ($0.minutes ?? Int.max) < ($1.minutes ?? Int.max) }
@@ -142,6 +155,27 @@ struct QuotaDisplay {
 
     var hasCurrentPercentage: Bool { !stale && restrictionMessage == nil && limitingWindow != nil }
 
+    /// The windows shown in the menu bar. A report with an active 5-hour window shows that window, or every
+    /// active window when both are requested. A report without one shows its most-used window.
+    var menuBarWindows: [QuotaWindow] {
+        guard hasCurrentPercentage, let limiting = limitingWindow else { return [] }
+        let active = windows.filter { !hasReset($0) }
+        guard let fiveHour = active.first(where: { $0.minutes == 300 }) else { return [limiting] }
+        return menuBarLimits == .both ? active : [fiveHour]
+    }
+
+    /// Whether the account reports a 5-hour window alongside another limit, so Settings offers the choice.
+    var offersFiveHourChoice: Bool {
+        let reported = reading?.windows ?? []
+        return reported.count > 1 && reported.contains { $0.minutes == 300 }
+    }
+
+    var menuBarTitle: String {
+        let shown = menuBarWindows
+        guard shown.count > 1 else { return shown.first.map(formattedPercentage) ?? title }
+        return shown.map { Self.shortName($0) + " " + formattedPercentage(for: $0) }.joined(separator: " · ")
+    }
+
     var title: String {
         guard hasCurrentPercentage, let window = limitingWindow else { return "–%" }
         return formattedPercentage(for: window)
@@ -156,7 +190,9 @@ struct QuotaDisplay {
             }
             return status
         }
-        return provider.name + " · " + Self.name(window) + ", " + accessibilityPercentage(for: window)
+        let shown = menuBarWindows.isEmpty ? [window] : menuBarWindows
+        return provider.name + " · "
+            + shown.map { Self.name($0) + ", " + accessibilityPercentage(for: $0) }.joined(separator: " · ")
             + (provider == .claude ? " · Account-wide" : "")
     }
 
@@ -196,6 +232,14 @@ struct QuotaDisplay {
             if minutes % 60 == 0 { return "\(minutes / 60)-hour limit" }
             return "\(minutes)-minute limit"
         }
+    }
+
+    /// A compact window label for the menu bar, such as 5h or 7d.
+    static func shortName(_ window: QuotaWindow) -> String {
+        guard let minutes = window.minutes else { return "" }
+        if minutes % 1_440 == 0 { return "\(minutes / 1_440)d" }
+        if minutes % 60 == 0 { return "\(minutes / 60)h" }
+        return "\(minutes)m"
     }
 
     static func percent(_ value: Double) -> String {

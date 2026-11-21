@@ -101,6 +101,7 @@ enum QuotaSource: Sendable {
     static func read(
         includeCountOnlyIdentity: Bool = false, executable: URL? = nil, timeout: DispatchTimeInterval = .seconds(15)
     ) throws -> QuotaReading {
+        let fetchedAt = Date()
         do {
             return try withTransport(executable: executable, timeout: timeout) { transport in
                 try transport.send(#"{"id":2,"method":"account/rateLimits/read"}"#)
@@ -110,7 +111,6 @@ enum QuotaSource: Sendable {
                 } catch is RPCError {
                     throw transport.quotaReadFailure()
                 }
-                let fetchedAt = Date()
                 let credits = response.quotaResetCredits
                 let mayOfferCountOnly =
                     credits?.canClaim(at: fetchedAt) == true && credits?.preferredCreditID(at: fetchedAt) == nil
@@ -132,26 +132,25 @@ enum QuotaSource: Sendable {
     static func claimReset(
         idempotencyKey: UUID,
         creditID: String?,
-        accountFingerprint: String? = nil,
+        accountFingerprint: String?,
         executable: URL? = nil,
         timeout: DispatchTimeInterval = .seconds(20)
     ) -> QuotaResetClaimResult {
-        guard creditID != nil || accountFingerprint != nil else { return .accountChanged }
+        guard let accountFingerprint, !accountFingerprint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return .accountChanged }
         var mayHaveSentClaim = false
         do {
             return try withTransport(executable: executable, timeout: timeout) { transport in
-                if let accountFingerprint {
-                    try transport.send(
-                        #"{"id":2,"method":"account/rateLimits/read","params":{"excludeResetCreditDetails":true}}"#
-                    )
-                    let account: RateLimitsResponse = try transport.receive(id: 2)
-                    guard let workspace = account.resetAccountFingerprint else { return .accountChanged }
-                    let currentFingerprint =
-                        creditID == nil
-                        ? try transport.readCountOnlyFingerprint(workspace: workspace)
-                        : workspace
-                    guard currentFingerprint == accountFingerprint else { return .accountChanged }
-                }
+                try transport.send(
+                    #"{"id":2,"method":"account/rateLimits/read","params":{"excludeResetCreditDetails":true}}"#
+                )
+                let account: RateLimitsResponse = try transport.receive(id: 2)
+                guard let workspace = account.resetAccountFingerprint else { return .accountChanged }
+                let currentFingerprint =
+                    creditID == nil
+                    ? try transport.readCountOnlyFingerprint(workspace: workspace)
+                    : workspace
+                guard currentFingerprint == accountFingerprint else { return .accountChanged }
 
                 let request = ResetClaimRequest(
                     params: .init(
@@ -177,37 +176,25 @@ enum QuotaSource: Sendable {
         timeout: DispatchTimeInterval,
         _ run: (inout CodexTransport) throws -> Result
     ) throws -> Result {
-        guard let executable = executable ?? executableURL() else { throw QuotaError.codexNotFound }
+        let paths = ProviderCLIPaths()
+        guard let executable = executable ?? executableURL(paths: paths) else { throw QuotaError.codexNotFound }
 
         let input = Pipe()
         let output = Pipe()
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = ["app-server", "--listen", "stdio://"]
-        process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
-        process.standardInput = input
-        process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-
-        let exited = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in exited.signal() }
+        let process: ProviderProcess
         do {
-            try process.run()
-        } catch {
-            throw QuotaError.launchFailed
-        }
+            process = try ProviderProcess(
+                executable: executable, arguments: ["app-server", "--listen", "stdio://"],
+                environment: paths.childEnvironment(for: executable, named: "codex"),
+                directory: FileManager.default.homeDirectoryForCurrentUser,
+                input: input, output: output)
+        } catch { throw QuotaError.launchFailed }
+        var failed = true
         let writer = input.fileHandleForWriting
         let reader = output.fileHandleForReading
         defer {
             try? writer.close()
-            // Closing stdin usually lets the stdio process exit by itself.
-            if exited.wait(timeout: .now() + .milliseconds(250)) == .timedOut, process.isRunning {
-                process.terminate()
-                if exited.wait(timeout: .now() + .milliseconds(250)) == .timedOut, process.isRunning {
-                    _ = Darwin.kill(process.processIdentifier, SIGKILL)
-                    _ = exited.wait(timeout: .now() + .milliseconds(250))
-                }
-            }
+            process.finish(failed: failed, graceMilliseconds: 250)
             try? reader.close()
         }
 
@@ -232,27 +219,132 @@ enum QuotaSource: Sendable {
         try transport.send(try JSONSerialization.data(withJSONObject: initialize))
         let _: InitializeResponse = try transport.receive(id: 1)
         try transport.send(#"{"method":"initialized"}"#)
-        return try run(&transport)
+        let result = try run(&transport)
+        failed = false
+        return result
     }
 
-    private static func executableURL() -> URL? {
-        let home = FileManager.default.homeDirectoryForCurrentUser
+    private static func executableURL(paths: ProviderCLIPaths) -> URL? {
         let candidates = [
             URL(fileURLWithPath: "/opt/homebrew/bin/codex"),
             URL(fileURLWithPath: "/usr/local/bin/codex"),
             URL(
                 fileURLWithPath:
                     "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"),
-            home.appendingPathComponent(".local/bin/codex"),
+            paths.home.appendingPathComponent(".local/bin/codex"),
             URL(fileURLWithPath: "/Applications/Codex.app/Contents/Resources/codex"),
         ]
-        let path = ProcessInfo.processInfo.environment["PATH"] ?? ""
-        let customCandidates = path.split(separator: ":").filter { $0.hasPrefix("/") }.map {
-            URL(fileURLWithPath: String($0)).appendingPathComponent("codex")
+        return paths.executable(named: "codex", preferred: candidates)
+    }
+}
+
+struct ProviderCLIPaths {
+    private static let systemPath = "/usr/bin:/bin:/usr/sbin:/sbin"
+    private static let systemNodeDirectories = ["/opt/homebrew/bin", "/usr/local/bin"].map {
+        URL(fileURLWithPath: $0, isDirectory: true)
+    }
+
+    let home: URL
+    private let environment: [String: String]
+    private let pathDirectories: [URL]
+
+    init(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) {
+        self.home = home
+        self.environment = environment
+        pathDirectories = (environment["PATH"] ?? Self.systemPath).split(separator: ":")
+            .filter { $0.hasPrefix("/") }.map { URL(fileURLWithPath: String($0), isDirectory: true) }
+    }
+
+    func executable(named name: String, preferred: [URL], defaults: UserDefaults = .standard) -> URL? {
+        if ProviderExecutable.hasSelection(name, defaults: defaults) {
+            return ProviderExecutable.selected(name, defaults: defaults)
         }
-        return (candidates + customCandidates).first {
-            FileManager.default.isExecutableFile(atPath: $0.path)
+        func verifiedTarget(_ alias: URL) -> URL? {
+            let target = alias.resolvingSymlinksInPath()
+            return ProviderExecutable.vendorSigned(target, name: name) ? target : nil
         }
+        func signed(in directories: [URL]) -> URL? {
+            directories.lazy.compactMap { verifiedTarget($0.appendingPathComponent(name, isDirectory: false)) }.first
+        }
+        return preferred.lazy.compactMap(verifiedTarget).first
+            ?? signed(in: pathDirectories) ?? signed(in: localDirectories) ?? signed(in: nvmDirectories)
+    }
+
+    func childEnvironment(for executable: URL, named name: String? = nil, defaults: UserDefaults = .standard)
+        -> [String: String]
+    {
+        var result = environment
+        var directories = pathDirectories.map(\.path)
+        if directories.isEmpty { directories = Self.systemPath.components(separatedBy: ":") }
+        if Self.isScript(executable) {
+            let sibling = executable.deletingLastPathComponent()
+            let selectedBin = name.flatMap {
+                ProviderExecutable.installationDirectory(for: executable, name: $0, defaults: defaults)
+            }
+            if let nodeDirectory = Self.nodeDirectory(in: [selectedBin, sibling].compactMap { $0 }) {
+                // npm shims should use the runtime from the selected installation when it has one.
+                directories.removeAll { $0 == nodeDirectory }
+                directories.insert(nodeDirectory, at: 0)
+            } else if Self.nodeDirectory(in: pathDirectories) == nil,
+                let nodeDirectory = Self.nodeDirectory(in: Self.systemNodeDirectories + localDirectories)
+                    ?? Self.nodeDirectory(in: nvmDirectories)
+            {
+                directories.append(nodeDirectory)
+            }
+        }
+        result["PATH"] = directories.joined(separator: ":")
+        return result
+    }
+
+    private var localDirectories: [URL] {
+        [".local/bin", ".npm-global/bin"].map { home.appendingPathComponent($0, isDirectory: true) }
+    }
+
+    private var nvmDirectories: [URL] {
+        let root: URL
+        if let configured = environment["NVM_DIR"], configured.hasPrefix("/") {
+            root = URL(fileURLWithPath: configured, isDirectory: true)
+        } else {
+            root = home.appendingPathComponent(".nvm", isDirectory: true)
+        }
+        let versions = root.appendingPathComponent("versions/node", isDirectory: true)
+        let installed = (try? FileManager.default.contentsOfDirectory(atPath: versions.path)) ?? []
+        return installed.filter { version in
+            guard version.hasPrefix("v") else { return false }
+            let components = version.dropFirst().split(separator: ".", omittingEmptySubsequences: false)
+            return components.count == 3 && components.allSatisfy { UInt($0) != nil }
+        }.sorted { $0.compare($1, options: .numeric) == .orderedDescending }.map {
+            versions.appendingPathComponent($0, isDirectory: true).appendingPathComponent("bin", isDirectory: true)
+        }
+    }
+
+    private static func nodeDirectory(in directories: [URL]) -> String? {
+        // A colon would split a directory into multiple child PATH entries.
+        directories.first {
+            !$0.path.contains(":") && isExecutable($0.appendingPathComponent("node", isDirectory: false))
+        }?.path
+    }
+
+    private static func isScript(_ executable: URL) -> Bool {
+        var info = stat()
+        guard stat(executable.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { return false }
+        // npm places symlinks in bin; inspect the target without running it or reading the whole file.
+        let descriptor = open(executable.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+        guard descriptor >= 0 else { return false }
+        defer { close(descriptor) }
+        guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { return false }
+        var signature: [UInt8] = [0, 0]
+        let count = signature.withUnsafeMutableBytes { Darwin.read(descriptor, $0.baseAddress, $0.count) }
+        return count == signature.count && signature == [0x23, 0x21]
+    }
+
+    private static func isExecutable(_ file: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: file.path, isDirectory: &isDirectory) && !isDirectory.boolValue
+            && FileManager.default.isExecutableFile(atPath: file.path)
     }
 }
 
@@ -268,7 +360,7 @@ enum QuotaError: LocalizedError {
         case .subscriptionRequired:
             "Codex is using an API key. Sign in with ChatGPT to see subscription limits."
         case .codexNotFound:
-            "The Codex CLI could not be found."
+            "Choose your installed Codex CLI or install it and sign in."
         case .launchFailed:
             "The Codex app server could not start."
         case .transportFailed:
@@ -396,21 +488,7 @@ struct RateLimitsResponse: Decodable {
 
     struct Snapshot: Decodable {
         let limitId: String?
-        let spendControlReached: Bool?
-        let rateLimitReachedType: ReachedReason?
-
-        enum ReachedReason: String, Decodable {
-            case rateLimit = "rate_limit_reached"
-            case ownerCredits = "workspace_owner_credits_depleted"
-            case memberCredits = "workspace_member_credits_depleted"
-            case ownerUsage = "workspace_owner_usage_limit_reached"
-            case memberUsage = "workspace_member_usage_limit_reached"
-        }
-
-        var hasExplicitRestriction: Bool {
-            spendControlReached == true || rateLimitReachedType != nil
-        }
-
+        let hasExplicitRestriction: Bool
         let windows: [QuotaWindow]
 
         private enum CodingKeys: String, CodingKey {
@@ -422,8 +500,11 @@ struct RateLimitsResponse: Decodable {
             limitId = try values.decodeIfPresent(String.self, forKey: .limitId)
             let primary = try values.decodeIfPresent(Window.self, forKey: .primary)?.quotaWindow()
             let secondary = try values.decodeIfPresent(Window.self, forKey: .secondary)?.quotaWindow()
-            spendControlReached = try values.decodeIfPresent(Bool.self, forKey: .spendControlReached)
-            rateLimitReachedType = try values.decodeIfPresent(ReachedReason.self, forKey: .rateLimitReachedType)
+            let spendControlReached = try values.decodeIfPresent(Bool.self, forKey: .spendControlReached)
+            // A non-null reason signals a restriction even if the server changes its representation.
+            let hasReason =
+                try values.contains(.rateLimitReachedType) && !values.decodeNil(forKey: .rateLimitReachedType)
+            hasExplicitRestriction = spendControlReached == true || hasReason
             let reported = primary == secondary ? [primary] : [primary, secondary]
             windows = reported.compactMap { $0 }.sorted { ($0.minutes ?? Int.max) < ($1.minutes ?? Int.max) }
         }

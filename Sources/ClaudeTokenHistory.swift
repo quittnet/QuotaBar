@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -9,25 +10,35 @@ enum ClaudeTokenHistoryError: LocalizedError {
     }
 }
 
-/// Read this instance on a serial executor. The index of usage and file cursors stays in memory.
+/// Confine the reader and its SQLite connection to the token reader actor.
 final class ClaudeTokenHistory {
+    /// Maximum time a sampled append check can hide an edit between its windows.
+    static let fullCheckInterval: TimeInterval = 24 * 60 * 60
     private let projects: URL
     private let statsCache: URL
     private let calendar: Calendar?
     private let decoder = JSONDecoder()
     private let fractionalDates = ISO8601DateFormatter()
     private let wholeDates = ISO8601DateFormatter()
-    private var files: [URL: Transcript] = [:]
+    private var cacheLocations: [URL]
+    private let didReadBytes: ((Int) -> Void)?
+    private var index: ClaudeHistoryIndex?
 
-    convenience init() {
-        let configuredHome = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"].flatMap { $0.isEmpty ? nil : $0 }
-        let home =
-            configuredHome.map { URL(fileURLWithPath: $0, isDirectory: true) }
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude", isDirectory: true)
-        self.init(home: home)
+    convenience init(profile home: URL = ClaudeProfile.directory) {
+        let homeID = SHA256.hash(data: Data(home.resolvingSymlinksInPath().standardizedFileURL.path.utf8)).map {
+            String(format: "%02x", $0)
+        }
+        .joined()
+        let cacheURL = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("app.quotabar.QuotaBar", isDirectory: true)
+            .appendingPathComponent("claude-history-v1-" + homeID + ".sqlite")
+        self.init(home: home, cacheURL: cacheURL)
     }
 
-    init(home: URL, calendar: Calendar? = nil) {
+    init(home: URL, cacheURL: URL? = nil, calendar: Calendar? = nil, didReadBytes: ((Int) -> Void)? = nil) {
+        // A damaged main database can be rebuilt in a sibling without unlinking an open cache.
+        cacheLocations = cacheURL.map { [$0, $0.appendingPathExtension("rebuilt")] } ?? []
+        self.didReadBytes = didReadBytes
         projects = home.appendingPathComponent("projects", isDirectory: true)
         statsCache = home.appendingPathComponent("stats-cache.json")
         self.calendar = calendar
@@ -35,9 +46,26 @@ final class ClaudeTokenHistory {
     }
 
     func read(now: Date = Date()) throws -> TokenTotals {
+        while true {
+            let url = cacheLocations.first
+            do {
+                let current = try index ?? ClaudeHistoryIndex(url: url)
+                index = current
+                return try read(current, now: now)
+            } catch let error as ClaudeHistoryIndex.Failure where error.isContention {
+                throw error
+            } catch {
+                guard url != nil, index == nil || error is ClaudeHistoryIndex.Failure else { throw error }
+                index = nil
+                cacheLocations.removeFirst()
+            }
+        }
+    }
+
+    private func read(_ index: ClaudeHistoryIndex, now: Date) throws -> TokenTotals {
         var partial = false
         var candidates = 0
-        var next: [URL: Transcript] = [:]
+        var readable = 0
         var rootInfo = stat()
         guard stat(projects.path, &rootInfo) == 0, (rootInfo.st_mode & S_IFMT) == S_IFDIR,
             let entries = FileManager.default.enumerator(
@@ -48,30 +76,53 @@ final class ClaudeTokenHistory {
                 })
         else { return try statsOnly() }
 
-        for case let url as URL in entries where url.pathExtension == "jsonl" {
-            var info = stat()
-            guard lstat(url.path, &info) == 0 else {
-                if errno != ENOENT { partial = true }
-                continue
-            }
-            guard (info.st_mode & S_IFMT) == S_IFREG else { continue }
-            candidates += 1
-            let revision = FileRevision(info)
-            let previous = files[url]
-            do {
-                if let previous, previous.revision == revision {
-                    next[url] = previous
-                } else {
-                    next[url] = try scan(url, revision: revision, previous: previous)
+        return try index.transaction {
+            try index.resetVisible()
+            for case let url as URL in entries where url.pathExtension == "jsonl" {
+                var info = stat()
+                guard lstat(url.path, &info) == 0 else {
+                    if errno != ENOENT { partial = true }
+                    continue
                 }
-            } catch {
-                partial = true
+                guard (info.st_mode & S_IFMT) == S_IFREG else { continue }
+                candidates += 1
+                let key = Self.identifier(url.path)
+                let revision = ClaudeTranscriptRevision(info)
+                do {
+                    let filePartial = try autoreleasepool {
+                        let previous = try index.checkpoint(key).flatMap {
+                            try? decoder.decode(Transcript.self, from: $0)
+                        }
+                        if let previous, previous.isValid, previous.revision == revision,
+                            !previous.needsFullCheck(at: now)
+                        {
+                            return previous.partial
+                        }
+                        return try index.withFileSavepoint {
+                            let updated = try scan(
+                                url, key: key, index: index, revision: revision, previous: previous, now: now)
+                            try index.save(key: key, checkpoint: JSONEncoder().encode(updated))
+                            return updated.partial
+                        }
+                    }
+                    try index.include(key)
+                    readable += 1
+                    partial = partial || filePartial
+                } catch let error as ClaudeHistoryIndex.Failure {
+                    throw error
+                } catch {
+                    partial = true
+                }
             }
+            guard readable > 0 || (candidates == 0 && !partial) else { return try statsOnly() }
+            try index.pruneInvisible()
+            let days = TokenDayBoundaries(now: now, calendar: calendar ?? .current)
+            return try index.totals(now: now, days: days, partial: partial, stats: readStatsLifetime())
         }
+    }
 
-        guard !next.isEmpty || (candidates == 0 && !partial) else { return try statsOnly() }
-        files = next
-        return totals(now: now, partial: partial)
+    private static func identifier(_ value: String) -> String {
+        Data(SHA256.hash(data: Data(value.utf8))).base64EncodedString()
     }
 
     private func statsOnly() throws -> TokenTotals {
@@ -96,7 +147,10 @@ final class ClaudeTokenHistory {
         return tokenTotal(stats.modelUsage.values.flatMap(\.counts))
     }
 
-    private func scan(_ url: URL, revision: FileRevision, previous: Transcript?) throws -> Transcript {
+    private func scan(
+        _ url: URL, key: String, index: ClaudeHistoryIndex, revision listed: ClaudeTranscriptRevision,
+        previous: Transcript?, now: Date
+    ) throws -> Transcript {
         let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
         guard descriptor >= 0 else { throw ClaudeTokenHistoryError.unavailable }
         let stream = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
@@ -104,123 +158,168 @@ final class ClaudeTokenHistory {
 
         var info = stat()
         guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
-            revision.sameFile(as: FileRevision(info)), info.st_size >= revision.size
+            listed.sameFile(as: ClaudeTranscriptRevision(info)), info.st_size >= listed.size
         else {
             throw ClaudeTokenHistoryError.unavailable
         }
 
+        let revision = ClaudeTranscriptRevision(info)
         var transcript = Transcript(revision: revision)
         var prefix = TokenLogPrefix()
-        if let previous, revision.sameFile(as: previous.revision), revision.size > previous.revision.size {
-            try prefix.extend(in: stream, to: previous.offset)
-            if prefix.digest == previous.anchor {
+        var verifyCachedPrefix: (() throws -> Bool)?
+        var readStart: UInt64 = 0
+        var fullyVerified = true
+        if let previous, previous.isValid, revision.canReuseAfterGrowth(from: previous.revision, observed: listed) {
+            let originalSize = UInt64(previous.revision.size)
+            let matches: Bool
+            if let samples = TranscriptSamples(length: originalSize) {
+                // Build 38 saved only a full hash. Reindex its large checkpoint once on the first change.
+                // Samples cannot see edits between windows, so rebuild from every byte at least once a day.
+                if let digest = previous.samples, !previous.verificationExpired(at: now) {
+                    let verify = { [didReadBytes] in
+                        var check = samples
+                        try check.readPrefix(in: stream, until: originalSize, didReadBytes: didReadBytes)
+                        return check.digest == digest
+                    }
+                    matches = try verify()
+                    if matches {
+                        verifyCachedPrefix = verify
+                        fullyVerified = false
+                    }
+                } else {
+                    matches = false
+                }
+            } else {
+                try prefix.extend(in: stream, to: previous.offset, didReadBytes: didReadBytes)
+                matches = prefix.digest == previous.anchor
+            }
+            if matches {
                 transcript = previous
                 transcript.revision = revision
+                readStart = previous.offset
+                if verifyCachedPrefix != nil {
+                    if originalSize - previous.offset > TokenLogLine.maximumSize {
+                        // The uncommitted row already exceeds the decoder limit. Resume at its old EOF.
+                        readStart = originalSize
+                    }
+                    prefix = TokenLogPrefix(start: readStart)
+                }
             } else {
                 prefix = TokenLogPrefix()
             }
         }
 
-        try stream.seek(toOffset: transcript.offset)
-        var remaining = UInt64(revision.size) - transcript.offset
-        let committed = try readTokenLogLines(
-            read: {
-                guard remaining > 0 else { return Data() }
-                let data = try stream.read(upToCount: Int(min(remaining, 256 * 1024))) ?? Data()
-                guard !data.isEmpty else { throw ClaudeTokenHistoryError.unavailable }
-                remaining -= UInt64(data.count)
-                return data
-            },
+        if transcript.offset == 0 { try index.replace(key) }
+        var samples = TranscriptSamples(length: UInt64(revision.size))
+        try samples?.readPrefix(in: stream, until: readStart, didReadBytes: didReadBytes)
+        let snapshot = try readTokenLogSnapshot(
+            stream, at: url, opened: info, from: readStart, prefix: prefix, didReadBytes: didReadBytes,
+            continuingOversizedLine: readStart > transcript.offset,
+            observe: { bytes, offset in samples?.observe(bytes, at: offset) }, verifyCachedPrefix: verifyCachedPrefix,
             accept: { line in
                 switch line {
-                case .complete(let data): accept(data, into: &transcript)
+                case .complete(let data):
+                    try accept(data, key: key, index: index, transcript: &transcript)
                 case .oversized: transcript.partial = true
                 }
             })
-        transcript.offset += committed
-
-        // Re-read an uncommitted final line on the next append.
-        try prefix.extend(in: stream, to: transcript.offset)
-        transcript.anchor = prefix.digest
-        var endInfo = stat()
-        guard fstat(descriptor, &endInfo) == 0, FileRevision(endInfo) == FileRevision(info) else {
-            throw ClaudeTokenHistoryError.unavailable
+        if snapshot.offset > readStart { transcript.offset = snapshot.offset }
+        transcript.anchor = snapshot.anchor
+        transcript.samples = samples?.digest
+        if fullyVerified {
+            transcript.verifiedAt = now
+            transcript.sampled = nil
+        } else {
+            transcript.sampled = true
         }
         return transcript
     }
 
-    private func accept(_ line: Data, into transcript: inout Transcript) {
-        do {
-            let row = try decoder.decode(AssistantRow.self, from: line)
-            guard let message = row.message, message.model != "<synthetic>" else { return }
-            guard let id = message.id, !id.isEmpty, let usage = message.usage, let count = usage.total else {
-                transcript.partial = true
-                return
-            }
-            let date = row.timestamp.flatMap { fractionalDates.date(from: $0) ?? wholeDates.date(from: $0) }
-            transcript.usage.append(Sample(id: id, date: date, count: count, finished: message.stopReason != nil))
-        } catch {
+    private func accept(_ line: Data, key: String, index: ClaudeHistoryIndex, transcript: inout Transcript) throws {
+        guard let row = try? decoder.decode(AssistantRow.self, from: line) else {
             transcript.partial = true
+            return
         }
-    }
-
-    private func totals(now: Date, partial incomplete: Bool) -> TokenTotals {
-        var partial = incomplete
-        var byMessage: [String: Contribution] = [:]
-        for transcript in files.values {
-            partial = partial || transcript.partial
-            for sample in transcript.usage {
-                guard sample.date.map({ $0 <= now }) ?? true else { continue }
-                byMessage[sample.id, default: Contribution()].add(sample)
-            }
+        guard let message = row.message, message.model != "<synthetic>" else { return }
+        guard let id = message.id, !id.isEmpty, let usage = message.usage, let count = usage.total else {
+            transcript.partial = true
+            return
         }
-
-        let days = TokenDayBoundaries(now: now, calendar: calendar ?? .current)
-        var all: Int64 = 0
-        var month: Int64 = 0
-        var week: Int64 = 0
-        var yesterday: Int64 = 0
-        var today: Int64 = 0
-
-        func add(_ count: Int64, to accumulator: inout Int64) {
-            let (value, overflow) = accumulator.addingReportingOverflow(count)
-            partial = partial || overflow
-            accumulator = overflow ? .max : value
-        }
-
-        for value in byMessage.values {
-            partial = partial || !value.finished || value.conflicting
-            add(value.count, to: &all)
-            guard let date = value.date else {
-                partial = true
-                continue
-            }
-            if date >= days.month { add(value.count, to: &month) }
-            if date >= days.week { add(value.count, to: &week) }
-            if date >= days.today {
-                add(value.count, to: &today)
-            } else if date >= days.yesterday {
-                add(value.count, to: &yesterday)
-            }
-        }
-        return TokenTotals(
-            allTime: all, month: month, week: week, yesterday: yesterday, today: today, partial: partial,
-            hasRetainedUsage: !byMessage.isEmpty,
-            // The Stats aggregate has no response identities or date coverage to reconcile with transcripts.
-            claudeStatsLifetime: readStatsLifetime()
-        )
+        let date = row.timestamp.flatMap { fractionalDates.date(from: $0) ?? wholeDates.date(from: $0) }
+        try index.append(
+            key: key, id: Self.identifier(id.precomposedStringWithCanonicalMapping), date: date, count: count,
+            finished: message.stopReason != nil)
     }
 }
 
-private struct Transcript {
-    var revision: FileRevision
+private struct Transcript: Codable {
+    var revision: ClaudeTranscriptRevision
     var offset: UInt64 = 0
     var anchor = Data()
-    var usage: [Sample] = []
+    var samples: Data?
     var partial = false
+    /// When every indexed byte was last read or hashed. Older checkpoints decode as unverified.
+    var verifiedAt: Date?
+    /// Rows were reused after a sampled check, so an edit between the windows may be hidden.
+    var sampled: Bool?
+
+    var isValid: Bool { revision.size >= 0 && offset <= UInt64(revision.size) && anchor.count == 32 }
+
+    func verificationExpired(at now: Date) -> Bool {
+        // A clock moved backward also forces a full check instead of trusting a future timestamp.
+        verifiedAt.map { $0 > now || now.timeIntervalSince($0) >= ClaudeTokenHistory.fullCheckInterval } ?? true
+    }
+
+    func needsFullCheck(at now: Date) -> Bool { sampled == true && verificationExpired(at: now) }
 }
 
-private struct FileRevision: Equatable {
+// A grow-only stat change cannot distinguish an append from an edit followed by an append.
+// Check eight 4 KiB windows including both ends. A same-inode rewrite confined to the gaps
+// followed by growth escapes this check until the daily full check rebuilds the file.
+// Same-size edits and shrinking files are fully rescanned.
+private struct TranscriptSamples {
+    private static let width: UInt64 = 4096
+    private static let count: UInt64 = 8
+    private let ranges: [Range<UInt64>]
+    private var hash = SHA256()
+    var digest: Data { Data(hash.finalize()) }
+
+    init?(length: UInt64) {
+        guard length > Self.width * Self.count else { return nil }
+        let span = length - Self.width
+        let intervals = Self.count - 1
+        ranges = (0..<Self.count).map { index in
+            let start = (span / intervals) * index + (span % intervals) * index / intervals
+            return start..<(start + Self.width)
+        }
+    }
+
+    mutating func readPrefix(in stream: FileHandle, until end: UInt64, didReadBytes: ((Int) -> Void)?) throws {
+        for range in ranges where range.lowerBound < end {
+            try stream.seek(toOffset: range.lowerBound)
+            var remaining = Int(min(end, range.upperBound) - range.lowerBound)
+            while remaining > 0 {
+                guard let data = try stream.read(upToCount: remaining), !data.isEmpty else {
+                    throw ClaudeTokenHistoryError.unavailable
+                }
+                hash.update(data: data)
+                remaining -= data.count
+                didReadBytes?(data.count)
+            }
+        }
+    }
+
+    mutating func observe(_ data: Data, at offset: UInt64) {
+        let chunk = offset..<(offset + UInt64(data.count))
+        for range in ranges where range.overlaps(chunk) {
+            let start = data.startIndex + Int(max(offset, range.lowerBound) - offset)
+            let end = data.startIndex + Int(min(chunk.upperBound, range.upperBound) - offset)
+            hash.update(data: data[start..<end])
+        }
+    }
+}
+
+struct ClaudeTranscriptRevision: Codable, Equatable {
     let device: Int32
     let inode: UInt64
     let size: Int64
@@ -245,6 +344,12 @@ private struct FileRevision: Equatable {
 
     func sameFile(as other: Self) -> Bool {
         device == other.device && inode == other.inode && created == other.created && createdNanos == other.createdNanos
+    }
+
+    func canReuseAfterGrowth(from prior: Self, observed: Self) -> Bool {
+        // An edit or truncation already observed by lstat remains evidence even if a writer appends before open.
+        prior.sameFile(as: observed) && observed.size > prior.size
+            && (self == observed || (sameFile(as: observed) && size > observed.size))
     }
 }
 
@@ -321,34 +426,4 @@ private func tokenTotal(_ counts: [Int64]) -> Int64? {
         total = sum
     }
     return total
-}
-
-private struct Sample {
-    let id: String
-    let date: Date?
-    let count: Int64
-    let finished: Bool
-}
-
-private struct Contribution {
-    var count: Int64 = 0
-    var date: Date?
-    private(set) var finished = false
-    private(set) var conflicting = false
-
-    mutating func add(_ sample: Sample) {
-        // One message ID can occur in several streamed blocks and in copies of a transcript.
-        if sample.finished != finished {
-            if sample.finished {
-                count = sample.count
-                finished = true
-            }
-        } else if finished && sample.count != count {
-            conflicting = true
-            count = min(count, sample.count)
-        } else {
-            count = max(count, sample.count)
-        }
-        if let observed = sample.date, date.map({ observed < $0 }) ?? true { date = observed }
-    }
 }

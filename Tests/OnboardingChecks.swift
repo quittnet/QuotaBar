@@ -20,7 +20,7 @@ struct OnboardingChecks {
     @MainActor static func main() {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
-        let suite = "QuotaBar-onboarding-test-" + UUID().uuidString
+        let suite = testPreferencesDomain()
         let defaults = UserDefaults(suiteName: suite)!
         let fixture = ProviderFixture()
         defaults.set("both", forKey: "providerSelection")

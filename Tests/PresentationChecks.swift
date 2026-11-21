@@ -3,20 +3,44 @@ import Foundation
 @main
 enum PresentationChecks {
     static func main() throws {
+        let domain = testPreferencesDomain()
+        // Seed the fixture first so a misrouted suite fails before its first preference write.
+        let preferenceRoot = URL(fileURLWithPath: ProcessInfo.processInfo.environment["QUOTABAR_TEST_PREFERENCES"]!)
+        let fixture = preferenceRoot.appendingPathComponent((domain as NSString).lastPathComponent)
+            .appendingPathExtension("plist")
+        let marker = UUID().uuidString
+        let seed = try PropertyListSerialization.data(fromPropertyList: ["marker": marker], format: .binary, options: 0)
+        try seed.write(to: fixture)
+        let preferences = UserDefaults(suiteName: domain)!
+        precondition(preferences.string(forKey: "marker") == marker, "Suite failed to read the private fixture plist")
+        preferences.set("written", forKey: "marker")
+        precondition(preferences.synchronize())
+        // cfprefsd can acknowledge synchronize() before its atomic file replacement completes.
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while true {
+            let stored = try PropertyListSerialization.propertyList(from: Data(contentsOf: fixture), format: nil)
+            if (stored as? [String: String])?["marker"] == "written" { break }
+            precondition(ContinuousClock.now < deadline, "Suite did not write the private fixture plist")
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        print("Swift preferences read and wrote the private fixture plist.")
+        defer { preferences.removePersistentDomain(forName: domain) }
         let files = FileManager.default
         let home = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? files.removeItem(at: home) }
         try files.createDirectory(
             at: home.appendingPathComponent(".claude/projects"), withIntermediateDirectories: true)
-        precondition(UsageProvider.detected(environment: [:], home: home) == [.claude])
+        precondition(UsageProvider.detected(environment: [:], home: home, defaults: preferences) == [.claude])
         let codexRoot = home.appendingPathComponent("alternate-codex")
         try files.createDirectory(at: codexRoot, withIntermediateDirectories: true)
         try Data().write(to: codexRoot.appendingPathComponent("sessions"))
         let env = ["CODEX_HOME": codexRoot.path]
-        precondition(UsageProvider.detected(environment: env, home: home) == [.claude])
+        precondition(UsageProvider.detected(environment: env, home: home, defaults: preferences) == [.claude])
         try files.createDirectory(
             at: codexRoot.appendingPathComponent("archived_sessions"), withIntermediateDirectories: true)
-        precondition(UsageProvider.detected(environment: env, home: home) == [.codex, .claude])
+        precondition(UsageProvider.detected(environment: env, home: home, defaults: preferences) == [.codex, .claude])
+        ClaudeProfile.select(codexRoot, defaults: preferences)
+        precondition(UsageProvider.detected(environment: env, home: home, defaults: preferences) == [.codex])
         for (seconds, expected) in [
             (180.0, "3 min"), (61, "2 min"), (60, "1 min"), (59.9, "59 sec"), (20, "20 sec"), (0.1, "1 sec"),
         ] {
@@ -46,6 +70,42 @@ enum PresentationChecks {
         precondition(!sample([week], age: QuotaDisplay.maximumAge).hasCurrentPercentage)
         precondition(sample([week], age: -1).title == "–%")
         precondition(sample([week]).tooltipReading.contains("Codex read "))
+        func shown(
+            _ windows: [QuotaWindow], provider: UsageProvider = .claude, limits: MenuBarLimits = .fiveHour,
+            mode: PercentageMode = .remaining, failed: Bool = false
+        ) -> QuotaDisplay {
+            QuotaDisplay(
+                reading: QuotaReading(fetchedAt: now, windows: windows), now: now, failed: failed, refreshing: false,
+                provider: provider, percentageMode: mode, menuBarLimits: limits)
+        }
+        // Either provider shows its 5-hour window by default, even when the weekly window is more used.
+        let busyWeek = QuotaWindow(minutes: 10_080, remaining: 30, resetsAt: now.addingTimeInterval(600))
+        for provider in UsageProvider.allCases {
+            let fiveHour = shown([busyWeek, session], provider: provider)
+            precondition(fiveHour.menuBarTitle == "42%", fiveHour.menuBarTitle)
+            precondition(fiveHour.accessibilityTitle.contains("5-hour limit, 42% remaining"))
+            precondition(!fiveHour.accessibilityTitle.contains("Weekly"))
+            precondition(fiveHour.offersFiveHourChoice)
+            precondition(shown([busyWeek, session], provider: provider, mode: .used).menuBarTitle == "58%")
+            let both = shown([busyWeek, session], provider: provider, limits: .both)
+            precondition(both.menuBarTitle == "5h 42% · 7d 30%", both.menuBarTitle)
+            precondition(
+                shown([busyWeek, session], provider: provider, limits: .both, mode: .used).menuBarTitle
+                    == "5h 58% · 7d 70%")
+            precondition(both.accessibilityTitle.contains("5-hour limit, 42% remaining · Weekly limit, 30% remaining"))
+            precondition(
+                shown([busyWeek, session], provider: provider, limits: .both, failed: true).menuBarTitle == "–%")
+            // Plans without a 5-hour window keep the most-used window and get no choice.
+            for limits in MenuBarLimits.allCases {
+                let weekly = shown([busyWeek], provider: provider, limits: limits)
+                precondition(weekly.menuBarTitle == "30%" && !weekly.offersFiveHourChoice)
+                let daily = QuotaWindow(minutes: 1_440, remaining: 20, resetsAt: now.addingTimeInterval(600))
+                let noFive = shown([busyWeek, daily], provider: provider, limits: limits)
+                precondition(noFive.menuBarTitle == "20%" && !noFive.offersFiveHourChoice)
+            }
+            precondition(!shown([session], provider: provider).offersFiveHourChoice)
+        }
+        print("Menu bar 5-hour limits: shown by default when reported, both windows on request, for either provider.")
         let expired = QuotaWindow(minutes: 300, remaining: 10, resetsAt: now)
         precondition(sample([expired]).title == "–%")
         precondition(sample([expired, week]).stale)

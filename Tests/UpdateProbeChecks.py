@@ -81,6 +81,7 @@ def make_feeds(directory, sign, url):
 
 def main():
     root, sparkle = map(pathlib.Path, sys.argv[1:])
+    preference_domain = pathlib.Path(os.environ["QUOTABAR_TEST_PREFERENCES"], "sparkle-probe")
     app = root / "Probe.app"
     contents = app / "Contents"
     directory = root / "feeds"
@@ -105,6 +106,7 @@ def main():
         make_feeds(directory, sign, url)
         info = {
             "CFBundleIdentifier": "app.quotabar.probe." + uuid.uuid4().hex,
+            "SUDefaultsDomain": str(preference_domain),
             "CFBundleName": "QuotaBar Probe", "CFBundlePackageType": "APPL",
             "CFBundleExecutable": "Probe", "CFBundleVersion": "37",
             "CFBundleShortVersionString": "1.8.0", "LSMinimumSystemVersion": "14.0",
@@ -115,6 +117,11 @@ def main():
             "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
         }
         (contents / "Info.plist").write_bytes(plistlib.dumps(info))
+        frameworks = contents / "Frameworks"
+        frameworks.mkdir()
+        subprocess.run(["ditto", "--noextattr", "--norsrc", sparkle / "Sparkle.framework", frameworks / "Sparkle.framework"], check=True)
+        signer = pathlib.Path(__file__).resolve().parents[1] / "sign-quotabar.sh"
+        subprocess.run([signer, app, root, "-"], check=True)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -122,11 +129,15 @@ def main():
             profile.mkdir()
             subprocess.run(
                 [contents / "MacOS/Probe", directory], check=True, timeout=120,
-                env={**os.environ, "CFFIXED_USER_HOME": str(profile)},
+                env={**os.environ, "HOME": str(profile), "CFFIXED_USER_HOME": str(profile)},
             )
         finally:
             server.shutdown()
             thread.join()
+        preferences = plistlib.loads(preference_domain.with_suffix(".plist").read_bytes())
+        if "SULastCheckTime" not in preferences:
+            raise RuntimeError("Sparkle did not record its last check in the private fixture plist")
+        print("Sparkle recorded its last check in the private fixture plist.")
         if server.requests != ["/appcast.xml"] * 80:
             raise RuntimeError(f"Unexpected probe requests: {server.requests}")
         print(f"Verified {len(server.requests)} feed requests and rejection of five modified archives.")

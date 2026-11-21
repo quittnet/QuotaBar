@@ -88,7 +88,7 @@ enum MenuChecks {
         let mock = MockRedemption()
         let reads = FixtureReads()
         let claude = ClaudeFixture()
-        let suite = "QuotaBar-menu-test-" + UUID().uuidString
+        let suite = testPreferencesDomain()
         let preferences = UserDefaults(suiteName: suite)!
         let useFixtures = ProcessInfo.processInfo.environment["QUOTABAR_TEST_FIXTURES"] == "1"
         let stress = ProcessInfo.processInfo.environment["QUOTABAR_STRESS"] == "1"
@@ -848,12 +848,12 @@ enum MenuChecks {
     }
 
     private static func shownPercentage(_ mode: PercentageMode, original: QuotaDisplay) -> String {
-        guard let limit = original.limitingWindow else { preconditionFailure("Expected a provider quota.") }
+        guard let limit = original.menuBarWindows.first else { preconditionFailure("Expected a provider quota.") }
         return QuotaDisplay.percent(mode == .used ? limit.used : limit.remaining)
     }
 
     private static func checkReadout(_ mode: PercentageMode, original: QuotaDisplay, in label: String) {
-        guard let limit = original.limitingWindow else { preconditionFailure("Expected a provider quota.") }
+        guard let limit = original.menuBarWindows.first else { preconditionFailure("Expected a provider quota.") }
         let window = QuotaDisplay.name(limit)
         let value = shownPercentage(mode, original: original)
         precondition(label.contains("\(original.provider.name) · \(window), \(value) \(mode.rawValue)"), label)

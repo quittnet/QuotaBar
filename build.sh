@@ -37,7 +37,7 @@ while IFS= read -r file; do
     esac
 done < release-files.txt
 set -- "$@" -F "${sparkle}" -framework Sparkle -Xlinker -rpath -Xlinker '@executable_path/../Frameworks'
-xcrun swiftc -swift-version 5 -module-cache-path "${TMPDIR:-/tmp}/quotabar-build-modules" -O -parse-as-library \
+xcrun swiftc -swift-version 5 -module-cache-path "${stage}/modules" -O -parse-as-library \
     -target "${target_arch}-apple-macosx14.0" "$@" -o "${app}/Contents/MacOS/QuotaBar"
 cp -X Resources/Info.plist "${app}/Contents/Info.plist"
 cp -X Resources/AppIcon.icns "${app}/Contents/Resources/AppIcon.icns"
@@ -53,32 +53,7 @@ plutil -insert SUAutomaticallyUpdate -bool NO "${plist}"
 plutil -insert SUVerifyUpdateBeforeExtraction -bool YES "${plist}"
 plutil -insert SURequireSignedFeed -bool YES "${plist}"
 plutil -insert SUSignedFeedFailureExpirationInterval -integer 0 "${plist}"
-framework="${app}/Contents/Frameworks/Sparkle.framework/Versions/B"
-if [ "${sign_identity}" = - ]; then
-    timestamp=--timestamp=none
-else
-    timestamp=--timestamp
-fi
-for nested in "${framework}/XPCServices/Downloader.xpc" "${framework}/XPCServices/Installer.xpc" \
-    "${framework}/Autoupdate" "${framework}/Updater.app" "${app}/Contents/Frameworks/Sparkle.framework"; do
-    codesign --force --sign "${sign_identity}" --options runtime "${timestamp}" "${nested}"
-done
-if [ "${sign_identity}" = - ]; then
-    entitlements="${stage}/host.entitlements"
-    cat > "${entitlements}" <<'ENTITLEMENTS'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>com.apple.security.cs.disable-library-validation</key><true/>
-</dict></plist>
-ENTITLEMENTS
-    codesign --force --sign - --options runtime --timestamp=none --entitlements "${entitlements}" \
-        --identifier app.quotabar.QuotaBar "${app}"
-else
-    codesign --force --sign "${sign_identity}" --options runtime --timestamp \
-        --identifier app.quotabar.QuotaBar "${app}"
-fi
-codesign --verify --deep --strict "${app}"
+./sign-quotabar.sh "${app}" "${stage}" "${sign_identity}"
 destination="${output_dir}/QuotaBar.app"
 if [ -e "${destination}" ] || [ -L "${destination}" ]; then
     backup=$(mktemp -d "${output_dir}/QuotaBar-previous.XXXXXX")
