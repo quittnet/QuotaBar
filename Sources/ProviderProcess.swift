@@ -81,19 +81,17 @@ struct ProviderProcess {
         return current
     }
 
-    func finish(failed: Bool, graceMilliseconds: Int) {
+    func finish(graceMilliseconds: Int) {
         let current = waitForExit(milliseconds: graceMilliseconds)
         guard current != .unavailable else { return }
-        if failed || current == .running {
-            // This group was created by posix_spawn. We have not reaped its leader,
-            // so its numeric ID cannot be reused for an unrelated process group.
-            _ = kill(-pid, SIGTERM)
-            if current == .running { _ = waitForExit(milliseconds: 250) }
-            if state() != .unavailable {
-                _ = kill(-pid, SIGKILL)
-                // A wrapper can also elect to leave the initial group itself.
-                if state() == .running { _ = kill(pid, SIGKILL) }
-            }
+        // This group was created by posix_spawn. We have not reaped its leader,
+        // so its numeric ID cannot be reused for an unrelated process group.
+        _ = kill(-pid, SIGTERM)
+        if current == .running { _ = waitForExit(milliseconds: 250) }
+        if state() != .unavailable {
+            _ = kill(-pid, SIGKILL)
+            // A wrapper can also elect to leave the initial group itself.
+            if state() == .running { _ = kill(pid, SIGKILL) }
         }
         if waitForExit(milliseconds: 250) == .running {
             let child = pid

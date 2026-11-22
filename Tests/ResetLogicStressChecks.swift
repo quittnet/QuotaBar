@@ -49,11 +49,14 @@ struct ResetLogicStressChecks {
         var blockedByReceipt = false
         var retrying = false
         var seenKeys: Set<UUID> = []
+        var lastRead: Input?
 
         func eligible(_ input: Input) -> Bool {
             guard input.usable, phase == .ready || phase == .uncertain else { return false }
             if let pending { return pending.accountFingerprint == input.account }
-            return !blockedByReceipt && input.account != nil && (input.count ?? 0) > 0
+            guard let owner = input.account, !blockedByReceipt, (input.count ?? 0) > 0 else { return false }
+            return lastRead?.account == owner && lastRead?.count == input.count
+                && lastRead?.afterCompletion == input.afterCompletion
         }
         mutating func prepare(_ input: Input) {
             guard eligible(input) else { return }
@@ -110,6 +113,7 @@ struct ResetLogicStressChecks {
             phase = .ready
         }
         mutating func restore() {
+            lastRead = nil
             selection = nil
             phase = pending == nil ? .ready : .uncertain
             blockedByReceipt = pending == nil && !receipts.isEmpty
@@ -117,6 +121,7 @@ struct ResetLogicStressChecks {
         mutating func received(_ input: Input) {
             guard !input.missingReading else { return }
             if phase == .uncertain { restore() }
+            lastRead = input
             guard phase == .ready || phase == .confirming else { return }
             if let account = input.account, let count = input.count, input.afterCompletion,
                 let prior = receipts[account], count != prior
@@ -186,7 +191,9 @@ struct ResetLogicStressChecks {
                         input.account = ["account-A", "account-B", nil][random.next(3)]
                         input.count = [nil, 0, 1, 2, 3, 4][random.next(6)]
                         input.afterCompletion = random.next(4) != 0
-                        if let reading = input.display.reading { store.received(reading) }
+                        if let reading = input.display.reading {
+                            store.received(reading, generation: store.readGeneration())
+                        }
                         model.received(input)
                     case 9:
                         input.failed = random.next(3) == 0
@@ -196,7 +203,7 @@ struct ResetLogicStressChecks {
                         input.missingReading = random.next(5) == 0
                     default:
                         input = Input(account: random.next(2) == 0 ? "account-A" : "account-B", count: 3)
-                        store.received(input.display.reading!)
+                        store.received(input.display.reading!, generation: store.readGeneration())
                         model.received(input)
                     }
                 }
@@ -255,12 +262,13 @@ struct ResetLogicStressChecks {
             let file = directory.appendingPathComponent("detail-\(index).json")
             let original = try fixture(["credit-A", "credit-B"], count: 2, at: before)
             let store = UsageResets(file: file)
+            store.received(original.reading!, generation: store.readGeneration())
             store.prepare(original)
             require(store.begin(original)?.creditID == "credit-A", "wrong detailed credit", "detail")
             store.finish(.reset, reading: original.reading)
             let relaunched = UsageResets(file: file)
             let updated = try fixture(variant.ids, count: variant.count, at: variant.fresh ? after : before)
-            relaunched.received(updated.reading!)
+            relaunched.received(updated.reading!, generation: relaunched.readGeneration())
             require(
                 relaunched.awaitingUpdatedBalance == variant.blocked,
                 "receipt completeness or age gate diverged", "detail=\(index)")
@@ -282,7 +290,7 @@ struct ResetLogicStressChecks {
         store.prepare(display)
         require(store.begin(display) == nil, "corrupt record dispatched", "storage")
         try FileManager.default.removeItem(at: file)
-        store.received(display.reading!)
+        store.received(display.reading!, generation: store.readGeneration())
         require(store.phase == .ready && store.canPrepare(display), "repaired storage did not recover", "storage")
         store.prepare(display)
         let attempt = store.begin(display)

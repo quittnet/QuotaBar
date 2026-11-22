@@ -9,6 +9,10 @@ struct ResetContentionChecks {
             let directory = URL(fileURLWithPath: args[2])
             let display = fixture()
             let store = UsageResets(file: directory.appendingPathComponent("pending"))
+            try waitUntil("verified fixture balance") {
+                store.received(display.reading!, generation: store.readGeneration())
+                return store.canPrepare(display)
+            }
             store.prepare(display)
             precondition(store.phase == .confirming)
             try Data().write(to: directory.appendingPathComponent("ready-" + args[3]))

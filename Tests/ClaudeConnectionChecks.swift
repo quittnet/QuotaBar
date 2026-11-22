@@ -273,6 +273,11 @@ struct ClaudeConnectionChecks {
         let stateURL = managed.appendingPathComponent("state.json")
         let scriptURL = managed.appendingPathComponent("statusline.sh")
         func installV1(savedCommand: String, guardLines: String = "", storedExecutable: URL? = nil) throws {
+            // Earlier versions lacked both standalone-uninstall files.
+            for name in ["QuotaBarClaudeDisconnect", "uninstall.sh"] {
+                let file = managed.appendingPathComponent(name)
+                if files.fileExists(atPath: file.path) { try files.removeItem(at: file) }
+            }
             let executable = storedExecutable ?? executable
             try JSONSerialization.data(withJSONObject: [
                 "marker": marker, "originalCommand": savedCommand, "executable": executable.path,
@@ -383,6 +388,23 @@ struct ClaudeConnectionChecks {
         try check(try Data(contentsOf: settingsURL) == previous)
         try check(try Data(contentsOf: other) == Data("user copy".utf8))
         precondition(!files.fileExists(atPath: managed.path))
+
+        // A legacy file saved after discovery belongs to its editor, even when its name still matches.
+        for artifact in [lock, backup] {
+            try files.createDirectory(at: managed, withIntermediateDirectories: true)
+            try installV1(savedCommand: original)
+            try (artifact == lock ? Data() : previous).write(to: artifact)
+            try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: artifact.path)
+            let edited = Data("saved while upgrading".utf8)
+            try mustFail {
+                try ClaudeConnection.connect(directory: real, executable: executable) { stage in
+                    if stage == .installingUninstaller { try edited.write(to: artifact, options: .atomic) }
+                }
+            }
+            try check(try Data(contentsOf: artifact) == edited)
+            try ClaudeConnection.disconnect(directory: real)
+            try check(try Data(contentsOf: artifact) == edited)
+        }
     }
 
     private static func checkReformattedSettings(root: URL, executable: URL) throws {
@@ -428,10 +450,10 @@ struct ClaudeConnectionChecks {
             process.waitUntilExit()
             return (process.terminationStatus, output)
         }
-        func connectRemovableApp(_ name: String, settings start: String) throws -> URL {
+        func connectRemovableApp(_ name: String, settings start: String?) throws -> URL {
             let dir = root.appendingPathComponent("uninstall-" + name)
             try files.createDirectory(at: dir, withIntermediateDirectories: true)
-            try Data(start.utf8).write(to: dir.appendingPathComponent("settings.json"))
+            if let start { try Data(start.utf8).write(to: dir.appendingPathComponent("settings.json")) }
             let app = root.appendingPathComponent("Removable-" + name)
             try files.copyItem(at: executable, to: app)
             try ClaudeConnection.connect(directory: dir, executable: app)
@@ -490,6 +512,110 @@ struct ClaudeConnectionChecks {
         let linkRefused = try runUninstaller(linked)
         precondition(linkRefused.status != 0 && linkRefused.output.contains("link"), linkRefused.output)
         try check(try Data(contentsOf: target) == linkedBefore)
+
+        let absent = try connectRemovableApp("absent", settings: nil)
+        let deleted = try runUninstaller(absent)
+        precondition(deleted.status == 0, deleted.output)
+        precondition(!files.fileExists(atPath: absent.appendingPathComponent("settings.json").path))
+
+        let source = #"{ "id":9007199254740993, "amount":1.2500e+02, "theme":"dark" }"# + "\n"
+        let precise = try connectRemovableApp("precise", settings: source)
+        let preciseURL = precise.appendingPathComponent("settings.json")
+        let current = try String(contentsOf: preciseURL, encoding: .utf8)
+        try Data(current.replacingOccurrences(of: "dark", with: "light").utf8).write(to: preciseURL)
+        let exact = try runUninstaller(precise)
+        precondition(exact.status == 0, exact.output)
+        try check(try Data(contentsOf: preciseURL) == Data(source.replacingOccurrences(of: "dark", with: "light").utf8))
+
+        let other = try connectRemovableApp("other-profile", settings: "{}")
+        let switched = try connectRemovableApp("switched", settings: "{}")
+        try setCommand(try statusCommand(settings(other)), in: switched)
+        let switchedSettings = switched.appendingPathComponent("settings.json")
+        let beforeSwitchCleanup = try Data(contentsOf: switchedSettings)
+        let otherWrapper = other.appendingPathComponent(".quotabar/statusline.sh")
+        let beforeOther = try Data(contentsOf: otherWrapper)
+        let privateNote = switched.appendingPathComponent(".quotabar/note.txt")
+        try Data("keep me".utf8).write(to: privateNote)
+        let cleaned = try runUninstaller(switched)
+        precondition(cleaned.status == 0, cleaned.output)
+        try check(try Data(contentsOf: switchedSettings) == beforeSwitchCleanup)
+        try check(try Data(contentsOf: otherWrapper) == beforeOther)
+        try check(try Data(contentsOf: privateNote) == Data("keep me".utf8))
+        try check(try files.contentsOfDirectory(atPath: privateNote.deletingLastPathComponent().path) == ["note.txt"])
+
+        for name in ["statusline.sh", "uninstall.sh", "previous-settings.json", "QuotaBarClaudeDisconnect"] {
+            let edited = try connectRemovableApp("modified-" + name, settings: "{}")
+            let directory = edited.appendingPathComponent(".quotabar")
+            let changed = directory.appendingPathComponent(name)
+            let bytes = try Data(contentsOf: changed) + Data("\n# local change\n".utf8)
+            try bytes.write(to: changed)
+            let settingsURL = edited.appendingPathComponent("settings.json")
+            let savedSettings = try Data(contentsOf: settingsURL)
+            let refused = try runUninstaller(edited)
+            precondition(refused.status != 0, "Standalone uninstall accepted edited " + name)
+            try mustFail { try ClaudeConnection.disconnect(directory: edited) }
+            try mustFail { try ClaudeConnection.connect(directory: edited, executable: executable) }
+            try check(try Data(contentsOf: changed) == bytes)
+            try check(try Data(contentsOf: settingsURL) == savedSettings)
+        }
+
+        // Upgrade a genuine build-39 layout using the frozen script template and the recorded commands.
+        let template = try String(contentsOfFile: "Tests/Fixtures/Build39ClaudeUninstall.txt", encoding: .utf8)
+        for editOldScript in [false, true] {
+            let prior = try connectRemovableApp(
+                "build39-" + String(editOldScript), settings: String(decoding: original, as: UTF8.self))
+            let managedDir = prior.appendingPathComponent(".quotabar")
+            let stateFile = managedDir.appendingPathComponent("state.json")
+            var priorState = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: stateFile))
+            priorState.removeValue(forKey: "disconnectHelperSHA256")
+            try JSONEncoder().encode(priorState).write(to: stateFile)
+            try files.removeItem(at: managedDir.appendingPathComponent("QuotaBarClaudeDisconnect"))
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .withoutEscapingSlashes
+            let managed = String(decoding: try encoder.encode(statusCommand(settings(prior))), as: UTF8.self)
+            let saved = String(decoding: try encoder.encode(priorState["originalCommand"]), as: UTF8.self)
+            let oldBytes = Data(
+                (template.replacingOccurrences(of: "__QUOTABAR_MANAGED__", with: managed)
+                    .replacingOccurrences(of: "__QUOTABAR_ORIGINAL__", with: saved)
+                    + (editOldScript ? "# keep my edits\n" : "")).utf8)
+            let oldUninstall = managedDir.appendingPathComponent("uninstall.sh")
+            try oldBytes.write(to: oldUninstall)
+            precondition(ClaudeConnection.status(directory: prior) == .needsUpgrade)
+            if editOldScript {
+                try mustFail { try ClaudeConnection.connect(directory: prior, executable: executable) }
+                try mustFail { try ClaudeConnection.disconnect(directory: prior) }
+                try check(try Data(contentsOf: oldUninstall) == oldBytes)
+            } else {
+                let oldRecord = try Data(contentsOf: stateFile)
+                let installedWrapper = managedDir.appendingPathComponent("statusline.sh")
+                let oldWrapper = try Data(contentsOf: installedWrapper)
+                let settingsURL = prior.appendingPathComponent("settings.json")
+                let oldSettings = try Data(contentsOf: settingsURL)
+                let helper = managedDir.appendingPathComponent("QuotaBarClaudeDisconnect")
+                let localLauncher = oldBytes + Data("# local edit during upgrade\n".utf8)
+                let localHelper = Data("editor's concurrent revision\n".utf8)
+                try mustFail {
+                    try ClaudeConnection.connect(directory: prior, executable: executable) { stage in
+                        if stage == .installingUninstaller {
+                            try localLauncher.write(to: oldUninstall, options: .atomic)
+                            try localHelper.write(to: helper, options: .atomic)
+                        }
+                    }
+                }
+                try check(try Data(contentsOf: oldUninstall) == localLauncher)
+                try check(try Data(contentsOf: helper) == localHelper)
+                try check(try Data(contentsOf: stateFile) == oldRecord)
+                try check(try Data(contentsOf: installedWrapper) == oldWrapper)
+                try check(try Data(contentsOf: settingsURL) == oldSettings)
+                try oldBytes.write(to: oldUninstall)
+                try files.removeItem(at: helper)
+                try ClaudeConnection.connect(directory: prior, executable: executable)
+                precondition(ClaudeConnection.isConfigured(directory: prior))
+                let migrated = try runUninstaller(prior)
+                precondition(migrated.status == 0, migrated.output)
+                try check(try Data(contentsOf: prior.appendingPathComponent("settings.json")) == original)
+            }
+        }
 
         // Disconnecting from the app also removes the uninstaller.
         let app = root.appendingPathComponent("Kept-app")
@@ -664,6 +790,39 @@ struct ClaudeConnectionChecks {
         try check(try Data(contentsOf: newSettings) == first)
         try ClaudeConnection.disconnect(directory: clean)
         try check(try Data(contentsOf: newSettings) == first)
+
+        // Both uninstall entry points use this transaction. Two editors racing the
+        // disconnect keep the second save active and the displaced first save in recovery.
+        let racing = root.appendingPathComponent("disconnect-two-saves")
+        try files.createDirectory(at: racing, withIntermediateDirectories: true)
+        let active = racing.appendingPathComponent("settings.json")
+        try baseline.write(to: active)
+        try ClaudeConnection.connect(directory: racing, executable: executable)
+        try mustFail {
+            try ClaudeConnection.disconnect(directory: racing) { stage in
+                if stage == .beforeDisplacing { try first.write(to: active, options: .atomic) }
+                if stage == .afterDisplacing { try second.write(to: active, options: .atomic) }
+            }
+        }
+        let versions = try files.contentsOfDirectory(at: racing, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix(".quotabar-settings-recovery-") }
+        precondition(versions.count == 1 && ClaudeConnection.canDisconnect(directory: racing))
+        try check(try Data(contentsOf: versions[0].appendingPathComponent("settings.json")) == first)
+        try check(try Data(contentsOf: active) == second)
+        try ClaudeConnection.disconnect(directory: racing)
+        try check(try Data(contentsOf: active) == second)
+
+        let changedDuringCleanup = root.appendingPathComponent("cleanup-edit")
+        try ClaudeConnection.connect(directory: changedDuringCleanup, executable: executable)
+        let launcher = changedDuringCleanup.appendingPathComponent(".quotabar/uninstall.sh")
+        let localEdit = Data("# User's revised uninstall script\n".utf8)
+        try mustFail {
+            try ClaudeConnection.disconnect(directory: changedDuringCleanup) { stage in
+                if stage == .cleanup { try localEdit.write(to: launcher, options: .atomic) }
+            }
+        }
+        try check(try Data(contentsOf: launcher) == localEdit)
+        precondition(ClaudeConnection.canDisconnect(directory: changedDuringCleanup))
 
         try ClaudeConnection.connect(directory: dir, executable: executable)
         try mustFail {

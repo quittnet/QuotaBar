@@ -21,7 +21,10 @@ enum ClaudeConnection {
         let settingsBackup: String?
         let captureProfile: String?
         let legacyFormatting: String?
+        var disconnectHelperSHA256: String? = nil
         var disconnecting: String? = nil
+
+        static func recognizes(_ key: String) -> Bool { CodingKeys(stringValue: key) != nil }
     }
 
     private struct SetupError: LocalizedError {
@@ -30,8 +33,6 @@ enum ClaudeConnection {
     }
 
     static var directory: URL { ClaudeProfile.directory }
-
-    static func selectDirectory(_ url: URL?) { ClaudeProfile.select(url) }
 
     static func canDisconnect() -> Bool { canDisconnect(directory: directory) }
 
@@ -65,11 +66,15 @@ enum ClaudeConnection {
         if isManagedCommand(command, root: root) {
             var info = stat()
             guard lstat(root.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR,
-                let state = try? loadState(root), let script = try? read(root.appendingPathComponent("statusline.sh")),
+                let state = try? loadState(root).state,
+                let script = try? read(root.appendingPathComponent("statusline.sh")),
                 let version = version(of: script, state: state)
             else { return .notConfigured }
             let installed = URL(fileURLWithPath: state.executable)
-            return version == .current && !isTranslocated(installed)
+            return version == .current && state.disconnectHelperSHA256 != nil
+                && FileManager.default.isExecutableFile(atPath: root.appendingPathComponent(helperName).path)
+                && FileManager.default.isExecutableFile(atPath: root.appendingPathComponent("uninstall.sh").path)
+                && !isTranslocated(installed)
                 && state.captureProfile.map { sameFile($0, directory.path) } == true
                 && (executable.map { $0.resolvingSymlinksInPath().path == installed.resolvingSymlinksInPath().path }
                     ?? true)
@@ -156,12 +161,13 @@ enum ClaudeConnection {
                     message:
                         "The .quotabar connection folder must be a regular directory. Check that folder and try again.")
             }
-            oldState = try loadState(root)
+            let record = try loadState(root)
+            oldState = record.state
             guard oldState?.disconnecting == nil else {
                 throw SetupError(message: "Finish disconnecting this Claude profile before reconnecting.")
             }
             oldScript = try read(scriptURL)
-            oldStateData = try read(stateURL)
+            oldStateData = record.bytes
             guard let oldState,
                 oldScript.map({ version(of: $0, state: oldState) != nil }) ?? true
             else {
@@ -191,20 +197,24 @@ enum ClaudeConnection {
         let migratedBackup = oldState?.settingsBackup == nil ? legacy.original : nil
         let backup = currentlyManaged ? oldBackup ?? migratedBackup : previousSettings
         let origin = backup.map(digest) ?? (currentlyManaged ? oldState?.settingsBackup : "absent")
+        let uninstallURL = root.appendingPathComponent("uninstall.sh")
+        let helperURL = root.appendingPathComponent(helperName)
+        let oldUninstaller = try checkedUninstaller(root, state: oldState)
+        let helper = try bundledHelper()
+        let helperDigest = digest(helper)
+        let uninstallScript = launcher(helperDigest)
         let state = State(
             marker: marker, originalCommand: originalCommand, executable: executable.path, settingsBackup: origin,
             captureProfile: directory.resolvingSymlinksInPath().path,
             legacyFormatting: currentlyManaged && (oldState?.legacyFormatting == "legacy" || migratedBackup != nil)
-                ? "legacy" : nil)
+                ? "legacy" : nil, disconnectHelperSHA256: helperDigest)
         let script = wrapper(state)
-        let uninstallURL = root.appendingPathComponent("uninstall.sh")
-        let oldUninstaller = rootExisted ? try read(uninstallURL) : nil
-        let uninstallScript = try uninstaller(managedCommand: managedCommand, originalCommand: originalCommand)
         let patched = try document.settingCommand(managedCommand)
         let updatedSettings = currentCommand == managedCommand ? document.data : patched
         guard updatedSettings.count <= maximumFileSize else { throw ClaudeSettingsDocument.Failure.unsupported }
         if currentCommand == managedCommand, oldScript == script, origin == oldState?.settingsBackup,
-            legacy.files.isEmpty, oldUninstaller == uninstallScript
+            legacy.files.isEmpty, oldUninstaller.script == uninstallScript, oldUninstaller.helper == helper,
+            files.isExecutableFile(atPath: helperURL.path), files.isExecutableFile(atPath: uninstallURL.path)
         {
             return
         }
@@ -213,17 +223,25 @@ enum ClaudeConnection {
             try files.createDirectory(
                 at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         }
+        var rollback: [(url: URL, restore: Data?, installed: Data?, permissions: mode_t)] = []
+        func replaceFile(_ url: URL, previous: Data?, with next: Data?, permissions: mode_t = 0o600) throws {
+            var info = stat()
+            if previous != nil, lstat(url.path, &info) != 0 { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+            try ClaudeSettingsCommit.apply(next, replacing: previous, at: url, permissions: permissions, observe: nil)
+            rollback.append((url, previous, next, info.st_mode & 0o7777))
+        }
         var connectionFilesReady = false
         do {
-            if backup != oldBackup, let backup { try write(backup, to: backupURL) }
-            try write(script, to: scriptURL, permissions: 0o700)
-            try write(JSONEncoder().encode(state), to: stateURL)
-            try write(uninstallScript, to: uninstallURL, permissions: 0o700)
+            if backup != oldBackup { try replaceFile(backupURL, previous: oldBackup, with: backup) }
+            try replaceFile(scriptURL, previous: oldScript, with: script, permissions: 0o700)
+            try replaceFile(stateURL, previous: oldStateData, with: JSONEncoder().encode(state))
+            try replaceFile(helperURL, previous: oldUninstaller.helper, with: helper, permissions: 0o700)
+            try observe?(.installingUninstaller)
+            try replaceFile(uninstallURL, previous: oldUninstaller.script, with: uninstallScript, permissions: 0o700)
             guard try read(settingsURL) == previousSettings else {
                 throw SetupError(
                     message: "Claude Code’s settings changed during setup. Connect again to use the latest settings.")
             }
-            if backup == nil, oldBackup != nil { try files.removeItem(at: backupURL) }
             if previousSettings != updatedSettings {
                 connectionFilesReady = true
                 try ClaudeSettingsCommit.apply(
@@ -233,39 +251,44 @@ enum ClaudeConnection {
             // A concurrent editor may have saved the newly installed wrapper into its own version.
             // Leave its verified script and record available if that version is now active.
             if connectionFilesReady, (try? selectsWrapper(settingsURL, root: root)) == true { throw error }
-            if let oldBackup {
-                try? write(oldBackup, to: backupURL)
-            } else if backup != nil {
-                try? files.removeItem(at: backupURL)
-            }
-            if let oldUninstaller {
-                try? write(oldUninstaller, to: uninstallURL, permissions: 0o700)
-            } else {
-                try? files.removeItem(at: uninstallURL)
-            }
-            if let oldStateData {
-                if let oldScript {
-                    try? write(oldScript, to: scriptURL, permissions: 0o700)
-                } else {
-                    try? files.removeItem(at: scriptURL)
+            let setupError = error
+            var conflicts: [String] = []
+            for file in rollback.reversed() {
+                do {
+                    try ClaudeSettingsCommit.apply(
+                        file.restore, replacing: file.installed, at: file.url, permissions: file.permissions,
+                        observe: nil)
+                } catch {
+                    conflicts.append(file.url.path + ". " + error.localizedDescription)
                 }
-                try? write(oldStateData, to: stateURL)
-            } else {
-                try? files.removeItem(at: scriptURL)
-                try? files.removeItem(at: stateURL)
-                _ = rmdir(root.path)
             }
-            throw error
+            if !rootExisted { _ = rmdir(root.path) }
+            if !conflicts.isEmpty {
+                throw SetupError(
+                    message: setupError.localizedDescription + " Review " + conflicts.joined(separator: "\n"))
+            }
+            throw setupError
         }
         try legacy.remove()
     }
 
     private struct LegacyFiles {
-        var files: [URL] = []
+        var files: [(url: URL, identity: stat, checksum: String?)] = []
         var original: Data?
 
         func remove() throws {
-            for url in files { try FileManager.default.removeItem(at: url) }
+            for file in files {
+                let expected: Data
+                if let checksum = file.checksum {
+                    guard let bytes = try read(file.url), digest(bytes) == checksum else {
+                        throw SetupError(message: "The legacy backup changed during cleanup. Review " + file.url.path)
+                    }
+                    expected = bytes
+                } else {
+                    expected = Data()  // The legacy lock was empty when discovered.
+                }
+                try removeVerifiedFile(file.url, expected: expected, identity: file.identity)
+            }
         }
     }
 
@@ -289,7 +312,7 @@ enum ClaudeConnection {
             guard line == nil || line is NSNull || command != nil else { continue }
             let managed = command.map { isManagedCommand($0, root: root) } ?? false
             guard command == original || managed else { continue }
-            result.files.append(url)
+            result.files.append((url, info, digest(data)))
             let time = Double(info.st_mtimespec.tv_sec) + Double(info.st_mtimespec.tv_nsec) / 1e9
             if time > newest, command == original, !managed {
                 newest = time
@@ -301,7 +324,7 @@ enum ClaudeConnection {
         if lstat(lock.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_nlink == 1,
             info.st_uid == geteuid(), (info.st_mode & 0o777) == 0o600, info.st_size == 0
         {
-            result.files.append(lock)
+            result.files.append((lock, info, nil))
         }
         return result
     }
@@ -337,13 +360,14 @@ enum ClaudeConnection {
 
     static func disconnect(directory: URL, observe: ClaudeSettingsCommit.Observer? = nil) throws {
         try withProfileLock(directory) {
-            let files = FileManager.default
             let root = directory.appendingPathComponent(".quotabar")
             guard canDisconnect(directory: directory) else {
                 throw SetupError(
                     message: "QuotaBar couldn’t find its connection record in the selected Claude profile.")
             }
-            var state = try loadState(root)
+            let record = try loadState(root)
+            var state = record.state
+            let uninstaller = try checkedUninstaller(root, state: state)
             let scriptURL = root.appendingPathComponent("statusline.sh")
             let script = try read(scriptURL)
             guard script.map({ version(of: $0, state: state) != nil }) ?? true else {
@@ -358,6 +382,7 @@ enum ClaudeConnection {
                 ? try legacyFiles(directory, root: root, original: state.originalCommand) : LegacyFiles()
             let backup = savedBackup ?? (state.settingsBackup == nil ? legacy.original : nil)
             let settingsURL = directory.appendingPathComponent("settings.json")
+            try requireSingleLink(settingsURL)
             if let current = try read(settingsURL) {
                 let document = try ClaudeSettingsDocument(current)
                 _ = try document.rawStatusLine()
@@ -373,19 +398,17 @@ enum ClaudeConnection {
                     _ = try document.rawCommand()
                     let updated = try restoredSettings(
                         document, command: command, line: line, state: state, backup: backup, root: root)
-                    try requireSingleLink(settingsURL)
                     guard try read(settingsURL) == current else {
                         throw SetupError(message: "Claude Code’s settings changed during disconnect. Try again.")
                     }
                     try ClaudeSettingsCommit.apply(updated, replacing: current, at: settingsURL, observe: observe)
                 } else if let line = document.object["statusLine"] as? [String: Any],
                     let command = line["command"] as? String,
-                    command.contains(scriptURL.path) || command.contains(quote(scriptURL.path))
-                        || isManagedCommand(command, root: root)
+                    referencesWrapper(command, root: root)
                 {
                     throw SetupError(
                         message:
-                            "The replacement status line may still call QuotaBar’s script. Remove that reference before disconnecting."
+                            "The replacement status line still calls QuotaBar’s script. Remove that reference before disconnecting."
                     )
                 }
             }
@@ -396,14 +419,16 @@ enum ClaudeConnection {
                 )
             }
             state.disconnecting = "yes"
-            try write(JSONEncoder().encode(state), to: root.appendingPathComponent("state.json"))
-            if script != nil { try files.removeItem(at: scriptURL) }
-            let uninstallURL = root.appendingPathComponent("uninstall.sh")
-            if files.fileExists(atPath: uninstallURL.path) { try files.removeItem(at: uninstallURL) }
+            let stateURL = root.appendingPathComponent("state.json")
+            let cleanupRecord = try JSONEncoder().encode(state)
+            try ClaudeSettingsCommit.apply(cleanupRecord, replacing: record.bytes, at: stateURL, observe: nil)
+            try removeVerifiedFile(scriptURL, expected: script)
             try legacy.remove()
-            if savedBackup != nil { try files.removeItem(at: backupURL) }
+            try removeVerifiedFile(backupURL, expected: savedBackup)
             try observe?(.cleanup)
-            try files.removeItem(at: root.appendingPathComponent("state.json"))
+            try removeVerifiedFile(root.appendingPathComponent("uninstall.sh"), expected: uninstaller.script)
+            try removeVerifiedFile(root.appendingPathComponent(helperName), expected: uninstaller.helper)
+            try removeVerifiedFile(stateURL, expected: cleanupRecord)
             if rmdir(root.path) != 0 && errno != ENOTEMPTY { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
         }
     }
@@ -415,8 +440,18 @@ enum ClaudeConnection {
         guard let line = doc.object["statusLine"] as? [String: Any], let command = line["command"] as? String else {
             return false
         }
-        return isManagedCommand(command, root: root)
-            || command.contains(root.appendingPathComponent("statusline.sh").path)
+        return referencesWrapper(command, root: root)
+    }
+
+    private static func referencesWrapper(_ command: String, root: URL) -> Bool {
+        if isManagedCommand(command, root: root) { return true }
+        let script = root.appendingPathComponent("statusline.sh")
+        var paths = [script.path, script.resolvingSymlinksInPath().path]
+        if let physical = realpath(script.path, nil) {
+            paths.append(String(cString: physical))
+            free(physical)
+        }
+        return paths.contains { command.contains($0) || command.contains(quote($0)) }
     }
 
     private static func restoredSettings(
@@ -456,16 +491,18 @@ enum ClaudeConnection {
         return try document.settingStatusLine(baseline?.rawStatusLine())
     }
 
-    private static func loadState(_ root: URL) throws -> State {
+    private static func loadState(_ root: URL) throws -> (state: State, bytes: Data) {
         guard let data = try read(root.appendingPathComponent("state.json")),
-            let state = try? JSONDecoder().decode(State.self, from: data), state.marker == marker
+            let state = try? JSONDecoder().decode(State.self, from: data), state.marker == marker,
+            let fields = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            fields.keys.allSatisfy(State.recognizes)
         else {
             throw SetupError(
                 message:
                     "The .quotabar folder already exists without a valid connection record. Check that folder before connecting."
             )
         }
-        return state
+        return (state, data)
     }
 
     private static func wrapperCommand(_ root: URL) -> String {
@@ -587,88 +624,93 @@ enum ClaudeConnection {
             """.utf8)
     }
 
-    /// A self-contained script that undoes the connection after QuotaBar itself has been deleted.
-    /// It uses only macOS's own JavaScript engine and edits settings.json only while it still selects the wrapper.
-    private static func uninstaller(managedCommand: String, originalCommand: String?) throws -> Data {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = .withoutEscapingSlashes
-        let managed = String(decoding: try encoder.encode(managedCommand), as: UTF8.self)
-        let original = try originalCommand.map { String(decoding: try encoder.encode($0), as: UTF8.self) } ?? "null"
-        let program = uninstallProgram.replacingOccurrences(of: "__QUOTABAR_MANAGED__", with: managed)
-            .replacingOccurrences(of: "__QUOTABAR_ORIGINAL__", with: original)
-        return Data(
+    private static let helperName = "QuotaBarClaudeDisconnect"
+
+    private static func bundledHelper() throws -> Data {
+        guard let executable = Bundle.main.executableURL else { throw CocoaError(.fileNoSuchFile) }
+        let directory = executable.deletingLastPathComponent()
+        let helperDirectory =
+            Bundle.main.bundleURL.pathExtension == "app"
+            ? directory.deletingLastPathComponent().appendingPathComponent("Helpers") : directory
+        guard let bytes = try read(helperDirectory.appendingPathComponent(helperName)) else {
+            throw SetupError(message: "The Claude disconnect helper is missing. Reinstall QuotaBar before connecting.")
+        }
+        return bytes
+    }
+
+    private static func launcher(_ helperDigest: String) -> Data {
+        Data(
             """
             #!/bin/bash
             # \(marker).uninstall
-            # Run with: bash ~/.claude/.quotabar/uninstall.sh (or this profile's .quotabar folder).
-            # Restores the status line QuotaBar replaced and removes this folder. It works without QuotaBar.app.
-            set -u
-            root=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd) || exit 1
-            exec /usr/bin/osascript -l JavaScript - "$root" <<'QUOTABAR_UNINSTALL'
-            \(program)
-            QUOTABAR_UNINSTALL
+            # Run with bash from any directory, including after QuotaBar.app has been removed.
+            set -eu
+            root=$(cd -P -- "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd)
+            helper="$root/\(helperName)"
+            if [[ -L "$helper" || ! -f "$helper" || ! -x "$helper" ]]; then
+                echo "Restore or move the changed Claude disconnect helper: $helper" >&2
+                exit 1
+            fi
+            checksum=$(/usr/bin/shasum -a 256 < "$helper")
+            if [[ "${checksum%% *}" != '\(helperDigest)' ]]; then
+                echo "The Claude disconnect helper has been edited: $helper" >&2
+                exit 1
+            fi
+            exec "$helper"
 
             """.utf8)
     }
 
-    private static let uninstallProgram = #"""
-        ObjC.import('Foundation');
-        function run(argv) {
-            const managed = __QUOTABAR_MANAGED__;
-            const original = __QUOTABAR_ORIGINAL__;
-            const root = argv[0];
-            const profile = root.replace(/\/[^\/]+\/?$/, '');
-            const settingsPath = profile + '/settings.json';
-            // Any spelling of a path to a QuotaBar wrapper (/var vs /private/var, ~, symlinks) blocks removal.
-            const fm = $.NSFileManager.defaultManager;
-            const readText = (path) => {
-                const text = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null);
-                return text.isNil() ? null : ObjC.unwrap(text);
-            };
-            let changed = 'Claude Code settings were left unchanged.';
-            if (fm.fileExistsAtPath(settingsPath)) {
-                const attributes = ObjC.deepUnwrap(fm.attributesOfItemAtPathError(settingsPath, null));
-                if (!attributes || attributes.NSFileType !== 'NSFileTypeRegular' || attributes.NSFileReferenceCount !== 1) {
-                    throw new Error('settings.json is a link. Remove QuotaBar from its statusLine by hand, then run this script again.');
-                }
-                const text = readText(settingsPath);
-                if (text === null) throw new Error('Could not read ' + settingsPath + '.');
-                let settings;
-                try { settings = JSON.parse(text); } catch (error) { throw new Error('settings.json is not valid JSON. Nothing was changed.'); }
-                const line = settings && typeof settings === 'object' ? settings.statusLine : undefined;
-                const command = line && typeof line === 'object' ? line.command : undefined;
-                if (command === managed) {
-                    if (original !== null) {
-                        line.command = original;
-                        changed = 'Restored the previous Claude Code status line.';
-                    } else if (Object.keys(line).every((key) => key === 'type' || key === 'command')) {
-                        delete settings.statusLine;
-                        changed = 'Removed the QuotaBar status line.';
-                    } else {
-                        throw new Error('The QuotaBar status line has extra settings. Choose a replacement status line first. Nothing was changed.');
-                    }
-                    if (readText(settingsPath) !== text) throw new Error('settings.json changed while uninstalling. Run this script again.');
-                    const output = $(JSON.stringify(settings, null, 2) + '\n');
-                    if (!output.writeToFileAtomicallyEncodingError(settingsPath, true, $.NSUTF8StringEncoding, null)) {
-                        throw new Error('Could not write ' + settingsPath + '. Nothing was changed.');
-                    }
-                    fm.setAttributesOfItemAtPathError($({ NSFilePosixPermissions: attributes.NSFilePosixPermissions }), settingsPath, null);
-                } else if (typeof command === 'string' && command.includes('.quotabar/statusline.sh')) {
-                    throw new Error('The current status line still calls QuotaBar’s script. Remove that reference first. Nothing was changed.');
-                }
-            }
-            for (const name of ['statusline.sh', 'state.json', 'previous-settings.json', 'uninstall.sh']) {
-                const path = root + '/' + name;
-                if (fm.fileExistsAtPath(path) && !fm.removeItemAtPathError(path, null)) throw new Error('Could not remove ' + path + '.');
-            }
-            const left = ObjC.deepUnwrap(fm.contentsOfDirectoryAtPathError(root, null)) || [];
-            if (left.length === 0) {
-                fm.removeItemAtPathError(root, null);
-                return changed + ' Removed ' + root + '.';
-            }
-            return changed + ' Left ' + root + ' in place because it also contains: ' + left.join(', ') + '.';
+    private static func checkedUninstaller(_ root: URL, state: State?) throws -> (script: Data?, helper: Data?) {
+        let helper = try read(root.appendingPathComponent(helperName))
+        if let helper, digest(helper) != state?.disconnectHelperSHA256 {
+            throw SetupError(message: "Restore or move the changed " + helperName + " file before continuing.")
         }
-        """#
+        let script = try read(root.appendingPathComponent("uninstall.sh"))
+        if let script {
+            let recognized: Bool
+            if let expected = state?.disconnectHelperSHA256 {
+                recognized = script == launcher(expected)
+            } else {
+                recognized = try state.map { try isBuild39Uninstaller(script, state: $0, root: root) } ?? false
+            }
+            guard recognized else {
+                throw SetupError(message: "Restore or move the changed uninstall.sh file before continuing.")
+            }
+        }
+        return (script, helper)
+    }
+
+    // Build 39 embedded two JSON literals in an otherwise fixed script. Compare the entire
+    // normalized file to the released template so an upgrade never claims a hand-edited copy.
+    private static func isBuild39Uninstaller(_ data: Data, state: State, root: URL) throws -> Bool {
+        guard let script = String(data: data, encoding: .utf8) else { return false }
+        let installedRoot =
+            state.captureProfile.map { URL(fileURLWithPath: $0).appendingPathComponent(".quotabar") } ?? root
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .withoutEscapingSlashes
+        let managed = String(decoding: try encoder.encode(wrapperCommand(installedRoot)), as: UTF8.self)
+        let original = String(decoding: try encoder.encode(state.originalCommand), as: UTF8.self)
+        // The old writer substituted the original-command token after inserting the managed path.
+        let installed = managed.replacingOccurrences(of: "__QUOTABAR_ORIGINAL__", with: original)
+        let fields = "    const managed = " + installed + ";\n    const original = " + original + ";\n"
+        let normalized = script.replacingOccurrences(
+            of: fields, with: "    const managed = __QUOTABAR_MANAGED__;\n    const original = __QUOTABAR_ORIGINAL__;\n"
+        )
+        return normalized != script
+            && digest(Data(normalized.utf8)) == "09b209c45b1a4eada9f6f56be3556bcbb518e66d46fc17b6de06de867dce5462"
+    }
+
+    // A managed file can change after the preflight. Displace its directory entry and
+    // compare the actual bytes before releasing it, as with settings.json itself.
+    private static func removeVerifiedFile(_ url: URL, expected: Data?, identity: stat? = nil) throws {
+        guard let expected else { return }
+        do {
+            try ClaudeSettingsCommit.apply(nil, replacing: expected, at: url, removalIdentity: identity, observe: nil)
+        } catch {
+            throw SetupError(message: "Couldn’t remove " + url.path + ". " + error.localizedDescription)
+        }
+    }
 
     private static func quote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
@@ -706,18 +748,4 @@ enum ClaudeConnection {
         }
     }
 
-    private static func write(_ data: Data, to url: URL, permissions: mode_t = 0o600)
-        throws
-    {
-        let temporary = url.deletingLastPathComponent().appendingPathComponent(".quotabar-write-" + UUID().uuidString)
-        let descriptor = open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, permissions)
-        guard descriptor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
-        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
-        defer { try? FileManager.default.removeItem(at: temporary) }
-        try handle.write(contentsOf: data)
-        guard fsync(descriptor) == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
-        try handle.close()
-        let result = rename(temporary.path, url.path)
-        guard result == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
-    }
 }

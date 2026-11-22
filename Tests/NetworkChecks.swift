@@ -356,8 +356,11 @@ enum NetworkChecks {
                     stage = 21
                 default:
                     guard let claude = claudeController, let label = claude.item.button?.toolTip,
-                        label.contains("Weekly limit, 83% remaining")
+                        label.contains("5-hour limit, 100% remaining")
                     else { return }
+                    let windows = claude.makePanel().summaries.first { $0.display.provider == .claude }?.display
+                        .windows
+                    precondition(windows?.first { $0.minutes == 10_080 }?.remaining == 83)
                     precondition(claudeReadings.count == 7 && label.contains("75% remaining"))
                     print("An invalid Claude percentage was hidden, and an undated fresh report restored the badge.")
                     claude.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))

@@ -1,7 +1,28 @@
 import AppKit
 import SwiftUI
 
+extension UsageProvider {
+    var accentColor: NSColor {
+        switch self {
+        case .codex: return .systemBlue
+        case .claude: return NSColor(srgbRed: 0xd9 / 255.0, green: 0x77 / 255.0, blue: 0x57 / 255.0, alpha: 1)
+        }
+    }
+}
+
 struct Dashboard: View {
+    enum Page {
+        case usage, settings, help
+
+        var parent: Self? {
+            switch self {
+            case .usage: return nil
+            case .settings: return .usage
+            case .help: return .settings
+            }
+        }
+    }
+
     struct Summary {
         let display: QuotaDisplay
         let failure: String?
@@ -25,6 +46,8 @@ struct Dashboard: View {
     /// Providers whose latest report includes a 5-hour window alongside another limit.
     var fiveHourChoices: [UsageProvider] = []
     var selectMenuBarLimits: (@MainActor @Sendable (MenuBarLimits, UsageProvider) -> Void)? = nil
+    let page: Page
+    let selectPage: @MainActor @Sendable (Page) -> Void
     let detailsExpanded: Bool
     let setDetailsExpanded: @MainActor @Sendable (Bool) -> Void
     let claudeUsesLegacyReport: Bool
@@ -53,7 +76,6 @@ struct Dashboard: View {
     let confirmReset: () -> Void
     let refresh: () -> Void
     let checkForUpdates: () -> Void
-    let showHelp: () -> Void
     let quit: () -> Void
 
     var canRefresh: Bool {
@@ -77,12 +99,25 @@ struct Dashboard: View {
         return "Connect Claude Code"
     }
 
-    @Environment(\.colorScheme) private var colorScheme
-    private var quotaColor: Color {
-        colorScheme == .dark ? Color(red: 0.46, green: 0.94, blue: 0.96) : Color(red: 0, green: 0.36, blue: 0.40)
+    var body: some View {
+        if let parent = page.parent {
+            VStack(spacing: 0) {
+                navigationHeader(backTo: parent)
+                Divider()
+                if page == .help {
+                    HelpView()
+                } else {
+                    settingsContent
+                }
+            }
+            .frame(width: 316)
+            .fixedSize(horizontal: false, vertical: true)
+        } else {
+            usagePage
+        }
     }
 
-    var body: some View {
+    private var usagePage: some View {
         VStack(alignment: .leading, spacing: 0) {
             ForEach(summaries, id: \.display.provider) { summary in
                 if summary.display.provider != summaries.first?.display.provider {
@@ -118,10 +153,6 @@ struct Dashboard: View {
             Text(display.provider.name)
                 .font(.system(size: 15, weight: .semibold))
                 .accessibilityAddTraits(.isHeader)
-            if display.provider == .claude && display.hasCurrentPercentage {
-                Text("Account-wide").font(.caption).foregroundStyle(.secondary)
-                    .help("Includes shared five-hour and weekly limits. Individual models may have additional limits.")
-            }
             Spacer()
         }
         .padding(.bottom, 12)
@@ -215,7 +246,7 @@ struct Dashboard: View {
                     .fixedSize()
                     .disabled(resetPhase == .submitting)
                     .help(
-                        menuLayout == .both
+                        menuLayout.showsBoth
                             ? "Choose which provider’s details to view" : "Choose the provider shown in the menu bar")
             }
 
@@ -285,105 +316,164 @@ struct Dashboard: View {
             .accessibilityLabel("Refresh limits and token totals")
             .disabled(!canRefresh)
 
-            Menu {
-                Section("Providers") {
-                    Picker(
-                        "Providers",
-                        selection: Binding(get: { providerSelection }, set: selectProviderSelection)
-                    ) {
-                        ForEach(ProviderSelection.allCases, id: \.self) { Text($0.title).tag($0) }
-                    }
-                    .pickerStyle(.inline)
-                    .labelsHidden()
-                    .disabled(resetPhase == .submitting)
-                }
-                Menu("Command-Line Tools") {
-                    ForEach(UsageProvider.allCases, id: \.self) { source in
-                        Menu(source.name) {
-                            Button("Choose Trusted Executable…") { chooseCLI(source) }
-                            Button("Use Automatic Detection") { automaticCLI(source) }
-                        }
-                    }
-                }
-                if providerSelection != .codex {
-                    Menu("Claude Configuration Folder") {
-                        Text(claudeProfilePath)
-                        Button("Choose Folder…", action: chooseClaudeProfile)
-                        Button("Use Default Folder", action: useDefaultClaudeProfile)
-                    }.disabled(connectingClaude)
-                    if canDisconnectClaude {
-                        Button("Disconnect Claude Status Line", action: disconnectClaude).disabled(connectingClaude)
-                    }
-                }
-                if let action = claudeSettingsAction {
-                    Button(action, action: connectClaude)
-                        .disabled(connectingClaude)
-                }
-                Divider()
-                Section("Menu Bar") {
-                    Picker("Menu bar layout", selection: Binding(get: { menuLayout }, set: selectLayout)) {
-                        ForEach(
-                            MenuBarLayout.allCases.filter { providerSelection == .both || $0 != .both }, id: \.self
-                        ) { Text($0.title).tag($0) }
-                    }
-                    .pickerStyle(.inline)
-                    .labelsHidden()
-                }
-                if let selectMenuBarLimits {
-                    ForEach(fiveHourChoices, id: \.self) { source in
-                        Divider()
-                        Section("\(source.name) in Menu Bar") {
-                            Picker(
-                                "\(source.name) in Menu Bar",
-                                selection: Binding(
-                                    get: { menuBarLimits[source] ?? .fiveHour },
-                                    set: { selectMenuBarLimits($0, source) })
-                            ) {
-                                ForEach(MenuBarLimits.allCases, id: \.self) { Text($0.title).tag($0) }
-                            }
-                            .pickerStyle(.inline)
-                            .labelsHidden()
-                        }
-                    }
-                }
-                Divider()
-                Section("Show Percentage As") {
-                    Picker(
-                        "Show Percentage As",
-                        selection: Binding(get: { display.percentageMode }, set: selectPercentageMode)
-                    ) {
-                        ForEach(PercentageMode.allCases, id: \.self) { Text($0.title).tag($0) }
-                    }
-                    .pickerStyle(.inline)
-                    .labelsHidden()
-                }
-                Divider()
-                if updater.supported {
-                    Toggle(
-                        "Automatically Check for Updates",
-                        isOn: Binding(
-                            get: { updater.automaticallyChecksForUpdates },
-                            set: { updater.automaticallyChecksForUpdates = $0 })
-                    )
-                    Button("Check for Updates…", action: checkForUpdates)
-                        .disabled(!updater.canCheckForUpdates)
-                    Divider()
-                }
-                Button("Help", action: showHelp)
-                Button("Quit QuotaBar", action: quit)
-                    .keyboardShortcut("q")
+            Button {
+                selectPage(.settings)
             } label: {
                 Image(systemName: "gearshape")
                     .frame(width: 22, height: 22)
             }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
+            .buttonStyle(.borderless)
             .help("Settings")
             .accessibilityLabel("Settings")
+            .accessibilityIdentifier("open-settings")
         }
         .padding(.horizontal, 17)
         .padding(.bottom, 12)
+    }
+
+    private func navigationHeader(backTo parent: Page) -> some View {
+        ZStack(alignment: .leading) {
+            Text(page == .help ? "Help" : "Settings")
+                .font(.headline)
+                .accessibilityAddTraits(.isHeader)
+                .frame(maxWidth: .infinity)
+            Button {
+                selectPage(parent)
+            } label: {
+                Label("Back", systemImage: "chevron.backward")
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(parent == .settings ? "Back to Settings" : "Back to usage")
+            .accessibilityIdentifier(page == .help ? "help-back" : "settings-back")
+        }
+        .padding(.horizontal, 17)
+        .padding(.vertical, 12)
+    }
+
+    private var settingsContent: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            displaySettings
+            Divider()
+            toolSettings
+            Divider()
+            if updater.supported {
+                VStack(alignment: .leading, spacing: 8) {
+                    settingsHeading("Updates")
+                    Toggle(
+                        "Automatically Check for Updates",
+                        isOn: Binding(
+                            get: { updater.automaticallyChecksForUpdates },
+                            set: { updater.automaticallyChecksForUpdates = $0 }))
+                    Button("Check for Updates…", action: checkForUpdates)
+                        .disabled(!updater.canCheckForUpdates)
+                }
+                Divider()
+            }
+            HStack {
+                Button("Help") { selectPage(.help) }
+                Spacer()
+                Button("Quit QuotaBar", action: quit)
+                    .keyboardShortcut("q")
+            }
+        }
+        .controlSize(.small)
+        .padding(17)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func settingsHeading(_ title: String) -> some View {
+        Text(title).font(.headline).accessibilityAddTraits(.isHeader)
+    }
+
+    private var displaySettings: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            settingsHeading("Menu Bar")
+            Picker("Providers", selection: Binding(get: { providerSelection }, set: selectProviderSelection)) {
+                ForEach(ProviderSelection.allCases, id: \.self) { Text($0.title).tag($0) }
+            }
+            .disabled(resetPhase == .submitting)
+
+            if providerSelection == .both {
+                Picker(
+                    "Menu Bar Shows",
+                    selection: Binding(
+                        get: { menuLayout.showsBoth }, set: { selectLayout(menuLayout.showing(both: $0)) })
+                ) {
+                    Text("Both Providers").tag(true)
+                    Text("Selected Provider").tag(false)
+                }
+            }
+            Toggle(
+                "Show Logos",
+                isOn: Binding(get: { menuLayout.showsLogos }, set: { selectLayout(menuLayout.showing(logos: $0)) }))
+            if let selectMenuBarLimits {
+                ForEach(fiveHourChoices, id: \.self) { source in
+                    Picker(
+                        "\(source.name) in Menu Bar",
+                        selection: Binding(
+                            get: { menuBarLimits[source] ?? .fiveHour }, set: { selectMenuBarLimits($0, source) })
+                    ) {
+                        ForEach(MenuBarLimits.allCases, id: \.self) { Text($0.title).tag($0) }
+                    }
+                }
+            }
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Show Percentage As")
+                Picker(
+                    "Show Percentage As", selection: Binding(get: { display.percentageMode }, set: selectPercentageMode)
+                ) {
+                    ForEach(PercentageMode.allCases, id: \.self) { Text($0.title).tag($0) }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .accessibilityIdentifier("settings-percentage-mode")
+            }
+        }
+        .pickerStyle(.menu)
+    }
+
+    @ViewBuilder
+    private var toolSettings: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            settingsHeading("Command-Line Tools")
+            ForEach(UsageProvider.allCases, id: \.self) { source in
+                HStack {
+                    Text(source.name)
+                    Spacer()
+                    Button("Choose…") { chooseCLI(source) }
+                        .accessibilityLabel("Choose trusted \(source.name) executable")
+                        .help("Choose a trusted \(source.name) executable")
+                    Button("Use Automatic") { automaticCLI(source) }
+                        .accessibilityLabel("Use automatic \(source.name) detection")
+                }
+            }
+        }
+        if providerSelection != .codex {
+            Divider()
+            VStack(alignment: .leading, spacing: 8) {
+                settingsHeading("Claude Configuration Folder")
+                Text(verbatim: claudeProfilePath)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(claudeProfilePath)
+                HStack {
+                    Button("Choose Folder…", action: chooseClaudeProfile)
+                    Button("Use Default Folder", action: useDefaultClaudeProfile)
+                }
+                if let action = claudeSettingsAction {
+                    Button(action, action: connectClaude)
+                }
+                if canDisconnectClaude {
+                    Button("Disconnect Claude Status Line", action: disconnectClaude)
+                }
+                if let claudeSetupError {
+                    Text(claudeSetupError).font(.callout).foregroundStyle(.secondary)
+                }
+            }
+            .disabled(connectingClaude)
+        }
     }
 
     private func readingStatus(_ reading: QuotaReading) -> some View {
@@ -519,7 +609,7 @@ struct Dashboard: View {
     private func footer(_ date: Date) -> String {
         let time = display.reportTime(date)
         if display.provider == .claude {
-            return (display.stale ? "Last known Claude limit · " : "Reported by Claude Code · ") + time
+            return display.stale ? "Last known Claude limit · " + time : "Limit updated " + time
         }
         return display.stale ? "Last known limit · " + time : "Limit updated " + time
     }
@@ -560,7 +650,7 @@ struct Dashboard: View {
                 GeometryReader { geometry in
                     ZStack(alignment: .leading) {
                         Capsule().fill(.quaternary)
-                        Capsule().fill(quotaColor)
+                        Capsule().fill(Color(nsColor: display.provider.accentColor))
                             .frame(width: geometry.size.width * CGFloat(min(max(percentage / 100, 0), 1)))
                     }
                 }
@@ -612,9 +702,6 @@ private struct DetailsProviderPicker: NSViewRepresentable {
         context.coordinator.selection = $provider
         control.isEnabled = isEnabled
         control.selectedSegment = UsageProvider.allCases.firstIndex(of: provider) ?? -1
-        control.selectedSegmentBezelColor =
-            provider == .claude
-            ? NSColor(srgbRed: 0xd9 / 255.0, green: 0x77 / 255.0, blue: 0x57 / 255.0, alpha: 1)
-            : .systemBlue
+        control.selectedSegmentBezelColor = provider.accentColor
     }
 }

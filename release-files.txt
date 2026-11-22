@@ -7,6 +7,7 @@ fetch-sparkle.sh
 release-update.sh
 sign-quotabar.sh
 release-files.txt
+Helpers/ClaudeDisconnect.swift
 Resources/AppIcon.icns
 Resources/Info.plist
 Resources/UpdatePublicKey.txt
@@ -38,6 +39,8 @@ Sources/TokenHistory.swift
 Sources/TokenTracking.swift
 Sources/UsageResets.swift
 Sources/Updater.swift
+Tests/Fixtures/Build39ClaudeUninstall.txt
+Tests/ClaudeCaptureOrderChecks.py
 Tests/ClaudeConnectionChecks.swift
 Tests/ClaudeHistoryMemoryChecks.swift
 Tests/ClaudeQuotaChecks.swift

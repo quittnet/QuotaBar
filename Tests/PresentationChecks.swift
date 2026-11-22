@@ -87,6 +87,10 @@ enum PresentationChecks {
             precondition(!fiveHour.accessibilityTitle.contains("Weekly"))
             precondition(fiveHour.offersFiveHourChoice)
             precondition(shown([busyWeek, session], provider: provider, mode: .used).menuBarTitle == "58%")
+            let day = QuotaWindow(minutes: 1_440, remaining: 52, resetsAt: now.addingTimeInterval(600))
+            let dailyAndSession = shown([day, session], provider: provider, limits: .both)
+            precondition(dailyAndSession.offersFiveHourChoice && MenuBarLimits.both.title == "All Reported Limits")
+            precondition(dailyAndSession.menuBarTitle == "5h 42% · 1d 52%")
             let both = shown([busyWeek, session], provider: provider, limits: .both)
             precondition(both.menuBarTitle == "5h 42% · 7d 30%", both.menuBarTitle)
             precondition(

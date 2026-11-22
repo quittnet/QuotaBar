@@ -57,16 +57,26 @@ enum ProviderSelection: String, CaseIterable {
     }
 }
 
+/// Stored under `menuBarLayout`. Two independent choices: whether both providers appear, and whether logos do.
+/// The raw values of the first three cases predate the second choice and stay readable from saved preferences.
 enum MenuBarLayout: String, CaseIterable {
-    case percentage, logo, both
+    case percentage, logo, both, bothPercentage
 
-    var title: String {
-        switch self {
-        case .percentage: return "Percentage Only"
-        case .logo: return "Logo and Percentage"
-        case .both: return "Both Providers"
+    init(showsBoth: Bool, showsLogos: Bool) {
+        switch (showsBoth, showsLogos) {
+        case (true, true): self = .both
+        case (true, false): self = .bothPercentage
+        case (false, true): self = .logo
+        case (false, false): self = .percentage
         }
     }
+
+    var showsBoth: Bool { self == .both || self == .bothPercentage }
+    var showsLogos: Bool { self == .logo || self == .both }
+
+    /// The same logo choice with both providers shown or only the selected one.
+    func showing(both: Bool) -> Self { Self(showsBoth: both, showsLogos: showsLogos) }
+    func showing(logos: Bool) -> Self { Self(showsBoth: showsBoth, showsLogos: logos) }
 }
 
 /// Which limits a provider shows in the menu bar when its account reports a 5-hour window.
@@ -74,7 +84,7 @@ enum MenuBarLayout: String, CaseIterable {
 enum MenuBarLimits: String, CaseIterable {
     case fiveHour, both
 
-    var title: String { self == .fiveHour ? "5-Hour Limit" : "5-Hour and Weekly" }
+    var title: String { self == .fiveHour ? "5-Hour Limit" : "All Reported Limits" }
 }
 
 enum PercentageMode: String, CaseIterable {
@@ -193,7 +203,6 @@ struct QuotaDisplay {
         let shown = menuBarWindows.isEmpty ? [window] : menuBarWindows
         return provider.name + " · "
             + shown.map { Self.name($0) + ", " + accessibilityPercentage(for: $0) }.joined(separator: " · ")
-            + (provider == .claude ? " · Account-wide" : "")
     }
 
     func reportTime(_ date: Date) -> String {

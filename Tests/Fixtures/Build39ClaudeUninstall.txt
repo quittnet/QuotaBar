@@ -1,0 +1,64 @@
+#!/bin/bash
+# app.quotabar.QuotaBar.statusline.v1.uninstall
+# Run with: bash ~/.claude/.quotabar/uninstall.sh (or this profile's .quotabar folder).
+# Restores the status line QuotaBar replaced and removes this folder. It works without QuotaBar.app.
+set -u
+root=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd) || exit 1
+exec /usr/bin/osascript -l JavaScript - "$root" <<'QUOTABAR_UNINSTALL'
+ObjC.import('Foundation');
+function run(argv) {
+    const managed = __QUOTABAR_MANAGED__;
+    const original = __QUOTABAR_ORIGINAL__;
+    const root = argv[0];
+    const profile = root.replace(/\/[^\/]+\/?$/, '');
+    const settingsPath = profile + '/settings.json';
+    // Any spelling of a path to a QuotaBar wrapper (/var vs /private/var, ~, symlinks) blocks removal.
+    const fm = $.NSFileManager.defaultManager;
+    const readText = (path) => {
+        const text = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null);
+        return text.isNil() ? null : ObjC.unwrap(text);
+    };
+    let changed = 'Claude Code settings were left unchanged.';
+    if (fm.fileExistsAtPath(settingsPath)) {
+        const attributes = ObjC.deepUnwrap(fm.attributesOfItemAtPathError(settingsPath, null));
+        if (!attributes || attributes.NSFileType !== 'NSFileTypeRegular' || attributes.NSFileReferenceCount !== 1) {
+            throw new Error('settings.json is a link. Remove QuotaBar from its statusLine by hand, then run this script again.');
+        }
+        const text = readText(settingsPath);
+        if (text === null) throw new Error('Could not read ' + settingsPath + '.');
+        let settings;
+        try { settings = JSON.parse(text); } catch (error) { throw new Error('settings.json is not valid JSON. Nothing was changed.'); }
+        const line = settings && typeof settings === 'object' ? settings.statusLine : undefined;
+        const command = line && typeof line === 'object' ? line.command : undefined;
+        if (command === managed) {
+            if (original !== null) {
+                line.command = original;
+                changed = 'Restored the previous Claude Code status line.';
+            } else if (Object.keys(line).every((key) => key === 'type' || key === 'command')) {
+                delete settings.statusLine;
+                changed = 'Removed the QuotaBar status line.';
+            } else {
+                throw new Error('The QuotaBar status line has extra settings. Choose a replacement status line first. Nothing was changed.');
+            }
+            if (readText(settingsPath) !== text) throw new Error('settings.json changed while uninstalling. Run this script again.');
+            const output = $(JSON.stringify(settings, null, 2) + '\n');
+            if (!output.writeToFileAtomicallyEncodingError(settingsPath, true, $.NSUTF8StringEncoding, null)) {
+                throw new Error('Could not write ' + settingsPath + '. Nothing was changed.');
+            }
+            fm.setAttributesOfItemAtPathError($({ NSFilePosixPermissions: attributes.NSFilePosixPermissions }), settingsPath, null);
+        } else if (typeof command === 'string' && command.includes('.quotabar/statusline.sh')) {
+            throw new Error('The current status line still calls QuotaBar’s script. Remove that reference first. Nothing was changed.');
+        }
+    }
+    for (const name of ['statusline.sh', 'state.json', 'previous-settings.json', 'uninstall.sh']) {
+        const path = root + '/' + name;
+        if (fm.fileExistsAtPath(path) && !fm.removeItemAtPathError(path, null)) throw new Error('Could not remove ' + path + '.');
+    }
+    const left = ObjC.deepUnwrap(fm.contentsOfDirectoryAtPathError(root, null)) || [];
+    if (left.length === 0) {
+        fm.removeItemAtPathError(root, null);
+        return changed + ' Removed ' + root + '.';
+    }
+    return changed + ' Left ' + root + ' in place because it also contains: ' + left.join(', ') + '.';
+}
+QUOTABAR_UNINSTALL

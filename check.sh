@@ -51,7 +51,7 @@ if [ "${1:-}" = "--lint" ]; then
         echo 'Warning: shellcheck is unavailable. Skipped shell script linting with shellcheck.' >&2
     fi
     plutil -lint Resources/Info.plist
-    xcrun swift-format lint --strict --recursive Sources Tests
+    xcrun swift-format lint --strict --recursive Sources Helpers Tests
     exit 0
 fi
 compile_app_check() {
@@ -128,6 +128,7 @@ if [ "${1:-}" = "--network" ]; then
         "${checks_dir}/network" "${checks_dir}"
     exit 0
 fi
+compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/ClaudeSettingsDocument.swift Sources/ClaudeConnection.swift Helpers/ClaudeDisconnect.swift -o "${checks_dir}/QuotaBarClaudeDisconnect"
 compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/ClaudeSettingsDocument.swift Sources/ClaudeConnection.swift Tests/TestPreferences.swift Tests/ClaudeConnectionChecks.swift -o "${checks_dir}/claude-connection"
 offline_run "${checks_dir}/claude-connection"
 compile Sources/ClaudeProfile.swift Sources/ProviderExecutable.swift Sources/ProviderProcess.swift Sources/QuotaCore.swift Tests/CoreChecks.swift -o "${checks_dir}/core"
@@ -157,6 +158,8 @@ compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/CodexHisto
 offline_run "${checks_dir}/claude-history-memory"
 if [ "${1:-}" = "--stress" ]; then
     logic_stress
+    compile Sources/*.swift -o "${checks_dir}/QuotaBar"
+    offline_run python3 Tests/ClaudeCaptureOrderChecks.py "${checks_dir}/QuotaBar"
     echo 'Exercising quota and token histories under load.'
     compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/ProviderExecutable.swift Sources/ProviderProcess.swift Sources/QuotaCore.swift Sources/Presentation.swift Sources/ClaudeUsageClient.swift \
         Sources/CodexHistoryCache.swift Sources/TokenHistory.swift Sources/ClaudeHistoryIndex.swift Sources/ClaudeTokenHistory.swift Tests/DataStressChecks.swift -o "${checks_dir}/data-stress"

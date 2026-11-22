@@ -189,12 +189,11 @@ enum QuotaSource: Sendable {
                 directory: FileManager.default.homeDirectoryForCurrentUser,
                 input: input, output: output)
         } catch { throw QuotaError.launchFailed }
-        var failed = true
         let writer = input.fileHandleForWriting
         let reader = output.fileHandleForReading
         defer {
             try? writer.close()
-            process.finish(failed: failed, graceMilliseconds: 250)
+            process.finish(graceMilliseconds: 250)
             try? reader.close()
         }
 
@@ -219,9 +218,7 @@ enum QuotaSource: Sendable {
         try transport.send(try JSONSerialization.data(withJSONObject: initialize))
         let _: InitializeResponse = try transport.receive(id: 1)
         try transport.send(#"{"method":"initialized"}"#)
-        let result = try run(&transport)
-        failed = false
-        return result
+        return try run(&transport)
     }
 
     private static func executableURL(paths: ProviderCLIPaths) -> URL? {

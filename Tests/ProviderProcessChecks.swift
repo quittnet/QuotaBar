@@ -17,7 +17,7 @@ struct ProviderProcessChecks {
             independent.waitUntilExit()
         }
         for provider in ["codex", "claude"] {
-            for scenario in ["wait", "early exit", "invalid reply"] {
+            for scenario in ["wait", "early exit", "invalid reply", "valid reply"] {
                 let wrapper = directory.appendingPathComponent(provider)
                 let record = directory.appendingPathComponent("pid")
                 let quoted = "'" + record.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
@@ -25,6 +25,21 @@ struct ProviderProcessChecks {
                 switch scenario {
                 case "wait": ending = "wait"
                 case "early exit": ending = "exit 0"
+                case "valid reply" where provider == "codex":
+                    ending = """
+                        read -r initialize
+                        echo '{"id":1,"result":{}}'
+                        read -r initialized
+                        read -r usage
+                        echo '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":35,"windowDurationMins":300}}}}'
+                        """
+                case "valid reply":
+                    ending = """
+                        read -r initialize
+                        echo '{"type":"control_response","response":{"subtype":"success","request_id":"initialize","response":{}}}'
+                        read -r usage
+                        echo '{"type":"control_response","response":{"subtype":"success","request_id":"usage","response":{"rate_limits_available":true,"rate_limits":{"five_hour":{"utilization":35}}}}}'
+                        """
                 default: ending = "printf 'invalid response\\n'; exit 0"
                 }
                 let source =
@@ -33,13 +48,16 @@ struct ProviderProcessChecks {
                 try files.setAttributes([.posixPermissions: 0o700], ofItemAtPath: wrapper.path)
                 let started = DispatchTime.now()
                 do {
+                    let report: QuotaReading
                     if provider == "codex" {
-                        _ = try QuotaSource.read(executable: wrapper, timeout: .milliseconds(250))
+                        report = try QuotaSource.read(executable: wrapper, timeout: .milliseconds(250))
                     } else {
-                        _ = try ClaudeUsageClient.read(executable: wrapper, timeout: 0.25)
+                        report = try ClaudeUsageClient.read(executable: wrapper, timeout: 0.25)
                     }
-                    preconditionFailure("Expected an unsuccessful fixture read")
-                } catch {}
+                    precondition(scenario == "valid reply" && report.windows.first?.used == 35)
+                } catch {
+                    if scenario == "valid reply" { throw error }
+                }
                 guard let child = pid_t(try String(contentsOf: record, encoding: .utf8)), child > 1 else {
                     throw CocoaError(.fileReadCorruptFile)
                 }
@@ -51,6 +69,8 @@ struct ProviderProcessChecks {
                 try files.removeItem(at: record)
             }
         }
-        print("Both provider readers cleaned up waiting and exited wrappers' finite workers after failed reads.")
+        print(
+            "Both provider readers cleaned up waiting and exited wrappers' finite workers after successful and failed reads."
+        )
     }
 }

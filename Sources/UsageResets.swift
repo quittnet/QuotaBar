@@ -31,13 +31,18 @@ private struct CompletedReset: Codable, Equatable {
     let credit: String?
     let time: Date
 
+    // Legacy receipts have neither UUID. Keep one reconciled generation per owner so other
+    // instances can distinguish a subsequent grant from a balance displayed before the spend.
+    let requestKey: UUID?
+    var reconciledGeneration: UUID?
+
     func isOtherAccount(_ reading: QuotaReading) -> Bool {
         guard let account, let owner = reading.resetOwner(for: credit) else { return false }
         return owner != account
     }
 
     func awaitsBalance(from reading: QuotaReading) -> Bool {
-        if isOtherAccount(reading) { return false }
+        if reconciledGeneration != nil || isOtherAccount(reading) { return false }
         guard reading.fetchedAt >= time else { return true }
         if account != nil && reading.resetOwner(for: credit) == nil { return true }
         guard let credits = reading.resetCredits else { return true }
@@ -127,16 +132,34 @@ final class UsageResets {
 
     struct ReadGeneration: Equatable {
         fileprivate let id: UUID?
-        fileprivate let valid: Bool
+        fileprivate let historyID: UUID?
+        fileprivate var valid: Bool { historyID != nil }
+        fileprivate let receipts: [CompletedReset]
     }
 
-    // A request already in flight at recovery can arrive later, even across wall-clock adjustments.
-    // Capture the on-disk generation at request start independently in each running instance.
+    // Capture generations before the provider read. Its response can arrive after a spend,
+    // reconciliation, or manual recovery in another instance, even across clock adjustments.
     func readGeneration() -> ReadGeneration {
         do {
+            let directory = file.deletingLastPathComponent()
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            let fd = try Self.openLock(at: file.appendingPathExtension("lock").path)
+            defer { close(fd) }
+            guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { throw CocoaError(.fileLocking) }
             let fence = try Self.read(Fence.self, at: fenceFile)
-            return ReadGeneration(id: fence?.generation, valid: fence.map { $0.time <= Date() } ?? true)
-        } catch { return ReadGeneration(id: nil, valid: false) }
+            guard fence.map({ $0.time <= Date() }) ?? true else { throw CocoaError(.fileReadCorruptFile) }
+            let history = try Self.read(ReceiptHistory.self, at: completedFile)
+            let historyID = history?.id ?? UUID()
+            let receipts = history?.receipts ?? []
+            if history?.id == nil {
+                // Publish participation before starting the provider read. A legacy writer
+                // uses this same lock and cannot mistake the upgraded envelope for no receipt.
+                try Self.syncDirectory(directory.deletingLastPathComponent())
+                try writeCompletions(receipts, historyID: historyID)
+            }
+            return ReadGeneration(id: fence?.generation, historyID: historyID, receipts: receipts)
+        } catch { return ReadGeneration(id: nil, historyID: nil, receipts: []) }
     }
 
     private struct VerifiedBalance: Equatable {
@@ -144,8 +167,10 @@ final class UsageResets {
         let account: String?
         let individual: String?
         let count: Int?
+        let receipts: [CompletedReset]
 
-        init(_ reading: QuotaReading) {
+        init(_ reading: QuotaReading, receipts: [CompletedReset]) {
+            self.receipts = receipts.filter { !$0.isOtherAccount(reading) }
             date = reading.fetchedAt
             account = reading.resetAccountFingerprint
             individual = reading.resetCountOnlyFingerprint
@@ -154,11 +179,20 @@ final class UsageResets {
     }
 
     private var verifiedBalance: VerifiedBalance?
+    private var verifiedHistoryID: UUID?
+    private var confirmationHistoryID: UUID?
+    private var knownReceipts: [CompletedReset] = []
+    private var confirmationReceipts: [CompletedReset] = []
+
+    private func currentBalance(_ reading: QuotaReading, receipts: [CompletedReset]) -> Bool {
+        let balance = VerifiedBalance(reading, receipts: receipts)
+        return balance == verifiedBalance
+    }
 
     private func afterRecovery(_ reading: QuotaReading) -> Bool {
         guard let recoveryFence else { return true }
         return recoveryFence.time <= Date() && reading.fetchedAt > recoveryFence.time
-            && verifiedBalance == VerifiedBalance(reading)
+            && verifiedBalance == VerifiedBalance(reading, receipts: knownReceipts)
     }
 
     struct BalancePoll {
@@ -187,7 +221,9 @@ final class UsageResets {
     private var retryingSubmission = false
     private var completedFile: URL { file.appendingPathExtension("completed") }
     private var completedBalance: CompletedReset?
-    private var hasCountOnlyReceipt = false
+    private var hasCountOnlyReceipt: Bool {
+        knownReceipts.contains { $0.credit == nil && $0.reconciledGeneration == nil }
+    }
     var awaitingUpdatedBalance: Bool { completedBalance != nil }
     var needsCountOnlyIdentityRefresh: Bool {
         (pending.map { $0.creditID == nil } ?? false) || hasCountOnlyReceipt
@@ -216,7 +252,7 @@ final class UsageResets {
                     "The recovery record is dated in the future. Check the system clock and review the record.")
             }
             let receipts = try readCompletions()
-            hasCountOnlyReceipt = receipts.contains { $0.credit == nil }
+            knownReceipts = receipts
             if let saved = try Self.read(ResetAttempt.self, at: file) {
                 if pending != saved || phase != .uncertain {
                     notice =
@@ -228,7 +264,7 @@ final class UsageResets {
                 completedBalance = nil
                 phase = .uncertain
             } else {
-                completedBalance = receipts.first
+                completedBalance = receipts.first { $0.reconciledGeneration == nil }
                 pending = nil
                 phase = .ready
                 notice = nil
@@ -244,8 +280,10 @@ final class UsageResets {
         self.init(file: base.appendingPathComponent("app.quotabar.QuotaBar/pending-reset.json"))
     }
 
+    private static let maximumRecordBytes = 1024 * 1024
+
     private static func read<Value: Decodable>(_ type: Value.Type, at file: URL) throws -> Value? {
-        guard let data = try PrivateFile.read(file, maximumBytes: 1024 * 1024) else { return nil }
+        guard let data = try PrivateFile.read(file, maximumBytes: maximumRecordBytes) else { return nil }
         return try JSONDecoder().decode(type, from: data)
     }
 
@@ -262,21 +300,40 @@ final class UsageResets {
         return descriptor
     }
 
-    private func readCompletions() throws -> [CompletedReset] {
-        do {
-            return try Self.read([CompletedReset].self, at: completedFile) ?? []
-        } catch DecodingError.typeMismatch {
-            return try Self.read(CompletedReset.self, at: completedFile).map { [$0] } ?? []
+    // Older app versions delete a verified receipt. Use a distinct root object so they
+    // cannot silently erase an upgraded store's generation or dispatch against it.
+    private struct ReceiptHistory: Codable {
+        let receipts: [CompletedReset]
+        let id: UUID?
+        private enum CodingKeys: String, CodingKey { case receipts, id }
+
+        init(_ receipts: [CompletedReset], id: UUID = UUID()) {
+            self.id = id
+            self.receipts = receipts
+        }
+
+        init(from decoder: Decoder) throws {
+            if let object = try? decoder.container(keyedBy: CodingKeys.self) {
+                if object.contains(.receipts) {
+                    id = try object.decodeIfPresent(UUID.self, forKey: .id)
+                    receipts = try object.decode([CompletedReset].self, forKey: .receipts)
+                } else {
+                    id = nil
+                    receipts = [try CompletedReset(from: decoder)]
+                }
+            } else {
+                id = nil
+                receipts = try [CompletedReset](from: decoder)
+            }
         }
     }
 
-    private func writeCompletions(_ receipts: [CompletedReset]) throws {
-        if receipts.isEmpty {
-            try FileManager.default.removeItem(at: completedFile)
-            try Self.syncDirectory(completedFile.deletingLastPathComponent())
-        } else {
-            try Self.writePrivate(try JSONEncoder().encode(receipts), to: completedFile)
-        }
+    private func readCompletions() throws -> [CompletedReset] {
+        try Self.read(ReceiptHistory.self, at: completedFile)?.receipts ?? []
+    }
+
+    private func writeCompletions(_ receipts: [CompletedReset], historyID: UUID) throws {
+        try Self.writePrivate(try JSONEncoder().encode(ReceiptHistory(receipts, id: historyID)), to: completedFile)
     }
 
     private func releaseLock() {
@@ -295,7 +352,8 @@ final class UsageResets {
         if let pending {
             return pending.matchesOwner(in: reading)
         }
-        guard completedBalance == nil, let credits = reading.resetCredits,
+        guard completedBalance == nil, currentBalance(reading, receipts: knownReceipts),
+            let credits = reading.resetCredits,
             credits.canClaim(at: display.now)
         else { return false }
         return reading.resetOwner(for: credits.preferredCreditID(at: display.now)) != nil
@@ -310,6 +368,8 @@ final class UsageResets {
                 key: UUID(), creditID: target, accountFingerprint: reading.resetOwner(for: target),
                 startingCount: reading.resetCredits?.availableCount)
         confirmationFence = recoveryFence
+        confirmationHistoryID = verifiedHistoryID
+        confirmationReceipts = knownReceipts.filter { !$0.isOtherAccount(reading) }
         phase = .confirming
         notice = nil
     }
@@ -380,9 +440,15 @@ final class UsageResets {
             }
             if saved == nil {
                 // Another instance may have completed its reset after our confirmation opened.
-                if let completion = try readCompletions().first(where: { $0.awaitsBalance(from: reading) }) {
-                    completedBalance = completion
-                    if completion.credit == nil { hasCountOnlyReceipt = true }
+                let history = try Self.read(ReceiptHistory.self, at: completedFile)
+                knownReceipts = history?.receipts ?? []
+                let relevant = knownReceipts.filter { !$0.isOtherAccount(reading) }
+                completedBalance = relevant.first { $0.reconciledGeneration == nil }
+                guard let historyID = history?.id, historyID == confirmationHistoryID, historyID == verifiedHistoryID,
+                    completedBalance == nil, relevant == confirmationReceipts,
+                    currentBalance(reading, receipts: knownReceipts)
+                else {
+                    verifiedBalance = nil
                     cancel()
                     notice = "A reset was applied. Refresh the balance before using another."
                     releaseLock()
@@ -437,7 +503,7 @@ final class UsageResets {
             completedBalance = CompletedReset(
                 account: attempt.accountFingerprint,
                 count: attempt.startingCount ?? reading?.resetCredits?.availableCount ?? 0,
-                credit: attempt.creditID, time: Date())
+                credit: attempt.creditID, time: Date(), requestKey: attempt.key)
             notice = "Reset applied."
         case .nothingToReset:
             notice = "No current limit is eligible. This request spent no reset."
@@ -447,10 +513,11 @@ final class UsageResets {
         }
         do {
             if outcome == .reset, let completedBalance {
-                var receipts = try readCompletions().filter { $0.account != completedBalance.account }
+                let history = try Self.read(ReceiptHistory.self, at: completedFile)
+                var receipts = (history?.receipts ?? []).filter { $0.account != completedBalance.account }
                 receipts.append(completedBalance)
-                try writeCompletions(receipts)
-                hasCountOnlyReceipt = receipts.contains { $0.credit == nil }
+                try writeCompletions(receipts, historyID: history?.id ?? UUID())
+                knownReceipts = receipts
             }
             try FileManager.default.removeItem(at: file)
             try Self.syncDirectory(file.deletingLastPathComponent())
@@ -486,7 +553,7 @@ final class UsageResets {
         let completedStamp = try FileStamp(completedFile)
         let fenceStamp = try FileStamp(fenceFile)
         let target: RecoveryTarget
-        if fenceStamp != nil, !readGeneration().valid {
+        if fenceStamp != nil, (try? Self.read(Fence.self, at: fenceFile)).map({ $0.time <= Date() }) != true {
             target = .invalidFence
         } else if pendingStamp != nil {
             if let attempt = try? Self.read(ResetAttempt.self, at: file) {
@@ -570,7 +637,7 @@ final class UsageResets {
                     throw RecoveryFailure("The saved receipt changed.")
                 }
                 receipts.remove(at: index)
-                retained = receipts.isEmpty ? nil : try JSONEncoder().encode(receipts)
+                retained = receipts.isEmpty ? nil : try JSONEncoder().encode(ReceiptHistory(receipts))
             case .invalidReceipts:
                 source = completedFile
                 retained = try retainedReadableReceipts()
@@ -631,17 +698,26 @@ final class UsageResets {
         // Decode rows independently so one legacy or damaged entry cannot discard a different account's receipt.
         guard let data = try Self.recoveryBytes(at: completedFile) else { throw CocoaError(.fileReadUnknown) }
         guard let object = try? JSONSerialization.jsonObject(with: data) else { return nil }
-        let rows = object as? [Any] ?? [object]
+        let historyRows = (object as? [String: Any])?["receipts"] as? [Any]
+        let rows = historyRows ?? (object as? [Any]) ?? [object]
         var retained: [Any] = []
         for row in rows where JSONSerialization.isValidJSONObject(row) {
             let bytes = try JSONSerialization.data(withJSONObject: row)
             if (try? JSONDecoder().decode(CompletedReset.self, from: bytes)) != nil { retained.append(row) }
         }
-        guard retained.count != rows.count || rows.isEmpty else {
+        // A damaged envelope UUID can be the only bad field. Replacing it during
+        // explicit recovery preserves all receipts and invalidates prior reads.
+        let header = object as? [String: Any]
+        let damagedID =
+            historyRows != nil && header?["id"] != nil
+            && (header?["id"] as? String).flatMap(UUID.init(uuidString:)) == nil
+        guard retained.count != rows.count || rows.isEmpty || (damagedID && data.count <= Self.maximumRecordBytes)
+        else {
             throw RecoveryFailure(
                 "The saved receipt collection could not be safely reduced. Check its size and format.")
         }
-        return retained.isEmpty ? nil : try JSONSerialization.data(withJSONObject: retained)
+        guard !retained.isEmpty else { return nil }
+        return try JSONSerialization.data(withJSONObject: ["id": UUID().uuidString, "receipts": retained])
     }
 
     private static func recoveryBytes(at url: URL) throws -> Data? {
@@ -670,10 +746,11 @@ final class UsageResets {
         try syncDirectory(url.deletingLastPathComponent())
     }
 
-    func received(_ reading: QuotaReading) { received(reading, generation: readGeneration()) }
-
     func received(_ reading: QuotaReading, generation: ReadGeneration) {
-        if phase == .uncertain || phase == .storageUnavailable { restore() }
+        if phase == .uncertain || phase == .storageUnavailable || (!generation.valid && phase != .submitting) {
+            restore()
+        }
+        verifiedBalance = nil
         do {
             let latest = try Self.read(Fence.self, at: fenceFile)
             if latest != recoveryFence, phase != .submitting {
@@ -685,7 +762,6 @@ final class UsageResets {
                     recoveryFence.time <= Date(), reading.fetchedAt > recoveryFence.time,
                     reading.resetCredits != nil
                 else { return }
-                verifiedBalance = VerifiedBalance(reading)
             } else if !generation.valid || generation.id != nil {
                 return
             }
@@ -700,27 +776,44 @@ final class UsageResets {
         {
             notice = "Return to the original Codex account to check the pending reset."
         }
-        guard phase == .ready || phase == .confirming else { return }
-        func update(_ receipts: [CompletedReset]) {
-            if completedBalance?.isOtherAccount(reading) == true { notice = nil }
-            hasCountOnlyReceipt = receipts.contains { $0.credit == nil }
-            completedBalance = receipts.first { $0.awaitsBalance(from: reading) }
-        }
-        func stillUnverified(_ receipt: CompletedReset) -> Bool {
-            receipt.isOtherAccount(reading) || receipt.awaitsBalance(from: reading)
+        guard phase == .ready || phase == .confirming || phase == .uncertain else { return }
+        func update(_ receipts: [CompletedReset]) -> [CompletedReset] {
+            knownReceipts = receipts
+            let relevant = receipts.filter { !$0.isOtherAccount(reading) }
+            if phase != .uncertain {
+                if completedBalance?.isOtherAccount(reading) == true { notice = nil }
+                completedBalance = relevant.first { $0.reconciledGeneration == nil }
+            }
+            return relevant
         }
         do {
-            let receipts = try readCompletions()
-            update(receipts)
-            guard receipts.contains(where: { !stillUnverified($0) }) else { return }
-            // A later grant can return the count to its old value. Remove a verified receipt once.
-            let fd = try Self.openLock(at: file.appendingPathExtension("lock").path)
-            defer { close(fd) }
-            guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { return }
-            let latest = try readCompletions()
-            let retained = latest.filter(stillUnverified)
-            if retained != latest { try writeCompletions(retained) }
-            update(retained)
+            let history = try Self.read(ReceiptHistory.self, at: completedFile)
+            let relevant = update(history?.receipts ?? [])
+            guard let historyID = history?.id, historyID == generation.historyID else { return }
+            let startedWith = generation.receipts.filter { !$0.isOtherAccount(reading) }
+            guard relevant == startedWith else { return }
+            func canReconcile(_ receipt: CompletedReset) -> Bool {
+                receipt.reconciledGeneration == nil && !receipt.isOtherAccount(reading)
+                    && !receipt.awaitsBalance(from: reading)
+            }
+            if phase != .uncertain, relevant.contains(where: canReconcile) {
+                let fd = try Self.openLock(at: file.appendingPathExtension("lock").path)
+                defer { close(fd) }
+                guard flock(fd, LOCK_EX | LOCK_NB) == 0,
+                    try Self.read(Fence.self, at: fenceFile) == recoveryFence
+                else { return }
+                guard let latestHistory = try Self.read(ReceiptHistory.self, at: completedFile),
+                    latestHistory.id == historyID, update(latestHistory.receipts) == startedWith
+                else { return }
+                var latest = latestHistory.receipts
+                for index in latest.indices where canReconcile(latest[index]) {
+                    latest[index].reconciledGeneration = UUID()
+                }
+                try writeCompletions(latest, historyID: historyID)
+                _ = update(latest)
+            }
+            verifiedHistoryID = historyID
+            verifiedBalance = VerifiedBalance(reading, receipts: knownReceipts)
         } catch {
             phase = .storageUnavailable
             notice = "QuotaBar couldn’t verify the saved reset balance."

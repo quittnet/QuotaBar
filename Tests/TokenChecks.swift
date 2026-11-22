@@ -56,8 +56,8 @@ struct TokenChecks {
                 response("2026-11-18T04:59:59Z", thread: "parent", response: "yesterday", tokens: 14),
                 counter("2026-11-18T04:59:59Z", cumulative: 60, last: 14),
                 response("2026-11-18T05:00:00Z", thread: "parent", response: "today", tokens: 15),
-                counter("2026-11-18T05:00:00Z", cumulative: 78, last: 15),
-                counter("2026-11-18T05:01:00Z", cumulative: 78, last: 15),
+                counter("2026-11-18T05:00:00Z", cumulative: 75, last: 15),
+                counter("2026-11-18T05:01:00Z", cumulative: 75, last: 15),
                 counter("2026-11-18T05:02:00Z", cumulative: 90, last: 12, estimated: true),
                 response("2026-11-18T15:00:01Z", thread: "parent", response: "in-the-future", tokens: 100),
                 #"{ "type": "event_msg", "payload":{"type":"agent_message","text":"token_count token_usage_record PRIVATE_FIXTURE_PROMPT"} }"#,
@@ -80,6 +80,13 @@ struct TokenChecks {
         let archivedParent = archive.appendingPathComponent(parent.lastPathComponent)
         try FileManager.default.copyItem(at: parent, to: archivedParent)
         try expect(history, now: now, all: 91, month: 81, week: 58, yesterday: 14, today: 31)
+        // The copied parent response cannot explain a gap in the child's usage after the inherited counter.
+        let lastChildCounter = counter("2026-11-18T06:00:02Z", cumulative: 91, last: 16, ordinal: 6)
+        let largerChildCounter = counter("2026-11-18T06:00:02Z", cumulative: 95, last: 16, ordinal: 6)
+        try childRows.replacingOccurrences(of: lastChildCounter, with: largerChildCounter)
+            .write(to: child, atomically: true, encoding: .utf8)
+        try expect(history, now: now, all: 91, month: 81, week: 58, yesterday: 14, today: 31, partial: true)
+        try childRows.write(to: child, atomically: true, encoding: .utf8)
         try FileManager.default.removeItem(at: parent)
         try expect(history, now: now, all: 91, month: 81, week: 58, yesterday: 14, today: 31)
         let compressedParent = try compress(archivedParent)
@@ -195,6 +202,23 @@ struct TokenChecks {
         try (metadata("test") + "\n" + counter(recordedAt, cumulative: 100, last: 7) + "\n")
             .write(to: log, atomically: true, encoding: .utf8)
         try expect(historyWithReorderedKeys, now: now, all: 7, month: 7, week: 7, today: 7, partial: true)
+
+        for cumulative: Int64 in [105, 110] {
+            for hasEstimate in [false, true] {
+                var rows = [
+                    metadata("mixed"), counter(recordedAt, cumulative: 100, last: 100),
+                    response(recordedAt, thread: "mixed", response: "final", tokens: 5),
+                ]
+                if hasEstimate {
+                    rows.append(counter(recordedAt, cumulative: cumulative, last: 4, estimated: true))
+                }
+                rows.append(counter(recordedAt, cumulative: cumulative, last: 5))
+                try (rows.joined(separator: "\n") + "\n").write(to: log, atomically: true, encoding: .utf8)
+                try expect(
+                    historyWithReorderedKeys, now: now, all: 105, month: 105, week: 105, today: 105,
+                    partial: cumulative == 110)
+            }
+        }
 
         // A paginated history can inherit its opening counter without a logical fork parent.
         let paginated =

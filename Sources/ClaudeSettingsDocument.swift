@@ -159,7 +159,7 @@ struct ClaudeSettingsDocument {
 /// Exchange the actual directory entries first, then validate the displaced file. This also
 /// covers an editor's atomic save in the interval immediately before QuotaBar's rename.
 enum ClaudeSettingsCommit {
-    enum Stage { case beforeDisplacing, afterDisplacing, cleanup }
+    enum Stage { case installingUninstaller, beforeDisplacing, afterDisplacing, cleanup }
     typealias Observer = (Stage) throws -> Void
 
     private struct Conflict: LocalizedError {
@@ -174,7 +174,10 @@ enum ClaudeSettingsCommit {
         }
     }
 
-    static func apply(_ proposed: Data?, replacing expected: Data?, at url: URL, observe: Observer?) throws {
+    static func apply(
+        _ proposed: Data?, replacing expected: Data?, at url: URL, permissions: mode_t? = nil,
+        removalIdentity: stat? = nil, observe: Observer?
+    ) throws {
         let folder = url.deletingLastPathComponent().appendingPathComponent(
             ".quotabar-settings-recovery-" + UUID().uuidString)
         guard mkdir(folder.path, 0o700) == 0 else { throw posix() }
@@ -186,7 +189,8 @@ enum ClaudeSettingsCommit {
         }
         var source = stat()
         let proposal = try proposed.map {
-            try prepare($0, at: staged, metadataFrom: expected == nil ? nil : url, source: &source)
+            try prepare(
+                $0, at: staged, metadataFrom: expected == nil ? nil : url, permissions: permissions, source: &source)
         }
         if proposed == nil {
             guard lstat(url.path, &source) == 0, (source.st_mode & S_IFMT) == S_IFREG, source.st_nlink == 1 else {
@@ -206,7 +210,7 @@ enum ClaudeSettingsCommit {
         // From here, staged may be the only copy of an independent editor's work.
         removeStaged = false
         try observe?(.afterDisplacing)
-        if matches(staged, bytes: expected, identity: source) {
+        if matches(staged, bytes: expected, identity: removalIdentity ?? source) {
             removeStaged = true
             return
         }
@@ -223,9 +227,9 @@ enum ClaudeSettingsCommit {
         throw Conflict(saved: removeStaged ? nil : staged)
     }
 
-    private static func prepare(_ bytes: Data, at staged: URL, metadataFrom url: URL?, source: inout stat) throws
-        -> stat
-    {
+    private static func prepare(
+        _ bytes: Data, at staged: URL, metadataFrom url: URL?, permissions: mode_t?, source: inout stat
+    ) throws -> stat {
         let fd = open(staged.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw posix() }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
@@ -240,9 +244,13 @@ enum ClaudeSettingsCommit {
             }
             guard fcopyfile(old, fd, nil, copyfile_flags_t(COPYFILE_METADATA)) == 0 else { throw posix() }
         }
+        if let permissions, fchmod(fd, permissions) != 0 { throw posix() }
         var info = stat()
         guard fsync(fd) == 0, fstat(fd, &info) == 0 else { throw posix() }
-        if url != nil, info.st_uid != source.st_uid || info.st_gid != source.st_gid || info.st_mode != source.st_mode {
+        if url != nil,
+            info.st_uid != source.st_uid || info.st_gid != source.st_gid
+                || (permissions == nil && info.st_mode != source.st_mode)
+        {
             throw CocoaError(.fileWriteNoPermission)
         }
         return info
@@ -255,7 +263,7 @@ enum ClaudeSettingsCommit {
             && info.st_gid == identity.st_gid && info.st_flags == identity.st_flags
             && info.st_mtimespec.tv_sec == identity.st_mtimespec.tv_sec
             && info.st_mtimespec.tv_nsec == identity.st_mtimespec.tv_nsec
-            && (try? PrivateFile.read(url, maximumBytes: bytes.count)) == bytes
+            && (bytes.isEmpty ? info.st_size == 0 : (try? PrivateFile.read(url, maximumBytes: bytes.count)) == bytes)
     }
 
     private static func posix() -> POSIXError { POSIXError(.init(rawValue: errno) ?? .EIO) }

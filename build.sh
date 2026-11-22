@@ -9,7 +9,7 @@ stage=$(mktemp -d "${output_dir}/.quotabar-build.XXXXXX")
 sparkle=
 trap 'rm -r "${stage}"; if [ -n "${sparkle}" ]; then rm -r "${sparkle}"; fi' EXIT HUP INT TERM
 app="${stage}/QuotaBar.app"
-mkdir -p "${app}/Contents/MacOS" "${app}/Contents/Resources/ProviderLogos"
+mkdir -p "${app}/Contents/MacOS" "${app}/Contents/Helpers" "${app}/Contents/Resources/ProviderLogos"
 sign_identity=${QUOTABAR_SIGN_IDENTITY:--}
 update_key=${QUOTABAR_UPDATE_PUBLIC_KEY:-}
 if [ -z "${update_key}" ] && [ -f Resources/UpdatePublicKey.txt ]; then
@@ -39,6 +39,10 @@ done < release-files.txt
 set -- "$@" -F "${sparkle}" -framework Sparkle -Xlinker -rpath -Xlinker '@executable_path/../Frameworks'
 xcrun swiftc -swift-version 5 -module-cache-path "${stage}/modules" -O -parse-as-library \
     -target "${target_arch}-apple-macosx14.0" "$@" -o "${app}/Contents/MacOS/QuotaBar"
+xcrun swiftc -swift-version 5 -module-cache-path "${stage}/modules" -O -parse-as-library \
+    -target "${target_arch}-apple-macosx14.0" Sources/PrivateFile.swift Sources/ClaudeProfile.swift \
+    Sources/ClaudeSettingsDocument.swift Sources/ClaudeConnection.swift Helpers/ClaudeDisconnect.swift \
+    -o "${app}/Contents/Helpers/QuotaBarClaudeDisconnect"
 cp -X Resources/Info.plist "${app}/Contents/Info.plist"
 cp -X Resources/AppIcon.icns "${app}/Contents/Resources/AppIcon.icns"
 cp -X Resources/ProviderLogos/OpenAI.png Resources/ProviderLogos/Claude.png "${app}/Contents/Resources/ProviderLogos/"

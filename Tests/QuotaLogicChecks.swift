@@ -10,9 +10,11 @@ struct QuotaLogicChecks {
         try await checkExpiredResetPolling()
         try await checkResetPollingAfterRelaunch()
         checkMenuBarLimitsSetting()
+        checkMenuBarLayoutSetting()
         try await checkInitialResetReadFailure()
         try await checkClaudeConnectionActions()
         try await checkClaudeProfiles()
+        try await checkClaudeAuthenticationSwitch()
         print("Passed \(reports) quota display scenarios and \(transitions) account restriction transitions.")
     }
 
@@ -48,6 +50,78 @@ struct QuotaLogicChecks {
                 report?.windows.first?.used == Double(amount) && totals.allTime == Int64(amount) && !totals.partial)
         }
         print("Switched between two Claude profiles with distinct percentages and token totals.")
+    }
+
+    static func checkClaudeAuthenticationSwitch() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let home = environment["CFFIXED_USER_HOME"] else {
+            fatalError("Run authentication checks with check.sh in an isolated home")
+        }
+        let standard = URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent(".claude")
+        setenv("CLAUDE_CONFIG_DIR", standard.path, 1)
+        defer {
+            if let inherited = environment["CLAUDE_CONFIG_DIR"] {
+                setenv("CLAUDE_CONFIG_DIR", inherited, 1)
+            } else {
+                unsetenv("CLAUDE_CONFIG_DIR")
+            }
+        }
+
+        let suite = testPreferencesDomain()
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set("claude", forKey: "providerSelection")
+        let store = UsageResets(file: URL(fileURLWithPath: suite).appendingPathExtension("resets"))
+
+        for selectStandard in [true, false] {
+            ClaudeProfile.select(selectStandard ? nil : standard, defaults: defaults)
+            precondition(
+                ClaudeProfile.childConfigurationDirectory(defaults: defaults) == (selectStandard ? standard.path : nil))
+            let reads = OSAllocatedUnfairLock(initialState: 0)
+            let releaseFirst = DispatchSemaphore(value: 0)
+            let releaseSecond = DispatchSemaphore(value: 0)
+            let app = AppDelegate(
+                resetStore: store, defaults: defaults, monitorNetwork: false,
+                readClaude: {
+                    let call = reads.withLock {
+                        $0 += 1
+                        return $0
+                    }
+                    precondition(call == 1 || call == 2)
+                    let release = call == 1 ? releaseFirst : releaseSecond
+                    precondition(release.wait(timeout: .now() + 5) == .success)
+                    return QuotaReading(
+                        fetchedAt: Date(),
+                        windows: [.init(minutes: 300, remaining: call == 1 ? 21 : 87, resetsAt: nil)])
+                }, readClaudeConnectionStatus: { (.notConfigured, false) })
+
+            func wait(until ready: () -> Bool) async throws {
+                let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+                while !ready(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+                precondition(ready(), "The profile switch must start a new Claude read")
+            }
+
+            app.networkChanged(available: false)
+            app.networkChanged(available: true)
+            try await wait { reads.withLock { $0 == 1 } }
+            let oldPath = app.makePanel().claudeProfilePath
+            if selectStandard {
+                app.selectClaudeProfile(standard)
+            } else {
+                app.makePanel().useDefaultClaudeProfile()
+            }
+            precondition(app.makePanel().claudeProfilePath == oldPath && oldPath == standard.path)
+            precondition(
+                ClaudeProfile.childConfigurationDirectory(defaults: defaults) == (selectStandard ? nil : standard.path))
+            releaseFirst.signal()
+            try await wait { reads.withLock { $0 == 2 } }
+            precondition(
+                app.display.refreshing && app.display.reading == nil, "An obsolete Claude report became visible")
+            releaseSecond.signal()
+            try await wait { !app.display.refreshing }
+            precondition(app.display.menuBarTitle == "87%")
+        }
+        print("Changing Claude authentication at the same folder discarded in-flight reads in both directions.")
     }
 
     static func checkClaudeConnectionActions() async throws {
@@ -232,6 +306,43 @@ struct QuotaLogicChecks {
         print("Menu bar limits settings persisted per provider across relaunch.")
     }
 
+    /// Which providers appear and whether logos appear are separate choices, including percentages only for both.
+    static func checkMenuBarLayoutSetting() {
+        for both in [false, true] {
+            for logos in [false, true] {
+                let layout = MenuBarLayout(showsBoth: both, showsLogos: logos)
+                precondition(layout.showsBoth == both && layout.showsLogos == logos)
+                precondition(layout.showing(both: !both) == MenuBarLayout(showsBoth: !both, showsLogos: logos))
+                precondition(layout.showing(logos: !logos) == MenuBarLayout(showsBoth: both, showsLogos: !logos))
+            }
+        }
+        let suite = testPreferencesDomain()
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let file = URL(fileURLWithPath: suite).appendingPathExtension("resets")
+        func launch() -> AppDelegate {
+            AppDelegate(resetStore: UsageResets(file: file), defaults: defaults, monitorNetwork: false)
+        }
+        defaults.set("both", forKey: "providerSelection")
+        defaults.set("both", forKey: "menuBarLayout")
+        let app = launch()
+        app.makePanel().selectLayout(.bothPercentage)
+        precondition(app.menuLayout == .bothPercentage && defaults.string(forKey: "menuBarLayout") == "bothPercentage")
+        let restored = launch().menuLayout
+        precondition(restored.showsBoth && !restored.showsLogos, "Both providers without logos must survive relaunch.")
+
+        // A single provider cannot show both, and keeps the logo choice when the saved layout showed both.
+        defaults.set("claude", forKey: "providerSelection")
+        let single = launch()
+        precondition(single.menuLayout == .percentage)
+        single.makePanel().selectLayout(.bothPercentage)
+        precondition(single.menuLayout == .percentage)
+        precondition(defaults.string(forKey: "menuBarLayout") == "bothPercentage", "A rejected choice must not save.")
+        defaults.set("both", forKey: "menuBarLayout")
+        precondition(launch().menuLayout == .logo)
+        print("Menu bar layout: provider count and logos are independent; both providers can show percentages only.")
+    }
+
     static func checkInitialResetReadFailure() async throws {
         let suite = testPreferencesDomain()
         let defaults = UserDefaults(suiteName: suite)!
@@ -250,6 +361,7 @@ struct QuotaLogicChecks {
                 fetchedAt: now, windows: [.init(minutes: 300, remaining: 64, resetsAt: nil)],
                 resetCredits: .init(availableCount: 3), resetCountOnlyFingerprint: "sample")
             let display = QuotaDisplay(reading: reading, now: now, failed: false, refreshing: false)
+            store.received(reading, generation: store.readGeneration())
             store.prepare(display)
             precondition(store.begin(display) != nil)
             app.finishReset(outcome)

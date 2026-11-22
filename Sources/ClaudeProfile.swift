@@ -22,12 +22,30 @@ enum ClaudeProfile {
         defaults: UserDefaults = .standard, environment: [String: String] = ProcessInfo.processInfo.environment,
         home: URL = FileManager.default.homeDirectoryForCurrentUser
     ) -> String? {
-        let selected = resolve(defaults: defaults, environment: environment, home: home)
+        guard let preference = defaults.string(forKey: key), preference.hasPrefix("/") else {
+            guard let inherited = environment["CLAUDE_CONFIG_DIR"], inherited.hasPrefix("/") else { return nil }
+            return inherited
+        }
+        let selected = URL(fileURLWithPath: preference, isDirectory: true)
         let standard = home.appendingPathComponent(".claude", isDirectory: true)
-        let isStandard =
-            selected.resolvingSymlinksInPath().standardizedFileURL.path
-            == standard.resolvingSymlinksInPath().standardizedFileURL.path
-        return isStandard && environment["CLAUDE_CONFIG_DIR"] == nil ? nil : selected.path
+        return canonicalPath(selected) == canonicalPath(standard) ? nil : selected.path
+    }
+
+    /// Resolves links through the deepest existing ancestor, then appends the missing components, so a folder
+    /// that does not exist yet compares equal under every spelling of its parent (for example /tmp and /private/tmp).
+    static func canonicalPath(_ url: URL) -> String {
+        var existing = url.standardizedFileURL.path
+        var missing: [String] = []
+        while existing != "/", !FileManager.default.fileExists(atPath: existing) {
+            missing.insert((existing as NSString).lastPathComponent, at: 0)
+            existing = (existing as NSString).deletingLastPathComponent
+        }
+        var resolved = existing
+        if let pointer = realpath(existing, nil) {
+            resolved = String(cString: pointer)
+            free(pointer)
+        }
+        return missing.reduce(resolved) { ($0 as NSString).appendingPathComponent($1) }
     }
 
     static func select(_ directory: URL?, defaults: UserDefaults = .standard) {

@@ -74,6 +74,17 @@ enum MenuChecks {
         case checkingClaudeQuota
         case inspecting
         case checkingDetailsClick(NSRect)
+        case checkingSettingsOpened(NSPanel)
+        case checkingSettingsPreference(NSPanel, PercentageMode)
+        case checkingHelpOpened(NSPanel)
+        case checkingHelpBack(NSPanel)
+        case checkingHelpEscape(NSPanel)
+        case checkingHelpEscapeReturn(NSPanel)
+        case checkingSettingsBack(NSPanel)
+        case checkingSettingsEscape(NSPanel)
+        case checkingSettingsEscapeReturn(NSPanel)
+        case checkingSettingsDismissal(NSPanel)
+        case checkingUsagePanel
         case checkingConfirmationFrame(NSRect)
         case waitingForRefresh(Date)
         case waitingForMock
@@ -207,7 +218,7 @@ enum MenuChecks {
                 }
                 if case .checkingCombinedUpdated = step {
                     let label = checkCombinedButton(item, button: button)
-                    guard label.contains("Claude · Weekly limit, 52%"),
+                    guard label.contains("Claude · 5-hour limit, 84%"),
                         !controller.dashboard.rootView.display.refreshing
                     else { return }
                     precondition(controller.provider == .codex && controller.dropdown.isVisible)
@@ -293,7 +304,7 @@ enum MenuChecks {
                     checkPercentageMode(.used, controller: controller, preferences: preferences, original: original)
                     let label = checkCombinedButton(item, button: button)
                     let used = shownPercentage(.used, original: original)
-                    precondition(label.contains("Claude · Weekly limit, 48% used"))
+                    precondition(label.contains("Claude · 5-hour limit, 16% used"))
                     checkReadout(.used, original: original, in: label)
                     let point = combinedPoint(.codex, in: button, percentage: true, title: used)
                     postStatusClick(at: point, button: button, app: app)
@@ -313,7 +324,7 @@ enum MenuChecks {
                     precondition(!controller.dropdown.isVisible && controller.provider == .codex)
                     precondition(controller.percentageMode == .remaining)
                     let label = checkCombinedButton(item, button: button)
-                    precondition(label.contains("Claude · Weekly limit, 52% remaining"))
+                    precondition(label.contains("Claude · 5-hour limit, 84% remaining"))
                     checkReadout(.remaining, original: original, in: label)
                     button.performClick(nil)
                     checkPercentageMode(
@@ -447,7 +458,10 @@ enum MenuChecks {
                     return
                 }
                 switch step {
-                case .waitingForStress:
+                case .waitingForStress, .checkingSettingsPreference, .checkingHelpOpened, .checkingHelpBack,
+                    .checkingHelpEscape, .checkingHelpEscapeReturn, .checkingSettingsBack, .checkingSettingsEscape,
+                    .checkingSettingsEscapeReturn, .checkingSettingsDismissal, .checkingUsagePanel:
+                    // Changing the settings picker temporarily adds "left" or "used" to the status title.
                     break
                 default:
                     guard !button.title.isEmpty else { return }
@@ -500,8 +514,9 @@ enum MenuChecks {
                 if case .checkingClaudeQuota = step {
                     let view = controller.dashboard.rootView
                     guard !view.display.refreshing, !view.countingTokens else { return }
-                    precondition(view.display.windows.count == 2 && button.title == "52%")
-                    precondition(button.toolTip?.contains("Claude · Weekly limit, 52%") == true)
+                    precondition(view.display.windows.count == 2 && button.title == "84%")
+                    precondition(view.display.windows.first { $0.minutes == 10_080 }?.remaining == 52)
+                    precondition(button.toolTip?.contains("Claude · 5-hour limit, 84%") == true)
                     checkContentFits(controller.dashboard, in: controller.dropdown)
                     precondition(!view.detailsExpanded)
                     view.setDetailsExpanded(true)
@@ -525,7 +540,7 @@ enum MenuChecks {
                 guard let dropdown = controller.dropdown, dropdown.isVisible,
                     let host = controller.dashboard, let content = dropdown.contentView
                 else {
-                    fputs("The status button did not open its dropdown.\n", stderr)
+                    fputs("The dropdown was not visible while \(step).\n", stderr)
                     exit(2)
                 }
                 let beforeRefresh: Date
@@ -556,9 +571,7 @@ enum MenuChecks {
                     postClick(at: point, in: dropdown, app: app)
                     return
                 case .checkingDetailsClick(let compactFrame):
-                    guard let reading = host.rootView.display.reading, !host.rootView.display.refreshing,
-                        !host.rootView.countingTokens
-                    else { return }
+                    guard !host.rootView.display.refreshing, !host.rootView.countingTokens else { return }
                     precondition(host.rootView.detailsExpanded)
                     checkDisclosureSizing(host, compact: compactFrame, in: dropdown)
                     precondition(AppDelegate(defaults: preferences).detailsExpanded)
@@ -569,6 +582,99 @@ enum MenuChecks {
                     print(
                         "Status button opened the live quota dropdown (\(Int(content.bounds.width)) x \(Int(content.bounds.height)))."
                     )
+                    if useFixtures {
+                        clickSettingsGear(in: content, panel: dropdown, app: app)
+                        step = .checkingSettingsOpened(dropdown)
+                    } else {
+                        step = .checkingUsagePanel
+                    }
+                    return
+                case .checkingSettingsOpened(let originalPanel):
+                    precondition(dropdown === originalPanel && host.rootView.page == .settings)
+                    precondition(content.subviews.contains { $0 is NSHostingView<AnyView> && $0.isHidden })
+                    host.view.layoutSubtreeIfNeeded()
+                    let settingsViews = descendants(of: host.view)
+                    precondition(
+                        !settingsViews.contains { $0 is NSScrollView }, "Settings should fit without scrolling.")
+                    let originalMode = controller.percentageMode
+                    clickPercentageMode(originalMode.toggled, in: settingsViews, panel: dropdown, app: app)
+                    step = .checkingSettingsPreference(originalPanel, originalMode)
+                    return
+                case .checkingSettingsPreference(let originalPanel, let originalMode):
+                    precondition(dropdown === originalPanel && host.rootView.page == .settings)
+                    precondition(controller.percentageMode != originalMode)
+                    precondition(AppDelegate(defaults: preferences).percentageMode == controller.percentageMode)
+                    clickHelp(in: dropdown, app: app)
+                    step = .checkingHelpOpened(originalPanel)
+                    return
+                case .checkingHelpOpened(let originalPanel):
+                    precondition(dropdown === originalPanel && host.rootView.page == .help)
+                    precondition(!app.windows.contains { $0.title == "QuotaBar Help" && $0.isVisible })
+                    precondition(content.subviews.contains { $0 is NSHostingView<AnyView> && $0.isHidden })
+                    host.view.layoutSubtreeIfNeeded()
+                    precondition(host.view.enclosingScrollView == nil)
+                    precondition(
+                        !descendants(of: host.view).contains { $0 is NSScrollView },
+                        "Help should fit without scrolling.")
+                    let helpFrame = host.view.convert(host.view.bounds, to: content)
+                    precondition(
+                        helpFrame.minY >= content.bounds.minY - 1 && helpFrame.maxY <= content.bounds.maxY + 1,
+                        "Help should fit inside the dropdown.")
+                    clickPageBack(in: dropdown, app: app)
+                    step = .checkingHelpBack(originalPanel)
+                    return
+                case .checkingHelpBack(let originalPanel):
+                    precondition(dropdown === originalPanel && host.rootView.page == .settings)
+                    clickHelp(in: dropdown, app: app)
+                    step = .checkingHelpEscape(originalPanel)
+                    return
+                case .checkingHelpEscape(let originalPanel):
+                    precondition(dropdown === originalPanel && host.rootView.page == .help)
+                    sendKey("\u{1b}", code: 53, to: dropdown, in: app)
+                    step = .checkingHelpEscapeReturn(originalPanel)
+                    return
+                case .checkingHelpEscapeReturn(let originalPanel):
+                    precondition(dropdown === originalPanel && host.rootView.page == .settings)
+                    print("Help fit inside the dropdown. Back and Escape each returned to Settings in the same panel.")
+                    clickPageBack(in: dropdown, app: app)
+                    step = .checkingSettingsBack(originalPanel)
+                    return
+                case .checkingSettingsBack(let originalPanel):
+                    precondition(dropdown === originalPanel)
+                    checkRestoredUsage(host, in: dropdown)
+                    clickSettingsGear(in: content, panel: dropdown, app: app)
+                    step = .checkingSettingsEscape(originalPanel)
+                    return
+                case .checkingSettingsEscape(let originalPanel):
+                    precondition(dropdown === originalPanel && host.rootView.page == .settings)
+                    sendKey("\u{1b}", code: 53, to: dropdown, in: app)
+                    precondition(dropdown.isVisible && host.rootView.page == .usage)
+                    step = .checkingSettingsEscapeReturn(originalPanel)
+                    return
+                case .checkingSettingsEscapeReturn(let originalPanel):
+                    precondition(dropdown === originalPanel)
+                    checkRestoredUsage(host, in: dropdown)
+                    clickSettingsGear(in: content, panel: dropdown, app: app)
+                    step = .checkingSettingsDismissal(originalPanel)
+                    return
+                case .checkingSettingsDismissal(let originalPanel):
+                    precondition(dropdown === originalPanel && host.rootView.page == .settings)
+                    button.performClick(nil)
+                    precondition(!dropdown.isVisible)
+                    button.performClick(nil)
+                    precondition(controller.dropdown === originalPanel && dropdown.isVisible)
+                    checkRestoredUsage(host, in: dropdown)
+                    host.rootView.selectPercentageMode(.remaining)
+                    print(
+                        "Settings saved a preference. Back, Escape, and reopening restored limits and Details in the same panel."
+                    )
+                    step = .checkingUsagePanel
+                    return
+                case .checkingUsagePanel:
+                    guard button.title.last == "%", let reading = host.rootView.display.reading,
+                        !host.rootView.display.refreshing,
+                        !host.rootView.countingTokens
+                    else { return }
                     button.performClick(nil)
                     precondition(!dropdown.isVisible)
                     button.performClick(nil)
@@ -682,13 +788,6 @@ enum MenuChecks {
                     precondition(restored.providerSelection == .both && restored.provider == .codex)
                     precondition(restored.menuLayout == .both && restored.percentageMode == .remaining)
                     precondition(!restored.detailsExpanded)
-                    host.rootView.showHelp()
-                    guard let help = app.windows.first(where: { $0.title == "QuotaBar Help" }) else {
-                        preconditionFailure("Help must open its window.")
-                    }
-                    precondition(help.isVisible && !dropdown.isVisible)
-                    help.performClose(nil)
-                    precondition(!help.isVisible)
                     print(
                         "UI stress passed: 60 settings/provider/layout cycles, 200 secondary clicks, 121 refresh requests, fixed scroll bounds, saved preferences, and at most two reads per provider."
                     )
@@ -714,9 +813,10 @@ enum MenuChecks {
             let expectedProviders = selection.singleProvider.map { [$0] } ?? UsageProvider.allCases
             checkSummaryProviders(controller, expected: expectedProviders)
             if let single = selection.singleProvider {
-                precondition(controller.provider == single && controller.menuLayout != .both)
+                precondition(controller.provider == single && !controller.menuLayout.showsBoth)
                 host.rootView.selectLayout(.both)
-                precondition(controller.menuLayout != .both)
+                host.rootView.selectLayout(.bothPercentage)
+                precondition(!controller.menuLayout.showsBoth)
             } else {
                 for provider in UsageProvider.allCases {
                     host.rootView.selectProvider(provider)
@@ -800,25 +900,25 @@ enum MenuChecks {
         precondition(controller.dropdown.isVisible)
         controller.dashboard.rootView.selectProviderSelection(.codex)
         precondition(controller.providerSelection == .codex && controller.provider == .codex)
-        precondition(controller.menuLayout != .both)
+        precondition(!controller.menuLayout.showsBoth)
         precondition(controller.dashboard.rootView.providerSelection == .codex)
         checkSummaryProviders(controller, expected: [.codex])
         precondition(button.accessibilityLabel()?.contains("Codex") == true)
         precondition(button.accessibilityLabel()?.contains("Claude") == false)
         let savedCodex = AppDelegate(defaults: preferences)
         precondition(savedCodex.providerSelection == .codex && savedCodex.provider == .codex)
-        precondition(savedCodex.menuLayout != .both)
+        precondition(!savedCodex.menuLayout.showsBoth)
 
         controller.dashboard.rootView.selectProviderSelection(.claude)
         precondition(controller.providerSelection == .claude && controller.provider == .claude)
-        precondition(controller.menuLayout != .both)
+        precondition(!controller.menuLayout.showsBoth)
         precondition(controller.dashboard.rootView.providerSelection == .claude)
         checkSummaryProviders(controller, expected: [.claude])
         precondition(button.accessibilityLabel()?.contains("Claude") == true)
         precondition(button.accessibilityLabel()?.contains("Codex") == false)
         let savedClaude = AppDelegate(defaults: preferences)
         precondition(savedClaude.providerSelection == .claude && savedClaude.provider == .claude)
-        precondition(savedClaude.menuLayout != .both)
+        precondition(!savedClaude.menuLayout.showsBoth)
 
         controller.dashboard.rootView.selectProviderSelection(.both)
         precondition(controller.providerSelection == .both && controller.menuLayout == .both)
@@ -964,6 +1064,45 @@ enum MenuChecks {
             else { preconditionFailure("Could not create a keyboard event for the dropdown.") }
             app.sendEvent(event)
         }
+    }
+
+    @MainActor private static func clickSettingsGear(in content: NSView, panel: NSPanel, app: NSApplication) {
+        // The 22-point gear is the trailing control in the footer, inset by 17 points.
+        let point = content.convert(NSPoint(x: content.bounds.maxX - 28, y: 23), to: nil)
+        postClick(at: point, in: panel, app: app)
+    }
+
+    @MainActor private static func clickHelp(in panel: NSPanel, app: NSApplication) {
+        // Help is the leading button in the Settings footer.
+        postClick(at: NSPoint(x: 39, y: 26), in: panel, app: app)
+    }
+
+    @MainActor private static func clickPageBack(in panel: NSPanel, app: NSApplication) {
+        // Settings and Help put Back in the leading edge of their headers.
+        postClick(at: NSPoint(x: 35, y: panel.frame.height - 19), in: panel, app: app)
+    }
+
+    @MainActor private static func descendants(of view: NSView) -> [NSView] {
+        view.subviews.flatMap { [$0] + descendants(of: $0) }
+    }
+
+    @MainActor private static func clickPercentageMode(
+        _ mode: PercentageMode, in views: [NSView], panel: NSPanel, app: NSApplication
+    ) {
+        guard let control = views.compactMap({ $0 as? NSSegmentedControl }).first(where: { $0.segmentCount == 2 })
+        else {
+            preconditionFailure("Could not find the percentage control in Settings.")
+        }
+        let bounds = control.bounds
+        let fraction: CGFloat = mode == .remaining ? 0.25 : 0.75
+        let point = control.convert(NSPoint(x: bounds.minX + bounds.width * fraction, y: bounds.midY), to: nil)
+        postClick(at: point, in: panel, app: app)
+    }
+
+    @MainActor private static func checkRestoredUsage(_ host: NSHostingController<Dashboard>, in dropdown: NSPanel) {
+        precondition(dropdown.isVisible && host.rootView.page == .usage && host.rootView.detailsExpanded)
+        precondition(host.rootView.display.windows.count == 2)
+        checkContentFits(host, in: dropdown)
     }
 
     @MainActor private static func checkContentFits(_ host: NSHostingController<Dashboard>, in dropdown: NSPanel) {

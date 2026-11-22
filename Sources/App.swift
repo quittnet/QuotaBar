@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var menuLayout: MenuBarLayout
     private(set) var percentageMode: PercentageMode
     private(set) var menuBarLimits: [UsageProvider: MenuBarLimits]
+    private var page = Dashboard.Page.usage
     private(set) var detailsExpanded: Bool
     private var updaterObservation: AnyCancellable?
     private var badges: MenuBarBadges?
@@ -53,7 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var provider: UsageProvider
     private func state(for source: UsageProvider) -> ProviderState { source == .codex ? codex : claude }
     private var current: ProviderState { state(for: provider) }
-    private var visibleProviders: [UsageProvider] { menuLayout == .both ? UsageProvider.allCases : [provider] }
+    private var visibleProviders: [UsageProvider] { menuLayout.showsBoth ? UsageProvider.allCases : [provider] }
     private var enabledProviders: [UsageProvider] {
         providerSelection.singleProvider.map { [$0] } ?? UsageProvider.allCases
     }
@@ -110,7 +111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let layout =
             defaults.string(forKey: "menuBarLayout").flatMap(MenuBarLayout.init(rawValue:))
             ?? (detected.count > 1 ? .both : .percentage)
-        self.menuLayout = selection.singleProvider != nil && layout == .both ? .percentage : layout
+        self.menuLayout = selection.singleProvider != nil ? layout.showing(both: false) : layout
         self.percentageMode =
             defaults.string(forKey: "percentageMode").flatMap(PercentageMode.init(rawValue:)) ?? .remaining
         self.menuBarLimits = Dictionary(
@@ -151,7 +152,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor in self?.updateViews() }
         }
         UpdateController.shared.start()
-        dropdown.onDismiss = { [weak self] in self?.resets.cancel() }
+        dropdown.onDismiss = { [weak self] in
+            self?.page = .usage
+            self?.resets.cancel()
+        }
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(wokeUp),
             name: NSWorkspace.didWakeNotification, object: nil)
@@ -198,22 +202,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return scheduled.map { min($0, retry) } ?? retry
     }
 
-    private lazy var helpWindow: NSWindow = {
-        let content = HelpView { [weak self] in self?.helpWindow.close() }
-        let window = NSWindow(contentViewController: NSHostingController(rootView: content))
-        window.title = "QuotaBar Help"
-        window.styleMask = [.titled, .closable]
-        window.isReleasedWhenClosed = false
-        window.center()
-        return window
-    }()
-
-    private func showHelp() {
-        dropdown.dismiss()
-        NSApp.activate()
-        helpWindow.makeKeyAndOrderFront(nil)
-    }
-
     func makePanel() -> Dashboard {
         let currentRanges =
             current.lastTokenScan <= Date() && Calendar.current.isDateInToday(current.lastTokenScan)
@@ -237,6 +225,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menuBarLimits: menuBarLimits,
             fiveHourChoices: enabledProviders.filter { display(for: $0).offersFiveHourChoice },
             selectMenuBarLimits: { [weak self] in self?.selectMenuBarLimits($0, for: $1) },
+            page: page, selectPage: { [weak self] in self?.selectPage($0) },
             detailsExpanded: detailsExpanded, setDetailsExpanded: { [weak self] in self?.setDetailsExpanded($0) },
             claudeUsesLegacyReport: claudeUsesLegacyReport,
             claudeConnectionStatus: enabledProviders.contains(.claude) ? claudeConnectionStatus : .notConfigured,
@@ -245,7 +234,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             connectClaude: { [weak self] in self?.changeClaudeConnection(disconnect: false) },
             canDisconnectClaude: canDisconnectClaude,
             disconnectClaude: { [weak self] in self?.changeClaudeConnection(disconnect: true) },
-            claudeProfilePath: ClaudeProfile.directory.path,
+            claudeProfilePath: ClaudeProfile.resolve(defaults: defaults).path,
             chooseClaudeProfile: { [weak self] in self?.chooseClaudeProfile() },
             useDefaultClaudeProfile: { [weak self] in self?.selectClaudeProfile(nil) },
             failure: current.failure, tokens: currentRanges ? current.tokens : nil,
@@ -267,7 +256,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSApp.activate()
                 UpdateController.shared.checkForUpdates()
             },
-            showHelp: { [weak self] in self?.showHelp() },
             quit: { NSApp.terminate(nil) })
     }
 
@@ -328,17 +316,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         picker.canChooseDirectories = true
         picker.canChooseFiles = false
         picker.showsHiddenFiles = true
-        picker.directoryURL = ClaudeProfile.directory.deletingLastPathComponent()
+        picker.directoryURL = ClaudeProfile.resolve(defaults: defaults).deletingLastPathComponent()
         dropdown?.dismiss()
         NSApp.activate()
         if picker.runModal() == .OK, let url = picker.url { selectClaudeProfile(url) }
     }
 
-    private func selectClaudeProfile(_ url: URL?) {
+    func selectClaudeProfile(_ url: URL?) {
         guard !connectingClaude else { return }
-        let old = ClaudeProfile.directory
-        ClaudeConnection.selectDirectory(url)
-        guard old != ClaudeProfile.directory else { return }
+        let previousDirectory = ClaudeProfile.resolve(defaults: defaults)
+        let previousOverride = ClaudeProfile.childConfigurationDirectory(defaults: defaults)
+        ClaudeProfile.select(url, defaults: defaults)
+        guard
+            previousDirectory != ClaudeProfile.resolve(defaults: defaults)
+                || previousOverride != ClaudeProfile.childConfigurationDirectory(defaults: defaults)
+        else { return }
         claudeConnectionCheck?.cancel()
         invalidate(.claude)
         claude.reading = nil
@@ -381,6 +373,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func selectPage(_ next: Dashboard.Page) {
+        guard page != next else { return }
+        if page == .usage { resets.cancel() }
+        page = next
+        updateViews()
+    }
+
     private func setDetailsExpanded(_ expanded: Bool) {
         guard expanded != detailsExpanded else { return }
         detailsExpanded = expanded
@@ -397,9 +396,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let single = next.singleProvider {
             invalidate(single == .codex ? .claude : .codex)
             provider = single
-            if menuLayout == .both { menuLayout = .percentage }
+            menuLayout = menuLayout.showing(both: false)
         } else {
-            menuLayout = .both
+            menuLayout = menuLayout.showing(both: true)
         }
         defaults.set(provider.rawValue, forKey: "selectedProvider")
         defaults.set(menuLayout.rawValue, forKey: "menuBarLayout")
@@ -418,7 +417,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func selectLayout(_ next: MenuBarLayout) {
-        guard next != menuLayout, next != .both || providerSelection == .both else { return }
+        guard next != menuLayout, !next.showsBoth || providerSelection == .both else { return }
         menuLayout = next
         defaults.set(next.rawValue, forKey: "menuBarLayout")
         updateViews()
@@ -508,7 +507,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var resetControlsVisible: Bool {
-        provider == .codex && dropdown?.isVisible == true && detailsExpanded
+        provider == .codex && dropdown?.isVisible == true && detailsExpanded && page == .usage
     }
 
     private func renderMenuBar(_ button: NSStatusBarButton) {
@@ -539,11 +538,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             loadingPhase = 0
         }
         let phase = animate ? loadingPhase : nil
-        if menuLayout == .both {
+        if menuLayout.showsBoth {
             let left = titles[0]
             let right = titles[1]
-            if badges?.codex != left || badges?.claude != right || badges?.loadingPhase != phase {
-                let rendered = MenuBarBadges(codex: left, claude: right, font: font, loadingPhase: phase)
+            let logos = menuLayout.showsLogos
+            if badges?.codex != left || badges?.claude != right || badges?.loadingPhase != phase
+                || badges?.logos != logos
+            {
+                let rendered = MenuBarBadges(codex: left, claude: right, font: font, loadingPhase: phase, logos: logos)
                 badges = rendered
                 button.attributedTitle = NSAttributedString(string: "")
                 button.imagePosition = .imageOnly
@@ -552,13 +554,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         } else {
             badges = nil
-            button.imagePosition = menuLayout == .logo ? .imageLeading : .noImage
-            button.image = menuLayout == .logo ? ProviderLogo.image(for: provider) : nil
+            button.imagePosition = menuLayout.showsLogos ? .imageLeading : .noImage
+            button.image = menuLayout.showsLogos ? ProviderLogo.image(for: provider) : nil
             let text = titles[0]
-            button.attributedTitle =
-                text == MenuBarBadges.loadingDots
-                ? MenuBarBadges.label(text, font: font, color: .labelColor, loadingPhase: phase)
-                : NSAttributedString(string: text)
+            if !menuLayout.showsLogos {
+                // Without a logo, the provider's color identifies the percentage.
+                button.attributedTitle = MenuBarBadges.label(
+                    text, font: font, color: provider.menuBarColor, loadingPhase: phase)
+            } else {
+                button.attributedTitle =
+                    text == MenuBarBadges.loadingDots
+                    ? MenuBarBadges.label(text, font: font, color: .labelColor, loadingPhase: phase)
+                    : NSAttributedString(string: text)
+            }
         }
     }
 
@@ -635,7 +643,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if target != provider {
             selectProvider(target)
-            if dropdown.isVisible { return }
+            if dropdown.isVisible {
+                selectPage(.usage)
+                return
+            }
         } else if dropdown.isVisible {
             dropdown.dismiss()
             return
@@ -733,7 +744,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard enabledProviders.contains(source), !state.countingTokens else { return }
         let asOf = Date()
         let timeZone = TimeZone.current
-        let profile = ClaudeProfile.directory
+        let profile = ClaudeProfile.resolve(defaults: defaults)
         state.countingTokens = true
         updateViews()
         Task(priority: .utility) {
@@ -747,7 +758,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             state.lastTokenScan = asOf
             state.tokenTimeZone = timeZone
             state.countingTokens = false
-            if (source == .claude && profile != ClaudeProfile.directory) || asOf > Date()
+            if (source == .claude && profile != ClaudeProfile.resolve(defaults: defaults)) || asOf > Date()
                 || !Calendar.current.isDateInToday(asOf) || timeZone != .current
             {
                 state.tokens = nil

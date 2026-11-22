@@ -68,10 +68,12 @@ final class DropdownPanel: NSPanel {
         guard let button = anchor, let window = button.window, let screen = window.screen else { return }
         let limits = screen.visibleFrame.insetBy(dx: 4, dy: 4)
         dashboard.view.layoutSubtreeIfNeeded()
+        let showsFooter = dashboard.rootView.page == .usage
         let size = dashboard.sizeThatFits(in: CGSize(width: limits.width, height: .greatestFiniteMagnitude))
         let width = min(ceil(size.width), limits.width)
-        footer.rootView = AnyView(dashboard.rootView.footerControls)
-        let footerHeight = ceil(footer.fittingSize.height)
+        footer.isHidden = !showsFooter
+        if showsFooter { footer.rootView = AnyView(dashboard.rootView.footerControls) }
+        let footerHeight = showsFooter ? ceil(footer.fittingSize.height) : 0
         let height = min(ceil(size.height) + footerHeight, limits.height)
         guard width > 0, height > 0 else { return }
         let buttonRect = window.convertToScreen(button.convert(button.bounds, to: nil))
@@ -92,7 +94,13 @@ final class DropdownPanel: NSPanel {
         dashboard.view.frame = body.bounds
     }
 
-    override func cancelOperation(_ sender: Any?) { dismiss() }
+    override func cancelOperation(_ sender: Any?) {
+        if let parent = dashboard.rootView.page.parent {
+            dashboard.rootView.selectPage(parent)
+        } else {
+            dismiss()
+        }
+    }
 
     func dismiss() {
         if let globalClick { NSEvent.removeMonitor(globalClick) }
@@ -138,7 +146,7 @@ final class DropdownPanel: NSPanel {
                 }
             }
             guard event.charactersIgnoringModifiers == "\u{1b}", modifiers.isEmpty else { return false }
-            dismiss()
+            cancelOperation(nil)
             return true
         }
         if let target = event.window, target !== self, target !== anchor?.window,

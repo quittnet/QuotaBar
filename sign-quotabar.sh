@@ -11,6 +11,10 @@ if [ "${sign_identity}" = - ]; then
 else
     timestamp=--timestamp
 fi
+helper="${app}/Contents/Helpers/QuotaBarClaudeDisconnect"
+if [ -f "${helper}" ]; then
+    codesign --force --sign "${sign_identity}" --options runtime "${timestamp}" "${helper}"
+fi
 for nested in "${version}/XPCServices/Downloader.xpc" "${version}/XPCServices/Installer.xpc" \
     "${version}/Autoupdate" "${version}/Updater.app" "${framework}"; do
     codesign --force --sign "${sign_identity}" --options runtime "${timestamp}" "${nested}"

@@ -22,9 +22,15 @@ enum ClaudeQuotaSource {
 
     static var cacheFile: URL { cacheFile(for: ClaudeProfile.directory) }
 
-    static func cacheFile(for profile: URL) -> URL {
+    static func cacheFile(for profile: URL, configuration: String? = ClaudeProfile.childConfigurationDirectory()) -> URL
+    {
         let path = profile.resolvingSymlinksInPath().standardizedFileURL.path
-        let key = SHA256.hash(data: Data(path.utf8)).map { String(format: "%02x", $0) }.joined()
+        let normal = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude")
+            .resolvingSymlinksInPath().standardizedFileURL.path
+        // Claude can sign into different accounts using the same normal folder.
+        // Older path-only entries for that folder cannot be attributed to either sign-in.
+        let identity = path == normal ? path + "\0" + (configuration ?? "") : path
+        let key = SHA256.hash(data: Data(identity.utf8)).map { String(format: "%02x", $0) }.joined()
         return FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("app.quotabar.QuotaBar/claude", isDirectory: true)
             .appendingPathComponent(key + ".json")

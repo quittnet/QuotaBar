@@ -38,7 +38,7 @@ enum ClaudeUsageClient {
             at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: directory) }
         var environment = paths.childEnvironment(for: executable, named: "claude", defaults: defaults)
-        environment["CLAUDE_CONFIG_DIR"] = ClaudeProfile.childConfigurationDirectory()
+        environment["CLAUDE_CONFIG_DIR"] = ClaudeProfile.childConfigurationDirectory(defaults: defaults)
         let arguments = [
             "-p", "--safe-mode", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
             "--no-session-persistence", "--strict-mcp-config", "--tools", "", "--setting-sources", "",
@@ -50,12 +50,11 @@ enum ClaudeUsageClient {
                 executable: executable, arguments: arguments, environment: environment, directory: directory,
                 input: input, output: output)
         } catch { throw Failure.unavailable }
-        var failed = true
         let writer = input.fileHandleForWriting
         let reader = output.fileHandleForReading
         defer {
             try? writer.close()
-            process.finish(failed: failed, graceMilliseconds: 100)
+            process.finish(graceMilliseconds: 100)
             try? reader.close()
         }
         for descriptor in [writer.fileDescriptor, reader.fileDescriptor] {
@@ -68,9 +67,7 @@ enum ClaudeUsageClient {
         // Control requests do not enter the conversation or trigger a model response.
         _ = try transport.request(id: "initialize", request: ["subtype": "initialize"])
         let data = try transport.request(id: "usage", request: ["subtype": "get_usage", "skip_behaviors": true])
-        let result = try parse(data, now: Date())
-        failed = false
-        return result
+        return try parse(data, now: Date())
     }
 
     static func parse(_ data: Data, now: Date) throws -> QuotaReading {
@@ -96,6 +93,15 @@ enum ClaudeUsageClient {
     }
 
     private static func isoDate(_ timestamp: String) -> Date? {
+        // Foundation can normalize impossible dates and accept valid prefixes of malformed strings.
+        let pattern =
+            #"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\.[0-9]+)?(?:[Zz]|[+-](?:[01][0-9]|2[0-3])(?::?[0-5][0-9])?)\z"#
+        guard timestamp.range(of: pattern, options: .regularExpression) != nil else { return nil }
+        let day = timestamp.prefix(10).split(separator: "-")
+        let components = DateComponents(year: Int(day[0]), month: Int(day[1]), day: Int(day[2]))
+        var calendar = Calendar(identifier: .iso8601)
+        calendar.timeZone = TimeZone.gmt
+        guard components.isValidDate(in: calendar) else { return nil }
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         if let date = formatter.date(from: timestamp) { return date }

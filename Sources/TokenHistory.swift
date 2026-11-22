@@ -431,7 +431,7 @@ final class TokenHistory {
             let fileID = file.metadata?.id ?? path
             var counter: Int64?
             var generation = 0
-            var pending: [Int64] = []
+            var pending: [(tokens: Int64, original: Bool)] = []
             var observed: Set<ResponseKey> = []
             for event in file.events {
                 if let response = event.response, let owner = event.owner {
@@ -453,27 +453,27 @@ final class TokenHistory {
                     if let previous = responses[key], previous.tokens != contribution.tokens { partial = true }
                     responses[key] = contribution.preferred(over: responses[key])
                     if observed.insert(key).inserted {
-                        pending.append(event.total)
+                        pending.append((event.total, original))
                     }
                     continue
                 }
-                guard let sample = event.counter else { continue }
+                // Context estimates can change both counts without proving spend.
+                guard let sample = event.counter, !sample.estimated else { continue }
                 let last = sample.last
-                if event.total == 0, last == 0, !sample.estimated, !sample.inherited {
+                if event.total == 0, last == 0, !sample.inherited {
                     if event.date.map({ $0 <= now }) ?? true { hasRetainedUsage = true }
                 }
-                let matched = pending.contains(last)
+                let matched = pending.contains { $0.tokens == last }
                 if let counter, event.total < counter { generation += 1 }
                 let key = SnapshotKey(
                     turnOrThread: event.turn ?? fileID, generation: generation, total: event.total, last: last)
-                if matched && !sample.estimated && !sample.inherited {
+                if matched && !sample.inherited {
                     // The same snapshot in an archived or forked copy may lack the response record.
                     identifiedSnapshots.insert(key)
                 }
-                // Rate-limit and context updates often repeat an unchanged cumulative count.
-                // A context estimate can change the "last" count without recording any spend.
+                // Rate-limit updates often repeat an unchanged cumulative count.
                 if counter == event.total {
-                    if matched && !sample.estimated { pending.removeAll(keepingCapacity: true) }
+                    if matched { pending.removeAll(keepingCapacity: true) }
                     continue
                 }
 
@@ -486,16 +486,27 @@ final class TokenHistory {
 
                 let first = counter == nil
                 counter = event.total
-                let reported = pending.reduce(Int64(0)) { cappedSum($0, $1, partial: &partial) }
+                let reported = pending.reduce(into: (all: Int64(0), local: Int64(0))) { counts, response in
+                    counts.all = cappedSum(counts.all, response.tokens, partial: &partial)
+                    if response.original { counts.local = cappedSum(counts.local, response.tokens, partial: &partial) }
+                }
                 pending.removeAll(keepingCapacity: true)
-                guard !sample.estimated, !matched, !sample.inherited else { continue }
-                if first, reported == 0, event.total > last, file.metadata?.hasParent == true { continue }
+                guard !sample.inherited else { continue }
+                let inheritedOpening = first && file.metadata?.hasParent == true
+                // Copied responses can match a snapshot for deduplication, but cannot prove new spend in this file.
+                let attributed = inheritedOpening ? reported.all : reported.local
+                if matched {
+                    let rise = first && !inheritedOpening ? event.total : increment
+                    if rise > attributed { partial = true }
+                    continue
+                }
+                if inheritedOpening, reported.all == 0, event.total > last { continue }
                 let observedIncrease = first ? event.total : increment
-                if observedIncrease - min(reported, observedIncrease) > last {
-                    // Only the final request has a dated usage record. Earlier increments are unaccounted for.
+                let unpaired = min(last, max(0, increment - reported.all))
+                if observedIncrease - min(attributed, observedIncrease) > unpaired {
+                    // Only the final request has a dated counter contribution. Other spend is unaccounted for.
                     partial = true
                 }
-                let unpaired = min(last, max(0, increment - reported))
                 guard unpaired > 0 else { continue }
                 let contribution = Contribution(
                     tokens: unpaired, date: event.date, original: file.metadata?.hasParent != true,

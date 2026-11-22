@@ -78,6 +78,20 @@ struct ClaudeUsageChecks {
         precondition(reading.windows.map(\.minutes) == [300, 10_080])
         precondition(reading.windows.map(\.remaining) == [92, 99])
         precondition(reading.resetAccountFingerprint == nil && reading.resetCredits == nil)
+        func parseReset(_ timestamp: String) throws -> Date? {
+            let body = report.replacingOccurrences(of: "2027-01-15T10:00:00.123456+00:00", with: timestamp)
+            return try ClaudeUsageClient.parse(Data(body.utf8), now: now).windows.first?.resetsAt
+        }
+        for date in [
+            "2030-02-29T12:00:00Z", "2032-02-30T00:00:00Z", "2030-02-28T12:00:00Ztrailing",
+            "2030-02-28T12:00:00.250Ztrailing", "2030-02-28T24:00:00Z", "2030-02-28T12:00:00+02:60",
+        ] {
+            try expect(.invalidResponse) { _ = try parseReset(date) }
+        }
+        let offsetDate = try parseReset("2032-02-29T23:45:00.250-02:30")
+        let utcDate = try parseReset("2032-03-01T02:15:00.250Z")
+        let hourOffset = try parseReset("2032-03-01T04:15:00.250+02")
+        precondition(offsetDate != nil && offsetDate == utcDate && hourOffset == utcDate)
         let idleSession =
             #"{"rate_limits_available":true,"rate_limits":{"five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":1,"resets_at":"2027-01-22T10:00:00Z"}}}"#
         let idleReading = try ClaudeUsageClient.parse(Data(idleSession.utf8), now: now)
@@ -320,15 +334,44 @@ struct ClaudeUsageChecks {
         func child(_ environment: [String: String]) -> String? {
             ClaudeProfile.childConfigurationDirectory(defaults: defaults, environment: environment, home: home)
         }
+        for invalid in ["", "relative/profile"] {
+            precondition(child(["CLAUDE_CONFIG_DIR": invalid]) == nil)
+        }
         precondition(child([:]) == nil, "The default profile must not set CLAUDE_CONFIG_DIR.")
         precondition(child(["CLAUDE_CONFIG_DIR": "/Users/fixture/.claude"]) == "/Users/fixture/.claude")
         precondition(child(["CLAUDE_CONFIG_DIR": "/Volumes/work/claude"]) == "/Volumes/work/claude")
         for standard in ["/Users/fixture/.claude", "/Users/fixture/.claude/", "/Users/fixture/./.claude"] {
             ClaudeProfile.select(URL(fileURLWithPath: standard, isDirectory: true), defaults: defaults)
+            precondition(child(["CLAUDE_CONFIG_DIR": "/Volumes/work/claude"]) == nil)
             precondition(child([:]) == nil, "Selecting \(standard) must keep Claude Code's default profile.")
         }
         ClaudeProfile.select(URL(fileURLWithPath: "/Users/fixture/work-claude", isDirectory: true), defaults: defaults)
         precondition(child([:]) == "/Users/fixture/work-claude")
+        ClaudeProfile.select(nil, defaults: defaults)
+
+        // A home reached through a link (/tmp is /private/tmp) must match whether or not .claude exists yet.
+        let root = URL(fileURLWithPath: "/tmp", isDirectory: true)
+            .appendingPathComponent("quotabar-alias-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let spellings = [root.path, "/private" + root.path]
+        for exists in [false, true] {
+            let folder = root.appendingPathComponent(".claude", isDirectory: true)
+            if exists { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
+            for homeSpelling in spellings {
+                for selectedSpelling in spellings {
+                    ClaudeProfile.select(
+                        URL(fileURLWithPath: selectedSpelling + "/.claude", isDirectory: true), defaults: defaults)
+                    let home = URL(fileURLWithPath: homeSpelling, isDirectory: true)
+                    let value = ClaudeProfile.childConfigurationDirectory(
+                        defaults: defaults, environment: [:], home: home)
+                    precondition(
+                        value == nil,
+                        "Selecting \(selectedSpelling)/.claude with home \(homeSpelling) (exists: \(exists)) passed a path."
+                    )
+                }
+            }
+        }
         ClaudeProfile.select(nil, defaults: defaults)
 
         // The real read path omits the variable for the default profile and passes a configured one.
@@ -353,6 +396,11 @@ struct ClaudeUsageChecks {
         _ = try ClaudeUsageClient.read(executable: executable, timeout: 2)
         let passed = try String(contentsOf: record, encoding: .utf8)
         precondition(passed == custom)
+        ClaudeProfile.select(
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude"), defaults: defaults)
+        _ = try ClaudeUsageClient.read(executable: executable, timeout: 2, defaults: defaults)
+        let selectedStandard = try String(contentsOf: record, encoding: .utf8)
+        precondition(selectedStandard == "<unset>")
         print("Claude default profile reaches Claude Code without CLAUDE_CONFIG_DIR; custom profiles pass it.")
     }
 

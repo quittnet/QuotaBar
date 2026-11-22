@@ -6,6 +6,7 @@ struct MenuBarBadges {
     let loadingPhase: Int?
     let codex: String
     let claude: String
+    let logos: Bool
     let image: NSImage
     private let split: CGFloat
 
@@ -20,16 +21,20 @@ struct MenuBarBadges {
         return text
     }
 
-    init(codex: String, claude: String, font: NSFont, loadingPhase: Int?) {
+    init(codex: String, claude: String, font: NSFont, loadingPhase: Int?, logos: Bool = true) {
         self.loadingPhase = loadingPhase
         self.codex = codex
         self.claude = claude
-        let logoSide = ProviderLogo.menuBarSize
-        let innerGap: CGFloat = 3
+        self.logos = logos
+        // Without logos, Codex stays on the left in the menu bar's text color and Claude on the right in coral.
+        let logoSide = logos ? ProviderLogo.menuBarSize : 0
+        let innerGap: CGFloat = logos ? 3 : 0
         let pairGap: CGFloat = 10
         let height: CGFloat = 18
-        let first = Self.label(codex, font: font, color: .black, loadingPhase: loadingPhase)
-        let second = Self.label(claude, font: font, color: .black, loadingPhase: loadingPhase)
+        let codexColor = logos ? NSColor.black : UsageProvider.codex.menuBarColor
+        let claudeColor = logos ? NSColor.black : UsageProvider.claude.menuBarColor
+        let first = Self.label(codex, font: font, color: codexColor, loadingPhase: loadingPhase)
+        let second = Self.label(claude, font: font, color: claudeColor, loadingPhase: loadingPhase)
         let firstWidth = logoSide + innerGap + ceil(first.size().width)
         let secondStart = firstWidth + pairGap
         let width = secondStart + logoSide + innerGap + ceil(second.size().width)
@@ -38,14 +43,15 @@ struct MenuBarBadges {
         let claudeLogo = ProviderLogo.image(for: .claude)
         image = NSImage(size: NSSize(width: width, height: height), flipped: false) { _ in
             func draw(_ logo: NSImage, _ text: NSAttributedString, x: CGFloat) {
-                logo.draw(in: NSRect(x: x, y: (height - logoSide) / 2, width: logoSide, height: logoSide))
+                if logos { logo.draw(in: NSRect(x: x, y: (height - logoSide) / 2, width: logoSide, height: logoSide)) }
                 text.draw(at: NSPoint(x: x + logoSide + innerGap, y: floor((height - text.size().height) / 2)))
             }
             draw(codexLogo, first, x: 0)
             draw(claudeLogo, second, x: secondStart)
             return true
         }
-        image.isTemplate = true
+        // A template is drawn in one menu bar color, so colored percentages need an ordinary image.
+        image.isTemplate = logos
     }
 
     @MainActor func provider(at point: NSPoint, in button: NSStatusBarButton) -> UsageProvider {
@@ -56,4 +62,9 @@ struct MenuBarBadges {
             : point.x - button.bounds.midX + image.size.width / 2
         return x < split ? .codex : .claude
     }
+}
+
+extension UsageProvider {
+    /// Percentage color without a logo. OpenAI's brand is monochrome, so Codex follows the menu bar's text color.
+    var menuBarColor: NSColor { self == .claude ? accentColor : .labelColor }
 }
