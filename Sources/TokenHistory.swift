@@ -77,9 +77,30 @@ enum TokenHistoryError: LocalizedError {
     }
 }
 
+func resolveTokenHistoryRoot(_ url: URL, info: inout stat) -> URL? {
+    guard lstat(url.path, &info) == 0 else { return nil }
+    // Foundation skips a symlink used as the enumeration root. Keep the original path for ordinary roots.
+    guard (info.st_mode & S_IFMT) == S_IFLNK else { return url }
+    guard let path = realpath(url.path, nil) else { return nil }
+    defer { free(path) }
+    let resolved = URL(fileURLWithPath: String(cString: path), isDirectory: true)
+    guard lstat(resolved.path, &info) == 0 else { return nil }
+    return resolved
+}
+
 /// The cache stores only file identities, offsets and token-accounting fields.
 /// Keep an instance on the serial queue that reads local history.
 final class TokenHistory {
+    private struct RootIdentity: Hashable {
+        let device: dev_t
+        let inode: ino_t
+    }
+
+    private struct TranscriptVisit: Hashable {
+        let fingerprint: LogFingerprint
+        let compressed: Bool
+    }
+
     private let home: URL
     private let cacheURL: URL?
     private let calendar: Calendar?
@@ -133,21 +154,34 @@ final class TokenHistory {
         let decoderFile = compression.binary.flatMap(DecoderRevision.init)
         let fm = FileManager.default
         var foundRoot = false
+        var visitedRoots = Set<RootIdentity>()
+        var visitedFiles = Set<TranscriptVisit>()
         var enumerationFailed = false
         var readable = 0
         var candidates = 0
         var next: [String: HistoryFile] = [:]
         var nextSkips: [String: ArchiveSkip] = [:]
         var archives: [(url: URL, fingerprint: LogFingerprint)] = []
+        var roots: [(url: URL, identity: RootIdentity, linked: Bool)] = []
 
         for directory in ["sessions", "archived_sessions"] {
-            let root = home.appendingPathComponent(directory, isDirectory: true)
+            let configuredRoot = home.appendingPathComponent(directory, isDirectory: true)
             var rootStat = stat()
-            guard stat(root.path, &rootStat) == 0 else {
+            guard let root = resolveTokenHistoryRoot(configuredRoot, info: &rootStat) else {
                 if errno != ENOENT { enumerationFailed = true }
                 continue
             }
-            guard (rootStat.st_mode & S_IFMT) == S_IFDIR,
+            guard (rootStat.st_mode & S_IFMT) == S_IFDIR else {
+                enumerationFailed = true
+                continue
+            }
+            let identity = RootIdentity(device: rootStat.st_dev, inode: rootStat.st_ino)
+            roots.append((root, identity, root != configuredRoot))
+        }
+        let deduplicateFiles = roots.count > 1 && roots.contains { $0.linked }
+        for (root, identity, _) in roots {
+            guard !visitedRoots.contains(identity) else { continue }
+            guard
                 let entries = fm.enumerator(
                     at: root, includingPropertiesForKeys: nil,
                     errorHandler: { _, error in
@@ -162,6 +196,7 @@ final class TokenHistory {
                 continue
             }
             foundRoot = true
+            visitedRoots.insert(identity)
             for case let url as URL in entries {
                 let compressed = url.lastPathComponent.hasSuffix(".jsonl.zst")
                 guard url.pathExtension == "jsonl" || compressed else { continue }
@@ -172,9 +207,15 @@ final class TokenHistory {
                     continue
                 }
                 guard (info.st_mode & S_IFMT) == S_IFREG else { continue }
+                let fingerprint = LogFingerprint(info)
+                // Linked roots can overlap. Account for each unchanged physical transcript once per refresh.
+                if deduplicateFiles,
+                    !visitedFiles.insert(TranscriptVisit(fingerprint: fingerprint, compressed: compressed)).inserted
+                {
+                    continue
+                }
                 candidates += 1
                 do {
-                    let fingerprint = LogFingerprint(info)
                     if let previous = files[path], previous.fingerprint == fingerprint {
                         next[path] = previous
                     } else if compressed {
@@ -194,6 +235,10 @@ final class TokenHistory {
                         changed.insert(path)
                     }
                     readable += 1
+                } catch TokenLogSnapshotError.verifiedPreviousCheckpoint {
+                    next[path] = files[path]
+                    readable += 1
+                    enumerationFailed = true
                 } catch {
                     enumerationFailed = true
                 }
@@ -823,7 +868,7 @@ private struct HistoryFile: Codable {
     var partial = false
 }
 
-private struct LogFingerprint: Codable, Equatable {
+private struct LogFingerprint: Codable, Hashable {
     let device: Int32
     let inode: UInt64
     let size: Int64
@@ -844,6 +889,10 @@ private struct LogFingerprint: Codable, Equatable {
         changedNanoseconds = info.st_ctimespec.tv_nsec
         created = info.st_birthtimespec.tv_sec
         createdNanoseconds = info.st_birthtimespec.tv_nsec
+    }
+
+    func grew(from earlier: Self) -> Bool {
+        sameFile(as: earlier) && size > earlier.size
     }
 
     func sameFile(as other: Self) -> Bool {
@@ -883,6 +932,10 @@ struct TokenLogPrefix {
     }
 }
 
+enum TokenLogSnapshotError: Error {
+    case verifiedPreviousCheckpoint
+}
+
 // Sample a fixed length so an active writer cannot indefinitely extend this refresh.
 func readTokenLogSnapshot(
     _ stream: FileHandle, at url: URL, opened: stat, from offset: UInt64, prefix initial: TokenLogPrefix,
@@ -919,7 +972,7 @@ func readTokenLogSnapshot(
     var after = LogFingerprint(current)
     // Allow a second append during verification, but never chase an active writer indefinitely.
     for _ in 0..<2 where before != after {
-        guard before.sameFile(as: after), after.size > before.size else { throw TokenHistoryError.unavailable }
+        guard after.grew(from: before) else { throw TokenHistoryError.unavailable }
         before = after
         // Validate both the reused checkpoint and every newly parsed committed byte on a racing append.
         guard try verifyCachedPrefix?() != false else { throw TokenHistoryError.unavailable }
@@ -928,8 +981,23 @@ func readTokenLogSnapshot(
         guard checked.digest == anchor, lstat(url.path, &current) == 0 else { throw TokenHistoryError.unavailable }
         after = LogFingerprint(current)
     }
-    guard before == after else { throw TokenHistoryError.unavailable }
-    return (end, anchor)
+    if before == after { return (end, anchor) }
+
+    // The snapshot never stabilized. Keep only the old checkpoint if it still matches
+    // the readable transcript after the last observed append. Leave its offset unchanged for retry.
+    guard offset > 0, after.grew(from: before) else { throw TokenHistoryError.unavailable }
+    let matches: Bool
+    if let verifyCachedPrefix {
+        matches = try verifyCachedPrefix()
+    } else {
+        var cached = TokenLogPrefix()
+        try cached.extend(in: stream, to: offset, didReadBytes: didReadBytes)
+        matches = cached.digest == initial.digest
+    }
+    guard matches, lstat(url.path, &current) == 0 else { throw TokenHistoryError.unavailable }
+    let final = LogFingerprint(current)
+    guard final == after || final.grew(from: after) else { throw TokenHistoryError.unavailable }
+    throw TokenLogSnapshotError.verifiedPreviousCheckpoint
 }
 
 // Consume only newline-committed records. A trailing fragment is re-read after the writer appends.

@@ -52,9 +52,10 @@ enum PrivateFile {
         defer { try? handle.close() }
         var info = stat()
         guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
-            info.st_size >= 0, info.st_size <= maximumBytes,
-            let data = try handle.read(upToCount: Int(info.st_size) + 1), data.count == info.st_size
+            info.st_size >= 0, info.st_size <= maximumBytes
         else { throw CocoaError(.fileReadUnknown) }
+        let data = try handle.read(upToCount: Int(info.st_size) + 1) ?? Data()
+        guard data.count == info.st_size else { throw CocoaError(.fileReadUnknown) }
         return data
     }
 }

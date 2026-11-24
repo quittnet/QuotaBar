@@ -14,6 +14,8 @@ struct TokenChecks {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(identifier: "America/New_York")!
         let now = ISO8601DateFormatter().date(from: "2026-11-18T15:00:00Z")!
+        try linkedHistoryRoots(in: root.appendingPathComponent("linked-roots"), now: now, calendar: calendar)
+        try overlappingHistoryRoots(now: now, calendar: calendar)
         try reconcileCounters(in: root.appendingPathComponent("reconcile"), now: now, calendar: calendar)
         try costAttribution(in: root.appendingPathComponent("cost"), now: now, calendar: calendar)
         try legacyForkDates(in: root.appendingPathComponent("legacy-fork"), now: now, calendar: calendar)
@@ -272,6 +274,124 @@ struct TokenChecks {
             .write(to: log, atomically: true, encoding: .utf8)
         try expect(historyWithReorderedKeys, now: now, all: 13, month: 13, week: 13, today: 13)
         print("Token history checks passed.")
+    }
+
+    private static func linkedHistoryRoots(in home: URL, now: Date, calendar: Calendar) throws {
+        let fm = FileManager.default
+        let sessions = home.appendingPathComponent("sessions")
+        let archive = home.appendingPathComponent("archived_sessions")
+        let outside = home.appendingPathComponent("outside")
+        let nested = "2026/11/18"
+        try fm.createDirectory(at: sessions.appendingPathComponent(nested), withIntermediateDirectories: true)
+        try fm.createDirectory(at: archive, withIntermediateDirectories: true)
+        try fm.createDirectory(at: outside, withIntermediateDirectories: true)
+        func write(_ id: String, tokens: Int64, to url: URL) throws {
+            let rows = [metadata(id), response("2026-11-18T12:00:00Z", thread: id, response: "one", tokens: tokens)]
+            try (rows.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+        }
+        try write("live", tokens: 17, to: sessions.appendingPathComponent(nested + "/live.jsonl"))
+        try write("archived", tokens: 23, to: archive.appendingPathComponent("archived.jsonl"))
+        let outsideLog = outside.appendingPathComponent("ignored.jsonl")
+        try write("outside", tokens: 101, to: outsideLog)
+        try fm.createSymbolicLink(at: sessions.appendingPathComponent("ignored.jsonl"), withDestinationURL: outsideLog)
+        try fm.createSymbolicLink(at: archive.appendingPathComponent("ignored-directory"), withDestinationURL: outside)
+
+        var bytesRead = 0
+        let cache = home.appendingPathComponent("history")
+        func reader() -> TokenHistory {
+            TokenHistory(home: home, cacheURL: cache, calendar: calendar) { bytesRead += $0 }
+        }
+        let directReader = reader()
+        try expect(directReader, now: now, all: 40, month: 40, week: 40, today: 40)
+        let direct = try directReader.read(now: now)
+        bytesRead = 0
+        let reused = try reader().read(now: now)
+        precondition(reused == direct && bytesRead == 0, "Ordinary roots must reuse their saved checkpoints")
+
+        let movedSessions = home.appendingPathComponent("relocated-sessions")
+        let movedArchive = home.appendingPathComponent("relocated-archive")
+        try fm.moveItem(at: sessions, to: movedSessions)
+        try fm.moveItem(at: archive, to: movedArchive)
+        try fm.createSymbolicLink(atPath: sessions.path, withDestinationPath: movedSessions.lastPathComponent)
+        try fm.createSymbolicLink(atPath: archive.path, withDestinationPath: movedArchive.lastPathComponent)
+        let linkedReader = reader()
+        let linked = try linkedReader.read(now: now)
+        precondition(linked == direct, "Linked active and archived roots must match ordinary roots")
+        bytesRead = 0
+        let linkedCached = try reader().read(now: now)
+        precondition(linkedCached == linked && bytesRead == 0, "Linked roots must reuse their saved checkpoints")
+
+        let replacement = home.appendingPathComponent("replacement-archive")
+        try fm.createDirectory(at: replacement, withIntermediateDirectories: true)
+        try write("archived", tokens: 59, to: replacement.appendingPathComponent("archived.jsonl"))
+        try fm.removeItem(at: archive)
+        try fm.createSymbolicLink(at: archive, withDestinationURL: replacement)
+        try expect(linkedReader, now: now, all: 76, month: 76, week: 76, today: 76)
+
+        try fm.removeItem(at: archive)
+        bytesRead = 0
+        let singleRoot = try TokenHistory(home: home, calendar: calendar) { bytesRead += $0 }.read(now: now)
+        let singleRootBytes = bytesRead
+        try fm.createSymbolicLink(atPath: archive.path, withDestinationPath: sessions.lastPathComponent)
+        bytesRead = 0
+        let aliased = try TokenHistory(home: home, calendar: calendar) { bytesRead += $0 }.read(now: now)
+        precondition(aliased == singleRoot && bytesRead == singleRootBytes, "Aliases must scan their shared root once")
+    }
+
+    private static func overlappingHistoryRoots(now: Date, calendar: Calendar) throws {
+        let fm = FileManager.default
+        let home = URL(fileURLWithPath: "/tmp", isDirectory: true).appendingPathComponent(UUID().uuidString)
+        let sessions = home.appendingPathComponent("sessions")
+        let nested = sessions.appendingPathComponent("a-nested")
+        let archived = home.appendingPathComponent("archived_sessions")
+        try fm.createDirectory(at: nested, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: home) }
+        try fm.createSymbolicLink(atPath: archived.path, withDestinationPath: "sessions/a-nested")
+        let plain = counter("2026-11-18T12:00:00Z", cumulative: 11, last: 11) + "\n"
+        let log = nested.appendingPathComponent("counter.jsonl")
+        try plain.write(to: log, atomically: true, encoding: .utf8)
+        var bytes = 0
+        let history = TokenHistory(home: home, calendar: calendar) { bytes += $0 }
+        try expect(history, now: now, all: 11, month: 11, week: 11, today: 11)
+        let plainBytesRead = bytes
+        try fm.removeItem(at: log)
+
+        let decoder = home.appendingPathComponent("decoder")
+        try """
+        #!/bin/sh
+        IFS= read -r archive
+        printf '%s\\n' "$archive" >> "$0.launches"
+        exec /bin/cat
+        """.write(to: decoder, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: decoder.path)
+        let first = response("2026-11-18T12:00:00Z", thread: "a", response: "one", tokens: 17) + "\n"
+        let second = response("2026-11-18T12:00:00Z", thread: "z", response: "one", tokens: 29) + "\n"
+        let nestedArchive = nested.appendingPathComponent("a.jsonl.zst")
+        let otherArchive = sessions.appendingPathComponent("z.jsonl.zst")
+        try ("a\n" + first).write(to: nestedArchive, atomically: true, encoding: .utf8)
+        try ("z\n" + second).write(to: otherArchive, atomically: true, encoding: .utf8)
+        let configuration = CompressedLogConfiguration(
+            maximumBytes: first.utf8.count + second.utf8.count, timeout: 1, executable: decoder)
+        let compressed = TokenHistory(home: home, calendar: calendar, compression: configuration)
+        try expect(compressed, now: now, all: 46, month: 46, week: 46, today: 46)
+        let launches = try String(contentsOf: decoder.appendingPathExtension("launches"), encoding: .utf8)
+        precondition(launches.split(separator: "\n") == ["a", "z"], "Each compressed archive must decode once")
+        precondition(plainBytesRead == plain.utf8.count, "A nested transcript must scan once")
+
+        try fm.removeItem(at: nestedArchive)
+        try expect(compressed, now: now, all: 29, month: 29, week: 29, today: 29)
+        let replacement = response("2026-11-18T12:00:00Z", thread: "a", response: "one", tokens: 61) + "\n"
+        try ("a\n" + replacement).write(to: nestedArchive, atomically: true, encoding: .utf8)
+        try expect(compressed, now: now, all: 90, month: 90, week: 90, today: 90)
+
+        try fm.removeItem(at: otherArchive)
+        try fm.removeItem(at: nestedArchive)
+        // A hardlink with another suffix still has to use its declared reader.
+        try (plain + first).write(to: log, atomically: true, encoding: .utf8)
+        try fm.linkItem(at: log, to: nestedArchive)
+        try expect(compressed, now: now, all: 28, month: 28, week: 28, today: 28)
+        let finalLaunches = try String(contentsOf: decoder.appendingPathExtension("launches"), encoding: .utf8)
+        precondition(finalLaunches.split(separator: "\n").last == plain.dropLast())
     }
 
     private static func slicedChunks() throws {

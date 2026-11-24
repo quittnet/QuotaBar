@@ -312,7 +312,7 @@ enum ClaudeConnection {
     }
 
     // Older versions created a private UUID-named backup before each settings edit.
-    // Only claim files with that exact shape, owner and mode alongside a verified installation.
+    // Only claim valid JSON files with that exact shape, owner and mode alongside a verified installation.
     private static func legacyFiles(_ directory: URL, root: URL, original: String?) throws -> LegacyFiles {
         let prefix = "settings.json.quotabar-backup-"
         var result = LegacyFiles()
@@ -324,7 +324,7 @@ enum ClaudeConnection {
             var info = stat()
             guard lstat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_nlink == 1,
                 info.st_uid == geteuid(), (info.st_mode & 0o777) == 0o600,
-                let data = try? read(url), let doc = try? ClaudeSettingsDocument(data)
+                let data = try? read(url), !data.isEmpty, let doc = try? ClaudeSettingsDocument(data)
             else { continue }
             let line = doc.object["statusLine"]
             let command = (line as? [String: Any])?["command"] as? String
@@ -723,8 +723,9 @@ enum ClaudeConnection {
         let helperDirectory =
             Bundle.main.bundleURL.pathExtension == "app"
             ? directory.deletingLastPathComponent().appendingPathComponent("Helpers") : directory
-        guard let bytes = try read(helperDirectory.appendingPathComponent(helperName)) else {
-            throw SetupError(message: "The Claude disconnect helper is missing. Reinstall QuotaBar before connecting.")
+        guard let bytes = try read(helperDirectory.appendingPathComponent(helperName)), !bytes.isEmpty else {
+            throw SetupError(
+                message: "The Claude disconnect helper is missing or empty. Reinstall QuotaBar before connecting.")
         }
         return bytes
     }

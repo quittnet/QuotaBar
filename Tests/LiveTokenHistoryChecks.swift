@@ -22,7 +22,7 @@ struct LiveTokenHistoryChecks {
 
     enum Mutation: CaseIterable {
         case append, repeatedAppend, sustainedAppend, finishFragment, replace, truncate, rewriteAndGrow,
-            rewriteDuringVerification
+            rewriteDuringVerification, replaceAtLimit, removeAtLimit, rewriteAtLimit
     }
 
     struct Failure: Error { let message: String }
@@ -31,10 +31,12 @@ struct LiveTokenHistoryChecks {
         var failures: [String] = []
         for provider in Provider.allCases {
             for mutation in Mutation.allCases {
-                do {
-                    try verify(provider, mutation)
-                } catch {
-                    failures.append("\(provider) \(mutation): \(error)")
+                for withSibling in mutation == .sustainedAppend ? [false, true] : [false] {
+                    do {
+                        try verify(provider, mutation, withSibling: withSibling)
+                    } catch {
+                        failures.append("\(provider) \(mutation) withSibling=\(withSibling): \(error)")
+                    }
                 }
             }
         }
@@ -42,7 +44,7 @@ struct LiveTokenHistoryChecks {
         print("Concurrent Claude and Codex transcript checks passed.")
     }
 
-    static func verify(_ provider: Provider, _ mutation: Mutation) throws {
+    static func verify(_ provider: Provider, _ mutation: Mutation, withSibling: Bool) throws {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: home) }
         let directory = home.appendingPathComponent(provider == .claude ? "projects" : "sessions")
@@ -52,7 +54,14 @@ struct LiveTokenHistoryChecks {
         let first = provider.row("first", 11)
         let second = provider.row("second", 22)
         let third = provider.row("third", 33)
-        try Data(first.utf8).write(to: log)
+        let sibling: Int64 = withSibling ? 5 : 0
+        if withSibling {
+            try Data(provider.row("stable", 5).utf8).write(to: directory.appendingPathComponent("stable.jsonl"))
+        }
+        // The sibling fixture also exercises Claude's sampled checkpoint for a larger transcript.
+        let padding =
+            withSibling ? "{\"type\":\"user\",\"text\":\"" + String(repeating: "x", count: 64 * 1024) + "\"}\n" : ""
+        try Data((first + padding).utf8).write(to: log)
         let stream = try FileHandle(forWritingTo: log)
         defer { try? stream.close() }
         try stream.seekToEnd()
@@ -60,24 +69,29 @@ struct LiveTokenHistoryChecks {
         var changeAfter = 0
         var writeError: Error?
         var bytesRead = 0
+        var keepGrowing = false
         func readBytes(_ count: Int) {
+            if keepGrowing {
+                do { try stream.write(contentsOf: Data("{\"type\":\"user\"}\n".utf8)) } catch { writeError = error }
+            }
             bytesRead += count
             guard bytesRead >= changeAfter, let action = change else { return }
             change = nil
             do { try action() } catch { writeError = error }
         }
-        func reader() -> (Date) throws -> TokenTotals {
+        func reader(cacheURL: URL?) -> (Date) throws -> TokenTotals {
             switch provider {
             case .claude:
-                return ClaudeTokenHistory(home: home, cacheURL: cache, calendar: .current, didReadBytes: readBytes).read
+                return ClaudeTokenHistory(home: home, cacheURL: cacheURL, calendar: .current, didReadBytes: readBytes)
+                    .read
             case .codex:
-                return TokenHistory(home: home, cacheURL: cache, calendar: .current, didReadBytes: readBytes).read
+                return TokenHistory(home: home, cacheURL: cacheURL, calendar: .current, didReadBytes: readBytes).read
             }
         }
         let now = ISO8601DateFormatter().date(from: "2026-11-18T15:00:00Z")!
-        let read = reader()
+        let read = reader(cacheURL: cache)
         let initial = try read(now)
-        precondition(initial.allTime == 11)
+        precondition(initial.allTime == 11 + sibling && !initial.partial)
         let tail = mutation == .finishFragment ? String(second.dropLast()) : second
         try stream.write(contentsOf: Data(tail.utf8))
         let sampledSize = first.utf8.count + tail.utf8.count
@@ -93,18 +107,21 @@ struct LiveTokenHistoryChecks {
             switch mutation {
             case .append: try stream.write(contentsOf: Data(third.utf8))
             case .finishFragment: try stream.write(contentsOf: Data(("\n" + third).utf8))
-            case .repeatedAppend, .sustainedAppend, .rewriteDuringVerification:
+            case .sustainedAppend:
+                try stream.write(contentsOf: Data(third.utf8))
+                keepGrowing = true
+            case .repeatedAppend, .rewriteDuringVerification, .replaceAtLimit, .removeAtLimit, .rewriteAtLimit:
                 try stream.write(contentsOf: Data(third.utf8))
                 changeAfter = sampledSize * 2
                 change = {
-                    if mutation == .rewriteDuringVerification {
-                        try rewritePrefixAndAppend("fourth")
-                    } else {
-                        try stream.write(contentsOf: Data(provider.row("fourth", 44).utf8))
-                        if mutation == .sustainedAppend {
-                            changeAfter += sampledSize
-                            change = { try stream.write(contentsOf: Data(provider.row("fifth", 55).utf8)) }
-                        }
+                    if mutation == .rewriteDuringVerification { return try rewritePrefixAndAppend("fourth") }
+                    try stream.write(contentsOf: Data(provider.row("fourth", 44).utf8))
+                    changeAfter += sampledSize
+                    switch mutation {
+                    case .replaceAtLimit: change = { try Data(third.utf8).write(to: log, options: .atomic) }
+                    case .removeAtLimit: change = { try FileManager.default.removeItem(at: log) }
+                    case .rewriteAtLimit: change = { try rewritePrefixAndAppend("fifth") }
+                    default: break
                     }
                 }
             case .replace: try Data(third.utf8).write(to: log, options: .atomic)
@@ -122,22 +139,45 @@ struct LiveTokenHistoryChecks {
             let totals = try snapshot.get()
             let sampledTotal: Int64 = mutation == .finishFragment ? 11 : 33
             guard totals.allTime == sampledTotal else { throw Failure(message: "Lost verified prefix: \(totals)") }
-        case .sustainedAppend, .replace, .truncate, .rewriteAndGrow, .rewriteDuringVerification:
+        case .sustainedAppend:
+            let totals = try snapshot.get()
+            guard totals.allTime == initial.allTime, totals.today == initial.today, totals.week == initial.week,
+                totals.month == initial.month, totals.peakDay == initial.peakDay, totals.spend == initial.spend,
+                totals.partial
+            else {
+                throw Failure(message: "Lost the previous checkpoint during sustained appends: \(totals)")
+            }
+            let restarted = try reader(cacheURL: cache)(now)
+            guard restarted == totals else { throw Failure(message: "Lost the on-disk checkpoint: \(restarted)") }
+            let cold = Result { try reader(cacheURL: nil)(now) }
+            keepGrowing = false
+            if let writeError { throw writeError }
+            if withSibling {
+                let totals = try cold.get()
+                guard totals.partial && totals.allTime == sibling else {
+                    throw Failure(message: "Cold scan: \(totals)")
+                }
+            } else if case .success(let totals) = cold {
+                throw Failure(message: "Cold scan accepted an unverified file: \(totals)")
+            }
+        case .replace, .truncate, .rewriteAndGrow, .rewriteDuringVerification, .replaceAtLimit, .removeAtLimit,
+            .rewriteAtLimit:
             if case .success(let totals) = snapshot { throw Failure(message: "Accepted inconsistent file: \(totals)") }
         }
-        let completed = try reader()(now)
+        let completed = try reader(cacheURL: cache)(now)
         let expected: Int64
         switch mutation {
-        case .append, .finishFragment: expected = 66
+        case .append, .finishFragment, .sustainedAppend: expected = 66
         case .repeatedAppend: expected = 110
-        case .sustainedAppend: expected = 165
         case .rewriteDuringVerification: expected = 165
         case .rewriteAndGrow: expected = 132
-        case .replace, .truncate: expected = 33
+        case .replace, .truncate, .replaceAtLimit: expected = 33
+        case .removeAtLimit: expected = 0
+        case .rewriteAtLimit: expected = 209
         }
-        precondition(completed.allTime == expected && !completed.partial)
+        precondition(completed.allTime == expected + sibling && !completed.partial)
         bytesRead = 0
-        let unchanged = try reader()(now)
+        let unchanged = try reader(cacheURL: cache)(now)
         precondition(unchanged == completed && bytesRead == 0)
     }
 }

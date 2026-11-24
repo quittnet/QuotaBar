@@ -20,16 +20,20 @@ struct ClaudeSettingsDocument {
 
     let data: Data
     let object: [String: Any]
+    private let editableData: Data
     private let bytes: [UInt8]
     private let rootStart: Int
 
     init(_ data: Data) throws {
-        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        // Use an empty object for edits while retaining the exact original bytes for restoration.
+        let editableData = data.isEmpty ? Self.empty : data
+        guard let object = try JSONSerialization.jsonObject(with: editableData) as? [String: Any] else {
             throw Failure.unsupported
         }
         self.data = data
         self.object = object
-        bytes = Array(data)
+        self.editableData = editableData
+        bytes = Array(editableData)
         let beginning = bytes.starts(with: [0xef, 0xbb, 0xbf]) ? 3 : 0
         guard let start = bytes[beginning...].firstIndex(where: { !Self.whitespace.contains($0) }), bytes[start] == 123
         else { throw Failure.unsupported }
@@ -104,7 +108,7 @@ struct ClaudeSettingsDocument {
     }
 
     private func replacing(_ range: Range<Int>, with replacement: Data) -> Data {
-        var updated = data
+        var updated = editableData
         updated.replaceSubrange(range, with: replacement)
         return updated
     }
@@ -263,7 +267,7 @@ enum ClaudeSettingsCommit {
             && info.st_gid == identity.st_gid && info.st_flags == identity.st_flags
             && info.st_mtimespec.tv_sec == identity.st_mtimespec.tv_sec
             && info.st_mtimespec.tv_nsec == identity.st_mtimespec.tv_nsec
-            && (bytes.isEmpty ? info.st_size == 0 : (try? PrivateFile.read(url, maximumBytes: bytes.count)) == bytes)
+            && (try? PrivateFile.read(url, maximumBytes: bytes.count)) == bytes
     }
 
     private static func posix() -> POSIXError { POSIXError(.init(rawValue: errno) ?? .EIO) }

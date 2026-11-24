@@ -8,14 +8,6 @@ extension UsageProvider {
         case .claude: return NSColor(srgbRed: 0xd9 / 255.0, green: 0x77 / 255.0, blue: 0x57 / 255.0, alpha: 1)
         }
     }
-
-    // The small native segmented picker draws white text over its selected tint.
-    fileprivate var historyMetricTint: Color {
-        switch self {
-        case .codex: return Color(.sRGB, red: 0x0c / 255.0, green: 0x5d / 255.0, blue: 0xb5 / 255.0)
-        case .claude: return Color(.sRGB, red: 0xb2 / 255.0, green: 0x50 / 255.0, blue: 0x2c / 255.0)
-        }
-    }
 }
 
 struct Dashboard: View {
@@ -355,8 +347,7 @@ struct Dashboard: View {
                 resetSection
             }
 
-            TokenHistoryHeader(showSpend: Binding(get: { showSpend }, set: setShowSpend))
-                .tint(display.provider.historyMetricTint)
+            TokenHistoryHeader(provider: display.provider, showSpend: Binding(get: { showSpend }, set: setShowSpend))
             tokenSection
                 .help(
                     showSpend
@@ -879,7 +870,71 @@ private struct DetailsProviderPicker: NSViewRepresentable {
     }
 }
 
+private struct HistoryMetricPicker: NSViewRepresentable {
+    let provider: UsageProvider
+    @Binding var showSpend: Bool
+    @Environment(\.isEnabled) private var isEnabled
+
+    final class Coordinator: NSObject {
+        var selection: Binding<Bool>
+
+        init(_ selection: Binding<Bool>) { self.selection = selection }
+
+        @MainActor @objc func changed(_ control: NSSegmentedControl) {
+            selection.wrappedValue = control.selectedSegment == 1
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator($showSpend) }
+
+    func makeNSView(context: Context) -> NSSegmentedControl {
+        let control = NSSegmentedControl(
+            labels: ["Tokens", "Spend"], trackingMode: .selectOne,
+            target: context.coordinator, action: #selector(Coordinator.changed(_:)))
+        control.segmentStyle = .rounded
+        control.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        control.segmentDistribution = .fillEqually
+        // Keep the native label-based width when the selected title becomes an image.
+        control.controlSize = .small
+        let width = control.intrinsicContentSize.width / CGFloat(control.segmentCount)
+        for index in 0..<control.segmentCount { control.setWidth(width, forSegment: index) }
+        control.setAccessibilityLabel("History metric")
+        return control
+    }
+
+    func updateNSView(_ control: NSSegmentedControl, context: Context) {
+        context.coordinator.selection = $showSpend
+        control.isEnabled = isEnabled
+        control.selectedSegment = showSpend ? 1 : 0
+        control.selectedSegmentBezelColor = provider.accentColor
+        for (index, title) in ["Tokens", "Spend"].enumerated() {
+            let selected = index == control.selectedSegment
+            control.setLabel(selected ? "" : title, forSegment: index)
+            control.setImage(selected ? Self.selectedTitles[index] : nil, forSegment: index)
+        }
+    }
+
+    // Original artwork keeps the selected title legible while AppKit draws the provider bezel.
+    private static let selectedTitles: [NSImage] = ["Tokens", "Spend"].map { title in
+        let label = NSAttributedString(
+            string: title,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize), .foregroundColor: NSColor.black,
+            ])
+        let image = NSImage(
+            size: NSSize(width: ceil(label.size().width), height: ceil(label.size().height)),
+            flipped: false
+        ) { _ in
+            label.draw(at: .zero)
+            return true
+        }
+        image.accessibilityDescription = title
+        return image
+    }
+}
+
 struct TokenHistoryHeader: View {
+    let provider: UsageProvider
     @Binding var showSpend: Bool
 
     var body: some View {
@@ -887,15 +942,10 @@ struct TokenHistoryHeader: View {
             Text(showSpend ? "Est. spend (USD)" : "Tokens on this Mac")
                 .font(.headline).accessibilityAddTraits(.isHeader)
             Spacer()
-            Picker("History metric", selection: $showSpend) {
-                Text("Tokens").tag(false)
-                Text("Spend").tag(true)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .controlSize(.small)
-            .fixedSize()
-            .help("Choose token counts or estimated spend at standard API rates.")
+            HistoryMetricPicker(provider: provider, showSpend: $showSpend)
+                .controlSize(.small)
+                .fixedSize()
+                .help("Choose token counts or estimated spend at standard API rates.")
         }
     }
 }

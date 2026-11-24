@@ -71,9 +71,10 @@ final class ClaudeTokenHistory {
         var candidates = 0
         var readable = 0
         var rootInfo = stat()
-        guard stat(projects.path, &rootInfo) == 0, (rootInfo.st_mode & S_IFMT) == S_IFDIR,
+        guard let root = resolveTokenHistoryRoot(projects, info: &rootInfo),
+            (rootInfo.st_mode & S_IFMT) == S_IFDIR,
             let entries = FileManager.default.enumerator(
-                at: projects, includingPropertiesForKeys: nil,
+                at: root, includingPropertiesForKeys: nil,
                 errorHandler: { _, _ in
                     partial = true
                     return true
@@ -112,6 +113,11 @@ final class ClaudeTokenHistory {
                     try index.include(key)
                     readable += 1
                     partial = partial || filePartial
+                } catch TokenLogSnapshotError.verifiedPreviousCheckpoint {
+                    // The file savepoint rolled back this scan's samples and retained its old checkpoint.
+                    try index.include(key)
+                    readable += 1
+                    partial = true
                 } catch let error as ClaudeHistoryIndex.Failure {
                     throw error
                 } catch {

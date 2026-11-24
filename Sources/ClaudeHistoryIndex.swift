@@ -93,7 +93,7 @@ final class ClaudeHistoryIndex {
             try execute("RELEASE scan_file")
             return result
         } catch {
-            try? execute("ROLLBACK TO scan_file; RELEASE scan_file")
+            try execute("ROLLBACK TO scan_file; RELEASE scan_file")
             throw error
         }
     }

@@ -7,7 +7,7 @@
 
 **Install on Apple Silicon Macs running macOS 14 or later.** Download **QuotaBar-macOS.zip**, unzip it, move **QuotaBar.app** to Applications, and try opening it once. That first attempt makes the approval option appear if Gatekeeper blocks the app. [Download the latest public Mac build](https://github.com/quittnet/QuotaBar/releases/latest)
 
-**QuotaBar 1.9.0 (41)** adds today’s local token count and estimated API spend beneath each provider’s limits. Choose Tokens, Spend, Both, or Off in **Settings → Daily usage**. In **Details**, switch between tokens and estimated spend for the last seven days and other periods. To update from 1.8.3 (40), open **Settings → Check for Updates…**. To check your installed version in Finder, select QuotaBar.app and press ⌘I.
+**QuotaBar 1.9.1 (42)** fixes local history reads during sustained transcript writes and supports symlinked history folders. Choose Tokens, Spend, Both, or Off in **Settings → Daily usage**. In **Details**, switch between tokens and estimated spend for the last seven days and other periods. To update, open **Settings → Check for Updates…**. To check your installed version in Finder, select QuotaBar.app and press ⌘I.
 
 The downloadable app uses an ad hoc signature and hasn’t been notarized by Apple. If the alert says the app **will damage your computer**, stop and follow Apple’s guidance. [Apple’s guide to opening Mac apps safely](https://support.apple.com/en-us/102445)
 

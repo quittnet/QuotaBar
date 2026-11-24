@@ -16,6 +16,7 @@ struct ClaudeConnectionChecks {
             "#!/bin/sh\nprintf '%s' \"$1\" > " + quote(arguments.path)
                 + "\ncat > " + quote(captured.path) + "\n", to: executable)
 
+        try checkEmptySettings(root: root, executable: executable)
         let fresh = root.appendingPathComponent("fresh ' config $ directory")
         try ClaudeConnection.connect(directory: fresh, executable: executable)
         precondition(ClaudeConnection.isConfigured(directory: fresh))
@@ -132,6 +133,7 @@ struct ClaudeConnectionChecks {
 
         for (name, invalid) in [
             ("malformed", "{invalid"),
+            ("whitespace", " \n"),
             ("array", "[]"),
             ("unsupported", #"{"statusLine":{"type":"other","command":"echo x"}}"#),
             ("missing-command", #"{"statusLine":{"type":"command"}}"#),
@@ -759,6 +761,58 @@ struct ClaudeConnectionChecks {
         try ClaudeConnection.disconnect(directory: kept)
         precondition(!files.fileExists(atPath: kept.appendingPathComponent(".quotabar").path))
         print("Claude standalone uninstaller: restored after app removal, refused unsafe edits, removed by disconnect.")
+    }
+
+    private static func checkEmptySettings(root: URL, executable: URL) throws {
+        let files = FileManager.default
+        let profile = root.appendingPathComponent("empty-settings")
+        let url = profile.appendingPathComponent("settings.json")
+        let backup = profile.appendingPathComponent(".quotabar/previous-settings.json")
+        try files.createDirectory(at: profile, withIntermediateDirectories: false)
+        try check(try PrivateFile.read(url, maximumBytes: 0) == nil)
+        try Data().write(to: url)
+        try check(try PrivateFile.read(url, maximumBytes: 0) == Data())
+        precondition(ClaudeConnection.status(directory: profile, executable: executable) == .notConfigured)
+        try files.setAttributes([.posixPermissions: 0o640], ofItemAtPath: url.path)
+        try ClaudeConnection.connect(directory: profile, executable: executable)
+        precondition(ClaudeConnection.status(directory: profile, executable: executable) == .configured)
+        try check(try Data(contentsOf: backup) == Data())
+        try ClaudeConnection.connect(directory: profile, executable: executable)
+        try ClaudeConnection.disconnect(directory: profile)
+        try check(try Data(contentsOf: url) == Data())
+        try check(try files.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int == 0o640)
+        precondition(!ClaudeConnection.canDisconnect(directory: profile))
+
+        // An editor replacing the empty file during connect keeps its version.
+        let unrelated = Data(#"{"theme":"dark"}"#.utf8)
+        try mustFail {
+            try ClaudeConnection.connect(directory: profile, executable: executable) { stage in
+                if stage == .beforeDisplacing { try unrelated.write(to: url, options: .atomic) }
+            }
+        }
+        try check(try Data(contentsOf: url) == unrelated)
+        precondition(!ClaudeConnection.canDisconnect(directory: profile))
+
+        try Data().write(to: url)
+        try ClaudeConnection.connect(directory: profile, executable: executable)
+        var edited = try settings(profile)
+        edited["theme"] = "dark"
+        try JSONSerialization.data(withJSONObject: edited, options: .sortedKeys).write(to: url)
+        try ClaudeConnection.disconnect(directory: profile)
+        try check(try Data(contentsOf: url) == unrelated)
+
+        try ClaudeConnection.connect(directory: profile, executable: executable)
+        let invalid = Data(" \n".utf8)
+        try invalid.write(to: url)
+        try mustFail { try ClaudeConnection.disconnect(directory: profile) }
+        try check(try Data(contentsOf: url) == invalid)
+        precondition(ClaudeConnection.canDisconnect(directory: profile))
+        try Data().write(to: url)
+        precondition(ClaudeConnection.status(directory: profile, executable: executable) == .notConfigured)
+        try ClaudeConnection.disconnect(directory: profile)
+        try check(try Data(contentsOf: url) == Data())
+        precondition(!ClaudeConnection.canDisconnect(directory: profile))
+        print("Claude empty settings: exact restoration, later edits and truncation, and concurrent replacement.")
     }
 
     private static func checkUndoAndMetadata(root: URL, executable: URL) throws {

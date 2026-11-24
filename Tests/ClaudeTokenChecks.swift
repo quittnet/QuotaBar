@@ -160,10 +160,57 @@ struct ClaudeTokenChecks {
         try expect(history, now: now, all: 8, month: 8, week: 8, today: 8)
         try checkCacheRecovery(home: home, calendar: calendar, now: now)
         try checkLockedCache(home: home, calendar: calendar, now: now)
+        try checkLinkedProjects(home: home.appendingPathComponent("linked-projects"), calendar: calendar, now: now)
         try checkSpend(home: home.appendingPathComponent("spend"), calendar: calendar, now: now)
         try checkForkPrices(home: home.appendingPathComponent("fork-prices"), calendar: calendar, now: now)
         try checkIterationsAndRefusals(home: home.appendingPathComponent("iterations"), calendar: calendar, now: now)
         print("Claude Code token history checks passed.")
+    }
+
+    private static func checkLinkedProjects(home: URL, calendar: Calendar, now: Date) throws {
+        let fm = FileManager.default
+        let projects = home.appendingPathComponent("projects")
+        let project = projects.appendingPathComponent("example")
+        let outside = home.appendingPathComponent("outside")
+        try fm.createDirectory(at: project, withIntermediateDirectories: true)
+        try fm.createDirectory(at: outside, withIntermediateDirectories: true)
+        let timestamp = "2026-11-18T07:00:00Z"
+        try write([response(timestamp, id: "kept", output: 17)], to: project.appendingPathComponent("session.jsonl"))
+        let outsideLog = outside.appendingPathComponent("ignored.jsonl")
+        try write([response(timestamp, id: "ignored", output: 101)], to: outsideLog)
+        try fm.createSymbolicLink(at: project.appendingPathComponent("ignored.jsonl"), withDestinationURL: outsideLog)
+        try fm.createSymbolicLink(at: projects.appendingPathComponent("ignored-directory"), withDestinationURL: outside)
+
+        var bytesRead = 0
+        let cache = home.appendingPathComponent("history.sqlite")
+        func reader() -> ClaudeTokenHistory {
+            ClaudeTokenHistory(home: home, cacheURL: cache, calendar: calendar) { bytesRead += $0 }
+        }
+        let directReader = reader()
+        try expect(directReader, now: now, all: 18, month: 18, week: 18, today: 18)
+        let direct = try directReader.read(now: now)
+        bytesRead = 0
+        let reused = try reader().read(now: now)
+        precondition(reused == direct && bytesRead == 0, "Ordinary roots must reuse their saved checkpoints")
+
+        let movedProjects = home.appendingPathComponent("relocated-projects")
+        try fm.moveItem(at: projects, to: movedProjects)
+        try fm.createSymbolicLink(atPath: projects.path, withDestinationPath: movedProjects.lastPathComponent)
+        let linkedReader = reader()
+        let linked = try linkedReader.read(now: now)
+        precondition(linked == direct, "A linked projects root must match an ordinary root")
+        bytesRead = 0
+        let linkedCached = try reader().read(now: now)
+        precondition(linkedCached == linked && bytesRead == 0, "Linked projects must reuse saved checkpoints")
+
+        let replacement = home.appendingPathComponent("replacement-projects")
+        let replacementProject = replacement.appendingPathComponent("example")
+        try fm.createDirectory(at: replacementProject, withIntermediateDirectories: true)
+        let replacementLog = replacementProject.appendingPathComponent("session.jsonl")
+        try write([response(timestamp, id: "kept", output: 59)], to: replacementLog)
+        try fm.removeItem(at: projects)
+        try fm.createSymbolicLink(at: projects, withDestinationURL: replacement)
+        try expect(linkedReader, now: now, all: 60, month: 60, week: 60, today: 60)
     }
 
     private static func checkSpend(home: URL, calendar: Calendar, now: Date) throws {

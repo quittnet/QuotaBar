@@ -121,6 +121,8 @@ struct ClaudeQuotaChecks {
         }
         try capture(#"{"rate_limits":{"five_hour":{"used_percentage":41,"resets_at":1800000800000}}}"#, after: 620)
         precondition(reading(after: 625) == nil)
+        try Data().write(to: file)
+        checkReadFailure(file)
         try Data("corrupt cache".utf8).write(to: file)
         checkReadFailure(file)
         checkReadFailure(directory)
