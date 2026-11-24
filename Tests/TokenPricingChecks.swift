@@ -73,6 +73,24 @@ enum TokenPricingChecks {
         precondition(spend.month.partial && !spend.week.partial && spend.allTime.usd == 3)
         spend.record(2, tokens: 1, date: nil, now: now, days: days)
         precondition(spend.allTime.usd == 5 && spend.today.partial && spend.yesterday.partial)
+        // Possible dates that span all of yesterday leave yesterday incomplete rather than exact.
+        var spanning = TokenSpendTotals()
+        spanning.record(
+            4, tokens: 1, date: days.yesterday.addingTimeInterval(-3_600),
+            latestDate: days.today.addingTimeInterval(60), now: now, days: days)
+        precondition(spanning.yesterday.partial && !spanning.yesterday.hasPricedUsage && spanning.today.partial)
+        var inside = TokenSpendTotals()
+        inside.record(
+            4, tokens: 1, date: days.yesterday.addingTimeInterval(60),
+            latestDate: days.today.addingTimeInterval(-60), now: now, days: days)
+        precondition(inside.yesterday.usd == 4 && !inside.yesterday.partial)
+        // The same ambiguity is reported for the peak day instead of being dropped silently.
+        var daily = TokenDailyUsage(calendar: calendar)
+        var dailyPartial = false
+        daily.add(
+            7, on: days.yesterday.addingTimeInterval(60), latestDate: days.today.addingTimeInterval(60),
+            partial: &dailyPartial)
+        precondition(dailyPartial && daily.peak == nil)
         print("Standard API rates, cache-write and long-input boundaries, partial estimates and USD display passed.")
     }
 }

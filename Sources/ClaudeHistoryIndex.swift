@@ -11,6 +11,15 @@ final class ClaudeHistoryIndex {
             let primaryCode = code & 0xff
             return primaryCode == SQLITE_BUSY || primaryCode == SQLITE_LOCKED
         }
+
+        /// A failure that may clear without the database being damaged, such as a full or read-only disk.
+        var isTransient: Bool {
+            let primaryCode = code & 0xff
+            return [
+                SQLITE_PERM, SQLITE_NOMEM, SQLITE_READONLY, SQLITE_INTERRUPT, SQLITE_IOERR, SQLITE_FULL,
+                SQLITE_CANTOPEN, SQLITE_PROTOCOL,
+            ].contains(primaryCode)
+        }
     }
 
     private let database: OpaquePointer

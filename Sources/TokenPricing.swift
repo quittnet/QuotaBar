@@ -53,11 +53,10 @@ struct TokenSpendTotals: Sendable, Equatable {
         if date >= days.month { month.add(usd) } else if latest >= days.month { month.partial = true }
         if date >= days.week { week.add(usd) } else if latest >= days.week { week.partial = true }
         if date >= days.today { today.add(usd) } else if latest >= days.today { today.partial = true }
-        let firstYesterday = (days.yesterday..<days.today).contains(date)
-        let lastYesterday = (days.yesterday..<days.today).contains(latest)
-        if firstYesterday && lastYesterday {
+        if date >= days.yesterday && latest < days.today {
             yesterday.add(usd)
-        } else if firstYesterday || lastYesterday {
+        } else if date < days.today && latest >= days.yesterday {
+            // The possible dates overlap yesterday without both falling inside it.
             yesterday.partial = true
         }
     }

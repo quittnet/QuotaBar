@@ -23,6 +23,9 @@ final class ClaudeTokenHistory {
     private var cacheLocations: [URL]
     private let didReadBytes: ((Int) -> Void)?
     private var index: ClaudeHistoryIndex?
+    // After a transient disk failure the reader counts in memory until this time, then retries the cache.
+    private var diskRetryAt: Date?
+    private static let diskRetryInterval: TimeInterval = 15 * 60
 
     convenience init(profile home: URL = ClaudeProfile.directory) {
         self.init(home: home, cacheURL: Self.cacheFile(for: home))
@@ -50,8 +53,12 @@ final class ClaudeTokenHistory {
 
     func read(now: Date = Date()) throws -> TokenTotals {
         if !cacheLocations.isEmpty, index?.needsReopening == true { index = nil }
+        if let retry = diskRetryAt, now >= retry || now < retry - Self.diskRetryInterval {
+            index = nil
+            diskRetryAt = nil
+        }
         while true {
-            let url = cacheLocations.first
+            let url = diskRetryAt == nil ? cacheLocations.first : nil
             do {
                 let current = try index ?? ClaudeHistoryIndex(url: url)
                 index = current
@@ -61,6 +68,11 @@ final class ClaudeTokenHistory {
             } catch {
                 guard url != nil, index == nil || error is ClaudeHistoryIndex.Failure else { throw error }
                 index = nil
+                if let failure = error as? ClaudeHistoryIndex.Failure, failure.isTransient {
+                    // Keep this location. Count in memory for now and try the disk cache again later.
+                    diskRetryAt = now.addingTimeInterval(Self.diskRetryInterval)
+                    continue
+                }
                 cacheLocations.removeFirst()
             }
         }

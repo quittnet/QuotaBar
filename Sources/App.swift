@@ -986,6 +986,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if obsolete || state.tokenRefreshPending || (profileChanged && !retryingProfile) {
                 state.tokenRefreshPending = false
                 refreshTokens(source: source, retryingProfile: profileChanged)
+            } else if profileChanged {
+                // The retry also saw the profile change. Say so until the next scheduled scan.
+                state.tokenFailure =
+                    "\(source.name)’s profile changed during refresh. QuotaBar will check again shortly."
             }
             if provider == source || dropdown?.isVisible == true { updateViews() }
         }

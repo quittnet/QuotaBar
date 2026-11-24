@@ -159,6 +159,7 @@ struct ClaudeTokenChecks {
         try append(padding + "\n", to: parent)
         try expect(history, now: now, all: 8, month: 8, week: 8, today: 8)
         try checkCacheRecovery(home: home, calendar: calendar, now: now)
+        try checkTransientCacheFailure(home: home, calendar: calendar, now: now)
         try checkLockedCache(home: home, calendar: calendar, now: now)
         try checkLinkedProjects(home: home.appendingPathComponent("linked-projects"), calendar: calendar, now: now)
         try checkSpend(home: home.appendingPathComponent("spend"), calendar: calendar, now: now)
@@ -547,6 +548,31 @@ struct ClaudeTokenChecks {
         try expect(reader(), now: now, all: 8, month: 8, week: 8, today: 8)
         precondition(bytesRead == 0, "An atomically replaced index must be available after restart")
         precondition(!FileManager.default.fileExists(atPath: cache.appendingPathExtension("rebuilt").path))
+    }
+
+    private static func checkTransientCacheFailure(home: URL, calendar: Calendar, now: Date) throws {
+        let cache = home.appendingPathComponent("transient.sqlite")
+        var bytesRead = 0
+        func reader() -> ClaudeTokenHistory {
+            ClaudeTokenHistory(home: home, cacheURL: cache, calendar: calendar, didReadBytes: { bytesRead += $0 })
+        }
+        try expect(reader(), now: now, all: 8, month: 8, week: 8, today: 8)
+        // A read-only cache stands in for a full or failing disk. It must not be abandoned.
+        precondition(chmod(cache.path, 0o400) == 0)
+        let blocked = reader()
+        bytesRead = 0
+        try expect(blocked, now: now, all: 8, month: 8, week: 8, today: 8)
+        precondition(bytesRead > 0, "A transient cache failure should count in memory")
+        precondition(
+            !FileManager.default.fileExists(atPath: cache.appendingPathExtension("rebuilt").path),
+            "A transient cache failure must keep the main cache location")
+        bytesRead = 0
+        try expect(blocked, now: now.addingTimeInterval(60), all: 8, month: 8, week: 8, today: 8)
+        precondition(bytesRead == 0, "The in-memory index should be reused until the retry time")
+        precondition(chmod(cache.path, 0o600) == 0)
+        try expect(blocked, now: now.addingTimeInterval(16 * 60), all: 8, month: 8, week: 8, today: 8)
+        precondition(bytesRead == 0, "After the retry time the reader should return to the cached index")
+        try FileManager.default.removeItem(at: cache)
     }
 
     private static func checkCacheRecovery(home: URL, calendar: Calendar, now: Date) throws {

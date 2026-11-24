@@ -45,7 +45,10 @@ struct TokenDailyUsage {
             intervals[key, default: []].append(day)
             interval = day
         }
-        if let latestDate, latestDate >= interval.end { return }
+        if let latestDate, latestDate >= interval.end {
+            partial = true
+            return
+        }
         totals[interval.start] = cappedSum(totals[interval.start, default: 0], tokens, partial: &partial)
     }
 
@@ -776,12 +779,25 @@ final class TokenHistory {
                 continue
             }
             daily.add(entry.tokens, on: date, latestDate: entry.latestDate, partial: &partial)
-            if date >= days.month { monthTokens = cappedSum(monthTokens, entry.tokens, partial: &partial) }
-            if date >= days.week { weekTokens = cappedSum(weekTokens, entry.tokens, partial: &partial) }
+            // A reverse match can place a response on either side of a period start. Count it only where
+            // both possible dates agree, and mark the history partial where they differ.
+            let latest = entry.latestDate ?? date
+            if date >= days.month {
+                monthTokens = cappedSum(monthTokens, entry.tokens, partial: &partial)
+            } else if latest >= days.month {
+                partial = true
+            }
+            if date >= days.week {
+                weekTokens = cappedSum(weekTokens, entry.tokens, partial: &partial)
+            } else if latest >= days.week {
+                partial = true
+            }
             if date >= days.today {
                 todayTokens = cappedSum(todayTokens, entry.tokens, partial: &partial)
-            } else if date >= days.yesterday, (entry.latestDate ?? date) < days.today {
+            } else if date >= days.yesterday, latest < days.today {
                 yesterdayTokens = cappedSum(yesterdayTokens, entry.tokens, partial: &partial)
+            } else if latest >= days.yesterday {
+                partial = true
             }
         }
         return TokenTotals(

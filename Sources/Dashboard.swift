@@ -352,7 +352,7 @@ struct Dashboard: View {
                 .help(
                     showSpend
                         ? "Estimated USD at standard API token rates for local \(display.provider.name) history. Excludes subscription charges and tool fees."
-                        : "Includes input and output tokens recorded in local \(display.provider.name) history. Day boundaries use your Mac’s time zone."
+                        : "Includes input, output and cached tokens recorded in local \(display.provider.name) history. Day boundaries use your Mac’s time zone."
                 )
         }
     }
@@ -891,13 +891,9 @@ private struct HistoryMetricPicker: NSViewRepresentable {
         let control = NSSegmentedControl(
             labels: ["Tokens", "Spend"], trackingMode: .selectOne,
             target: context.coordinator, action: #selector(Coordinator.changed(_:)))
+        // Match DetailsProviderPicker: native size, font and selected-title color.
         control.segmentStyle = .rounded
-        control.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         control.segmentDistribution = .fillEqually
-        // Keep the native label-based width when the selected title becomes an image.
-        control.controlSize = .small
-        let width = control.intrinsicContentSize.width / CGFloat(control.segmentCount)
-        for index in 0..<control.segmentCount { control.setWidth(width, forSegment: index) }
         control.setAccessibilityLabel("History metric")
         return control
     }
@@ -907,29 +903,6 @@ private struct HistoryMetricPicker: NSViewRepresentable {
         control.isEnabled = isEnabled
         control.selectedSegment = showSpend ? 1 : 0
         control.selectedSegmentBezelColor = provider.accentColor
-        for (index, title) in ["Tokens", "Spend"].enumerated() {
-            let selected = index == control.selectedSegment
-            control.setLabel(selected ? "" : title, forSegment: index)
-            control.setImage(selected ? Self.selectedTitles[index] : nil, forSegment: index)
-        }
-    }
-
-    // Original artwork keeps the selected title legible while AppKit draws the provider bezel.
-    private static let selectedTitles: [NSImage] = ["Tokens", "Spend"].map { title in
-        let label = NSAttributedString(
-            string: title,
-            attributes: [
-                .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize), .foregroundColor: NSColor.black,
-            ])
-        let image = NSImage(
-            size: NSSize(width: ceil(label.size().width), height: ceil(label.size().height)),
-            flipped: false
-        ) { _ in
-            label.draw(at: .zero)
-            return true
-        }
-        image.accessibilityDescription = title
-        return image
     }
 }
 
@@ -943,7 +916,6 @@ struct TokenHistoryHeader: View {
                 .font(.headline).accessibilityAddTraits(.isHeader)
             Spacer()
             HistoryMetricPicker(provider: provider, showSpend: $showSpend)
-                .controlSize(.small)
                 .fixedSize()
                 .help("Choose token counts or estimated spend at standard API rates.")
         }
