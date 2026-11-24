@@ -7,7 +7,8 @@ mkdir -p "${output_dir}"
 output_dir=$(cd "${output_dir}" && pwd)
 stage=$(mktemp -d "${output_dir}/.quotabar-build.XXXXXX")
 sparkle=
-trap 'rm -r "${stage}"; if [ -n "${sparkle}" ]; then rm -r "${sparkle}"; fi' EXIT HUP INT TERM
+trap 'rm -r "${stage}"; if [ -n "${sparkle}" ]; then rm -r "${sparkle}"; fi' EXIT
+trap 'exit 1' HUP INT TERM
 app="${stage}/QuotaBar.app"
 mkdir -p "${app}/Contents/MacOS" "${app}/Contents/Helpers" "${app}/Contents/Resources/ProviderLogos"
 sign_identity=${QUOTABAR_SIGN_IDENTITY:--}
@@ -30,7 +31,7 @@ if [ "${key_bytes}" != 32 ]; then
 fi
 sparkle=$(./fetch-sparkle.sh)
 set --
-while IFS= read -r file; do
+while IFS= read -r file || [ -n "${file}" ]; do
     case "${file}" in
         Sources/*.swift) set -- "$@" "${file}" ;;
         *) ;;
@@ -58,10 +59,4 @@ plutil -insert SUVerifyUpdateBeforeExtraction -bool YES "${plist}"
 plutil -insert SURequireSignedFeed -bool YES "${plist}"
 plutil -insert SUSignedFeedFailureExpirationInterval -integer 0 "${plist}"
 ./sign-quotabar.sh "${app}" "${stage}" "${sign_identity}"
-destination="${output_dir}/QuotaBar.app"
-if [ -e "${destination}" ] || [ -L "${destination}" ]; then
-    backup=$(mktemp -d "${output_dir}/QuotaBar-previous.XXXXXX")
-    mv "${destination}" "${backup}/QuotaBar.app"
-    printf 'Previous bundle preserved at %s\n' "${backup}/QuotaBar.app"
-fi
-mv "${app}" "${destination}"
+python3 Helpers/PublishArchives.py bundle "${output_dir}" "${stage}"

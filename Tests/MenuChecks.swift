@@ -24,7 +24,8 @@ private final class ClaudeFixture: @unchecked Sendable {
         let now = Date()
         lock.withLock {
             reading = QuotaReading(
-                fetchedAt: now,
+                // Give each provider a distinct report time in the expanded footer.
+                fetchedAt: now.addingTimeInterval(-75),
                 windows: [
                     QuotaWindow(minutes: 300, remaining: 84, resetsAt: now.addingTimeInterval(7200)),
                     QuotaWindow(minutes: 10080, remaining: 52, resetsAt: now.addingTimeInterval(86400)),
@@ -35,13 +36,21 @@ private final class ClaudeFixture: @unchecked Sendable {
 
 private final class FixtureReads: @unchecked Sendable {
     private let lock = NSLock()
+    let responses = DispatchGroup()
     private var counts: [UsageProvider: Int] = [:]
 
     func record(_ provider: UsageProvider) {
         lock.withLock { counts[provider, default: 0] += 1 }
+        precondition(responses.wait(timeout: .now() + 60) == .success, "The refresh burst did not finish.")
     }
 
     func count(_ provider: UsageProvider) -> Int { lock.withLock { counts[provider, default: 0] } }
+
+    func holdResponses(during actions: () -> Void) {
+        responses.enter()
+        defer { responses.leave() }
+        actions()
+    }
 }
 
 // Run in a logged-in macOS session. Only this temporary test app's own views are inspected.
@@ -54,8 +63,12 @@ enum MenuChecks {
         case checkingUnavailableSecondaryClick
         case checkingPostedCodexClick
         case checkingCombinedUpdated
+        case pickingCodexDetails
         case checkingBothDetails
+        case checkingReopenedDetails(UsageProvider, afterBadgeDismissal: Bool)
+        case checkingOppositeBadgeClosed(UsageProvider)
         case checkingBothClaudeDetails
+        case checkingRefreshDoubleClick
         case checkingCombinedPrimaryOpened(QuotaDisplay)
         case checkingCombinedUsed(QuotaDisplay)
         case checkingCombinedPrimaryClosed(QuotaDisplay)
@@ -73,6 +86,7 @@ enum MenuChecks {
         case waitingForClaude
         case checkingClaudeQuota
         case inspecting
+        case checkingAnchorAfterLayout
         case checkingDetailsClick(NSRect)
         case checkingSettingsOpened(NSPanel)
         case checkingSettingsPreference(NSPanel, PercentageMode)
@@ -87,6 +101,8 @@ enum MenuChecks {
         case checkingUsagePanel
         case checkingConfirmationFrame(NSRect)
         case waitingForRefresh(Date)
+        case waitingToConfirmReset
+        case waitingForOfflineReset
         case waitingForMock
         case startingStress
         case waitingForStress(Int, Int, Date)
@@ -106,10 +122,13 @@ enum MenuChecks {
         precondition(!stress || useFixtures, "UI stress requires isolated provider fixtures.")
         if stress { setbuf(stdout, nil) }
         defer { preferences.removePersistentDomain(forName: suite) }
+        let initialProvider = UsageProvider.detected(defaults: preferences).first ?? .codex
+        precondition(AppDelegate(defaults: preferences).provider == initialProvider)
         // Launch with Claude selected so the initial Codex reading must load in the background.
         preferences.set(UsageProvider.claude.rawValue, forKey: "selectedProvider")
+        let resetStore = UsageResets(file: scratch.appendingPathComponent("pending.json"))
         let controller = AppDelegate(
-            resetStore: UsageResets(file: scratch.appendingPathComponent("pending.json")),
+            resetStore: resetStore,
             defaults: preferences,
             monitorNetwork: false,
             readCodex: { includeCountOnlyIdentity in
@@ -145,6 +164,7 @@ enum MenuChecks {
         let deadline = Date().addingTimeInterval(300)
         var step = Step.startingCombined
         var checkedBothDetails = false
+        let refreshDoubleClick = DispatchGroup()
         _ = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
             MainActor.assumeIsolated {
                 let preferences = UserDefaults(suiteName: suite)!
@@ -159,6 +179,9 @@ enum MenuChecks {
                         "The provider refresh burst did not settle within ten seconds.")
                 }
                 if case .startingCombined = step {
+                    precondition(
+                        !controller.dropdown.isVisible && !controller.dashboard.rootView.isPresented,
+                        "A new process must keep its dashboard inactive until the first open.")
                     precondition(controller.provider == .claude)
                     if initialLayout == .percentage {
                         precondition(button.image == nil && button.title == "–%")
@@ -225,6 +248,10 @@ enum MenuChecks {
                     checkSummaryProviders(controller, expected: [.codex, .claude])
                     if !checkedBothDetails {
                         checkBothSummaries(controller, detailsVisible: false)
+                        if useFixtures {
+                            checkProviderAccessibility(in: controller.dropdown)
+                            checkHistoryAccessibility()
+                        }
                         if let path = CommandLine.arguments.dropFirst(5).first,
                             let content = controller.dropdown.contentView
                         {
@@ -232,7 +259,8 @@ enum MenuChecks {
                         }
                         checkedBothDetails = true
                         controller.dashboard.rootView.setDetailsExpanded(true)
-                        step = .checkingBothDetails
+                        controller.dashboard.rootView.selectProvider(.claude)
+                        step = .pickingCodexDetails
                         return
                     }
                     let badgeImage = button.image
@@ -258,35 +286,98 @@ enum MenuChecks {
                     step = .checkingCombinedPrimaryOpened(original)
                     return
                 }
+                if case .pickingCodexDetails = step {
+                    clickDetailsProvider(.codex, in: controller.dropdown, app: app)
+                    step = .checkingBothDetails
+                    return
+                }
                 if case .checkingBothDetails = step {
-                    guard !controller.dashboard.rootView.countingTokens else { return }
+                    let view = controller.dashboard.rootView
+                    guard !view.countingTokens, !view.display.refreshing else { return }
                     checkBothSummaries(controller, detailsVisible: true)
                     precondition(controller.dashboard.rootView.display.provider == .codex)
-                    if useFixtures { precondition(controller.dashboard.rootView.canUseReset) }
+                    if useFixtures {
+                        precondition(view.canUseReset)
+                        checkReportFooter(view.display, in: controller.dropdown)
+                    }
                     if let path = CommandLine.arguments.dropFirst(6).first,
                         let content = controller.dropdown.contentView
                     {
                         capture(content, at: path)
                     }
-                    controller.dashboard.rootView.selectProvider(.claude)
-                    step = .checkingBothClaudeDetails
+                    sendOutsideClick(in: app)
+                    precondition(!controller.dropdown.isVisible && !controller.dashboard.rootView.isPresented)
+                    postCombinedClick(.claude, button: button, app: app)
+                    step = .checkingReopenedDetails(.codex, afterBadgeDismissal: false)
+                    return
+                }
+                if case .checkingRefreshDoubleClick = step {
+                    guard refreshDoubleClick.wait(timeout: .now()) == .success else { return }
+                    sendKey("\u{1b}", code: 53, to: controller.dropdown, in: app)
+                    precondition(!controller.dropdown.isVisible && !controller.dashboard.rootView.isPresented)
+                    postCombinedClick(.codex, button: button, app: app)
+                    step = .checkingReopenedDetails(.claude, afterBadgeDismissal: false)
                     return
                 }
                 if case .checkingBothClaudeDetails = step {
-                    guard !controller.dashboard.rootView.countingTokens else { return }
+                    let view = controller.dashboard.rootView
+                    guard !view.countingTokens, !view.display.refreshing else { return }
                     checkBothSummaries(controller, detailsVisible: true)
                     precondition(controller.dashboard.rootView.display.provider == .claude)
                     precondition(!controller.dashboard.rootView.canUseReset)
+                    if useFixtures { checkReportFooter(view.display, in: controller.dropdown) }
                     precondition(controller.dashboard.rootView.display.limitingWindow?.remaining == 52)
                     if let path = CommandLine.arguments.dropFirst(7).first,
                         let content = controller.dropdown.contentView
                     {
                         capture(content, at: path)
                     }
-                    controller.dashboard.rootView.selectProvider(.codex)
+                    step = .checkingRefreshDoubleClick
+                    if useFixtures {
+                        refreshDoubleClick.enter()
+                        Task { @MainActor in
+                            await checkRefreshDoubleClick(controller, button: button, reads: reads, app: app)
+                            refreshDoubleClick.leave()
+                        }
+                    }
+                    return
+                }
+                if case .checkingOppositeBadgeClosed(let expected) = step {
+                    precondition(!controller.dropdown.isVisible && !controller.dashboard.rootView.isPresented)
+                    precondition(controller.provider == expected)
+                    postCombinedClick(expected == .codex ? .claude : .codex, button: button, app: app)
+                    step = .checkingReopenedDetails(expected, afterBadgeDismissal: true)
+                    return
+                }
+                if case .checkingReopenedDetails(let expected, let afterBadgeDismissal) = step {
+                    let view = controller.dashboard.rootView
+                    precondition(controller.dropdown.isVisible && view.isPresented && view.detailsExpanded)
+                    precondition(
+                        view.display.provider == expected,
+                        "Reopened expanded Details expected \(expected.name), displayed \(view.display.provider.name).")
+                    let picker = detailsProviderPicker(in: controller.dropdown)
+                    precondition(picker.label(forSegment: picker.selectedSegment) == expected.name)
+                    guard !view.countingTokens, !view.display.refreshing,
+                        let summary = view.summaries.first(where: { $0.display.provider == expected })
+                    else { return }
+                    precondition(view.display.windows == summary.display.windows && view.tokens == summary.tokens)
+                    if useFixtures { precondition(view.canUseReset == (expected == .codex)) }
+                    let restored = AppDelegate(defaults: preferences)
+                    precondition(restored.detailsExpanded && restored.provider == expected)
+                    if !afterBadgeDismissal {
+                        postCombinedClick(expected == .codex ? .claude : .codex, button: button, app: app)
+                        step = .checkingOppositeBadgeClosed(expected)
+                        return
+                    }
+                    if expected == .codex {
+                        clickDetailsProvider(.claude, in: controller.dropdown, app: app)
+                        step = .checkingBothClaudeDetails
+                        return
+                    }
+                    view.selectProvider(.codex)
                     controller.dashboard.rootView.setDetailsExpanded(false)
                     print(
-                        "Both provider limits stayed above Details while the details selector switched tokens and resets."
+                        "Expanded Codex and Claude Details each reopened on their selected provider after an opposite-badge click."
                     )
                     step = .checkingCombinedUpdated
                     return
@@ -458,7 +549,8 @@ enum MenuChecks {
                     return
                 }
                 switch step {
-                case .waitingForStress, .checkingSettingsPreference, .checkingHelpOpened, .checkingHelpBack,
+                case .checkingAnchorAfterLayout, .waitingForStress, .checkingSettingsPreference, .checkingHelpOpened,
+                    .checkingHelpBack,
                     .checkingHelpEscape, .checkingHelpEscapeReturn, .checkingSettingsBack, .checkingSettingsEscape,
                     .checkingSettingsEscapeReturn, .checkingSettingsDismissal, .checkingUsagePanel:
                     // Changing the settings picker temporarily adds "left" or "used" to the status title.
@@ -475,7 +567,7 @@ enum MenuChecks {
                     let host = controller.dashboard!
                     host.rootView.selectProvider(.claude)
                     host.rootView.selectProvider(.codex)
-                    precondition(button.toolTip?.contains("Codex") == true)
+                    precondition(button.accessibilityLabel()?.contains("Codex") == true)
                     host.rootView.selectProvider(.claude)
                     step = .waitingForClaude
                     return
@@ -486,7 +578,7 @@ enum MenuChecks {
                     precondition(view.display.provider == .claude && button.title == "–%")
                     precondition(view.failure == nil && !view.canUseReset && view.resetNotice == nil)
                     precondition(
-                        button.toolTip?.contains("Claude") == true
+                        button.accessibilityLabel()?.contains("Claude") == true
                             && preferences.string(forKey: "selectedProvider") == "claude")
                     precondition(AppDelegate(defaults: preferences).provider == .claude)
                     view.prepareReset()
@@ -516,7 +608,7 @@ enum MenuChecks {
                     guard !view.display.refreshing, !view.countingTokens else { return }
                     precondition(view.display.windows.count == 2 && button.title == "84%")
                     precondition(view.display.windows.first { $0.minutes == 10_080 }?.remaining == 52)
-                    precondition(button.toolTip?.contains("Claude · 5-hour limit, 84%") == true)
+                    precondition(button.accessibilityLabel()?.contains("Claude · 5-hour limit, 84%") == true)
                     checkContentFits(controller.dashboard, in: controller.dropdown)
                     precondition(!view.detailsExpanded)
                     view.setDetailsExpanded(true)
@@ -525,7 +617,7 @@ enum MenuChecks {
                     precondition(AppDelegate(defaults: preferences).detailsExpanded)
                     controller.dashboard.rootView.setDetailsExpanded(false)
                     precondition(preferences.string(forKey: "selectedProvider") == "codex")
-                    precondition(button.toolTip?.contains("Codex") == true)
+                    precondition(button.accessibilityLabel()?.contains("Codex") == true)
                     print(
                         "Provider switching, preference restoration, empty Claude state, fixture quota and reset isolation passed."
                     )
@@ -547,7 +639,8 @@ enum MenuChecks {
                 switch step {
                 case .startingCombined, .checkingCombinedEmpty, .checkingUnavailableClick,
                     .checkingUnavailableSecondaryClick, .checkingPostedCodexClick,
-                    .checkingCombinedUpdated, .checkingBothDetails, .checkingBothClaudeDetails,
+                    .checkingCombinedUpdated, .pickingCodexDetails, .checkingBothDetails, .checkingBothClaudeDetails,
+                    .checkingRefreshDoubleClick, .checkingReopenedDetails, .checkingOppositeBadgeClosed,
                     .checkingCombinedPrimaryOpened, .checkingCombinedUsed,
                     .checkingCombinedPrimaryClosed,
                     .checkingCombinedRemainingClosed, .checkingPostedClaudeClick, .waitingForLogo,
@@ -557,10 +650,19 @@ enum MenuChecks {
                     .waitingForModeFeedbackExpiry, .opening,
                     .waitingForClaude, .checkingClaudeQuota:
                     preconditionFailure("The live check has not opened the dropdown.")
-                case .inspecting:
+                case .inspecting, .checkingAnchorAfterLayout:
                     guard host.rootView.display.reading != nil, !host.rootView.display.refreshing,
                         !host.rootView.countingTokens
                     else { return }
+                    if case .inspecting = step, useFixtures {
+                        host.rootView.selectLayout(.logo)
+                        step = .checkingAnchorAfterLayout
+                        return
+                    }
+                    if case .checkingAnchorAfterLayout = step {
+                        checkPanelAnchor(dropdown, under: button)
+                        host.rootView.selectLayout(.percentage)
+                    }
                     precondition(
                         !dropdown.styleMask.contains(.titled) && dropdown.styleMask.contains(.nonactivatingPanel))
                     precondition(!host.rootView.detailsExpanded)
@@ -573,7 +675,7 @@ enum MenuChecks {
                 case .checkingDetailsClick(let compactFrame):
                     guard !host.rootView.display.refreshing, !host.rootView.countingTokens else { return }
                     precondition(host.rootView.detailsExpanded)
-                    checkDisclosureSizing(host, compact: compactFrame, in: dropdown)
+                    checkDisclosureSizing(host, compact: compactFrame, in: dropdown, under: button)
                     precondition(AppDelegate(defaults: preferences).detailsExpanded)
 
                     if let path = CommandLine.arguments.dropFirst().first {
@@ -592,8 +694,8 @@ enum MenuChecks {
                 case .checkingSettingsOpened(let originalPanel):
                     precondition(dropdown === originalPanel && host.rootView.page == .settings)
                     precondition(content.subviews.contains { $0 is NSHostingView<AnyView> && $0.isHidden })
-                    host.view.layoutSubtreeIfNeeded()
-                    let settingsViews = descendants(of: host.view)
+                    checkSettingsPresentation(host, in: dropdown)
+                    let settingsViews = descendants(of: content)
                     precondition(
                         !settingsViews.contains { $0 is NSScrollView }, "Settings should fit without scrolling.")
                     let originalMode = controller.percentageMode
@@ -625,12 +727,13 @@ enum MenuChecks {
                     return
                 case .checkingHelpBack(let originalPanel):
                     precondition(dropdown === originalPanel && host.rootView.page == .settings)
+                    checkSettingsPresentation(host, in: dropdown)
                     clickHelp(in: dropdown, app: app)
                     step = .checkingHelpEscape(originalPanel)
                     return
                 case .checkingHelpEscape(let originalPanel):
                     precondition(dropdown === originalPanel && host.rootView.page == .help)
-                    sendKey("\u{1b}", code: 53, to: dropdown, in: app)
+                    sendKey("\u{1b}", code: 53, repeats: 2, to: dropdown, in: app)
                     step = .checkingHelpEscapeReturn(originalPanel)
                     return
                 case .checkingHelpEscapeReturn(let originalPanel):
@@ -676,9 +779,9 @@ enum MenuChecks {
                         !host.rootView.countingTokens
                     else { return }
                     button.performClick(nil)
-                    precondition(!dropdown.isVisible)
+                    precondition(!dropdown.isVisible && !host.rootView.isPresented)
                     button.performClick(nil)
-                    precondition(dropdown.isVisible)
+                    precondition(dropdown.isVisible && host.rootView.isPresented)
                     precondition(host.rootView.detailsExpanded)
                     print("Status button closed and reopened the dropdown.")
                     sendOutsideClick(in: app)
@@ -717,9 +820,14 @@ enum MenuChecks {
                     print("Collapsing Details canceled confirmation without issuing a claim.")
                     host.rootView.prepareReset()
                     precondition(host.rootView.resetPhase == .confirming && mock.count == 0)
-                    host.rootView.cancelReset()
+                    let priorConfirmation = host.rootView
+                    priorConfirmation.cancelReset()
                     precondition(host.rootView.resetPhase == .ready && mock.count == 0)
                     host.rootView.prepareReset()
+                    precondition(host.rootView.resetPhase == .confirming && mock.count == 0)
+                    priorConfirmation.confirmReset()
+                    precondition(host.rootView.resetPhase == .confirming && mock.count == 0)
+                    priorConfirmation.cancelReset()
                     precondition(host.rootView.resetPhase == .confirming && mock.count == 0)
                     sendKey("\u{1b}", code: 53, to: dropdown, in: app)
                     precondition(!dropdown.isVisible && mock.count == 0)
@@ -735,16 +843,44 @@ enum MenuChecks {
                     precondition(!host.rootView.detailsExpanded)
                     print("Command-R refreshed the quota while Details was collapsed.")
                     host.rootView.setDetailsExpanded(true)
+                    if useFixtures {
+                        host.rootView.prepareReset()
+                        precondition(host.rootView.resetPhase == .confirming)
+                        let expiredConfirmation = host.rootView.confirmReset
+                        controller.networkChanged(available: false)
+                        precondition(host.rootView.resetPhase == .ready)
+                        controller.networkChanged(available: true)
+                        expiredConfirmation()
+                        precondition(resetStore.phase == .ready && mock.count == 0)
+                    }
+                    step = .waitingToConfirmReset
+                    return
+                case .waitingToConfirmReset:
+                    guard !host.rootView.display.refreshing else { return }
+                    precondition(!useFixtures || host.rootView.canUseReset)
                     if host.rootView.canUseReset {
                         host.rootView.prepareReset()
                         precondition(host.rootView.resetPhase == .confirming && mock.count == 0)
                         let confirm = host.rootView.confirmReset
                         confirm()
                         confirm()
-                        step = .waitingForMock
+                        if useFixtures {
+                            controller.networkChanged(available: false)
+                            step = .waitingForOfflineReset
+                        } else {
+                            step = .waitingForMock
+                        }
                         return
                     }
                     finish(dropdown: dropdown, scratch: scratch, preferencesSuite: suite, app: app)
+                    return
+                case .waitingForOfflineReset:
+                    guard resetStore.phase != .submitting else { return }
+                    precondition(host.rootView.resetPhase == .ready && host.rootView.resetNotice == "Reset applied.")
+                    precondition(mock.count == 1)
+                    print("The open dropdown showed the completed synthetic reset while offline.")
+                    controller.networkChanged(available: true)
+                    step = .waitingForMock
                     return
                 case .waitingForMock:
                     guard host.rootView.resetPhase == .ready, !host.rootView.display.refreshing else { return }
@@ -763,7 +899,10 @@ enum MenuChecks {
                     else { return }
                     let codexBefore = reads.count(.codex)
                     let claudeBefore = reads.count(.claude)
-                    stressInteractions(controller, button: button, preferences: preferences, app: app)
+                    // Native clicks can run AppKit's event loop. Hold fixture responses so the requests overlap.
+                    reads.holdResponses {
+                        stressInteractions(controller, button: button, preferences: preferences, app: app)
+                    }
                     precondition(mock.count == 1)
                     step = .waitingForStress(codexBefore, claudeBefore, Date())
                     return
@@ -773,8 +912,10 @@ enum MenuChecks {
                         ),
                         !host.rootView.countingTokens
                     else { return }
-                    precondition((1...2).contains(reads.count(.codex) - codexBefore))
-                    precondition((1...2).contains(reads.count(.claude) - claudeBefore))
+                    let codexReads = reads.count(.codex) - codexBefore
+                    let claudeReads = reads.count(.claude) - claudeBefore
+                    precondition((1...2).contains(codexReads), "Unexpected Codex reads: \(codexReads)")
+                    precondition((1...2).contains(claudeReads), "Unexpected Claude reads: \(claudeReads)")
                     precondition(host.rootView.summaries.map(\.display.title) == ["46%", "52%"])
                     precondition(mock.count == 1 && host.rootView.resetPhase == .ready)
                     for _ in 0..<100 {
@@ -789,7 +930,7 @@ enum MenuChecks {
                     precondition(restored.menuLayout == .both && restored.percentageMode == .remaining)
                     precondition(!restored.detailsExpanded)
                     print(
-                        "UI stress passed: 60 settings/provider/layout cycles, 200 secondary clicks, 121 refresh requests, fixed scroll bounds, saved preferences, and at most two reads per provider."
+                        "UI stress passed: 60 settings/provider/layout cycles, 200 secondary clicks, 121 overlapping refresh requests, fixed scroll bounds, saved preferences, \(codexReads) Codex reads and \(claudeReads) Claude reads."
                     )
                     finish(dropdown: dropdown, scratch: scratch, preferencesSuite: suite, app: app)
                     return
@@ -799,6 +940,51 @@ enum MenuChecks {
             }
         }
         withExtendedLifetime(controller) { app.run() }
+    }
+
+    @MainActor private static func checkRefreshDoubleClick(
+        _ controller: AppDelegate, button: NSStatusBarButton, reads: FixtureReads, app: NSApplication
+    ) async {
+        let panel = controller.dropdown!
+        let host = controller.dashboard!
+        let image = button.image
+        let width = button.bounds.width
+        let tokens = host.rootView.summaries.map(\.tokens)
+        let readsBefore = UsageProvider.allCases.map(reads.count)
+        // Refresh is immediately left of Settings in the panel footer. Keep the pointer stationary.
+        let screenPoint = panel.convertPoint(toScreen: NSPoint(x: panel.frame.width - 57, y: 23))
+        reads.responses.enter()
+        postClick(at: panel.convertPoint(fromScreen: screenPoint), in: panel, app: app)
+        let deadline = Date().addingTimeInterval(5)
+        while !host.rootView.summaries.allSatisfy({ $0.display.refreshing && !$0.countingTokens }) {
+            precondition(Date() < deadline, "The first click must start a refresh while token scans finish.")
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        precondition(button.image === image && button.bounds.width == width)
+        var deliveredSecondMouseUp = false
+        let monitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp) { event in
+            if event.window === panel && event.clickCount == 2 { deliveredSecondMouseUp = true }
+            return event
+        }
+        defer { if let monitor { NSEvent.removeMonitor(monitor) } }
+        postClick(at: panel.convertPoint(fromScreen: screenPoint), in: panel, app: app, clickCount: 2)
+        while !deliveredSecondMouseUp {
+            precondition(Date() < deadline, "AppKit did not deliver the second refresh click.")
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        precondition(
+            button.image === image && button.bounds.width == width && button.window != nil,
+            "A double-click on Refresh must keep the existing percentages in the status item.")
+        precondition(host.rootView.summaries.allSatisfy { $0.display.hasCurrentPercentage })
+        precondition(host.rootView.summaries.map(\.tokens) == tokens)
+        precondition(panel.isVisible && host.rootView.detailsExpanded && host.rootView.display.provider == .claude)
+        reads.responses.leave()
+        while host.rootView.summaries.contains(where: { $0.display.refreshing || $0.countingTokens }) {
+            precondition(Date() < deadline, "The double-click refresh did not settle.")
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        precondition(UsageProvider.allCases.map(reads.count) == readsBefore.map { $0 + 2 })
+        print("A native refresh double-click kept both percentage badges through the requested follow-up read.")
     }
 
     @MainActor private static func stressInteractions(
@@ -859,6 +1045,25 @@ enum MenuChecks {
         host.rootView.refresh()
     }
 
+    @MainActor private static func detailsProviderPicker(in panel: NSPanel) -> NSSegmentedControl {
+        guard let content = panel.contentView,
+            let control = descendants(of: content).compactMap({ $0 as? NSSegmentedControl }).first(where: {
+                $0.accessibilityIdentifier() == "details-provider-picker" && !$0.isHiddenOrHasHiddenAncestor
+            })
+        else { preconditionFailure("The presented Details provider control is missing.") }
+        return control
+    }
+
+    @MainActor private static func clickDetailsProvider(
+        _ provider: UsageProvider, in panel: NSPanel, app: NSApplication
+    ) {
+        let control = detailsProviderPicker(in: panel)
+        let bounds = control.bounds
+        let fraction: CGFloat = provider == .codex ? 0.25 : 0.75
+        let point = control.convert(NSPoint(x: bounds.minX + bounds.width * fraction, y: bounds.midY), to: nil)
+        postClick(at: point, in: panel, app: app)
+    }
+
     @MainActor private static func checkCombinedButton(_ item: NSStatusItem, button: NSStatusBarButton) -> String {
         guard let image = button.image, let label = button.accessibilityLabel() else {
             preconditionFailure("The combined status button needs a template image and an accessibility label.")
@@ -866,7 +1071,7 @@ enum MenuChecks {
         precondition(item.isVisible && item.length == NSStatusItem.variableLength && button.window != nil)
         precondition(image.isTemplate && button.title.isEmpty && button.imagePosition == .imageOnly)
         precondition(button.bounds.width >= image.size.width && button.bounds.width <= image.size.width + 24)
-        precondition(button.toolTip?.hasPrefix(label) == true && label.contains("Codex") && label.contains("Claude"))
+        precondition(button.toolTip == nil && label.contains("Codex") && label.contains("Claude"))
         return label
     }
 
@@ -908,6 +1113,8 @@ enum MenuChecks {
         let savedCodex = AppDelegate(defaults: preferences)
         precondition(savedCodex.providerSelection == .codex && savedCodex.provider == .codex)
         precondition(!savedCodex.menuLayout.showsBoth)
+        controller.dashboard.rootView.setDetailsExpanded(true)
+        checkSingleProviderReopen(.codex, controller: controller, button: button)
 
         controller.dashboard.rootView.selectProviderSelection(.claude)
         precondition(controller.providerSelection == .claude && controller.provider == .claude)
@@ -919,20 +1126,32 @@ enum MenuChecks {
         let savedClaude = AppDelegate(defaults: preferences)
         precondition(savedClaude.providerSelection == .claude && savedClaude.provider == .claude)
         precondition(!savedClaude.menuLayout.showsBoth)
+        checkSingleProviderReopen(.claude, controller: controller, button: button)
+        controller.dashboard.rootView.setDetailsExpanded(false)
 
         controller.dashboard.rootView.selectProviderSelection(.both)
-        precondition(controller.providerSelection == .both && controller.menuLayout == .both)
+        precondition(controller.providerSelection == .both && controller.menuLayout == .bothPercentage)
         precondition(controller.dashboard.rootView.providerSelection == .both)
         checkSummaryProviders(controller, expected: [.codex, .claude])
         precondition(button.accessibilityLabel()?.contains("Claude") == true)
         precondition(button.accessibilityLabel()?.contains("Codex") == true)
         let savedBoth = AppDelegate(defaults: preferences)
-        precondition(savedBoth.providerSelection == .both && savedBoth.menuLayout == .both)
+        precondition(savedBoth.providerSelection == .both && savedBoth.menuLayout == .bothPercentage)
         controller.dashboard.rootView.selectProvider(.codex)
         controller.dashboard.rootView.selectLayout(.percentage)
         button.performClick(nil)
         precondition(!controller.dropdown.isVisible && controller.provider == .codex)
         print("Provider choices persisted, selected only the enabled account, and restored both menu readings.")
+    }
+
+    @MainActor private static func checkSingleProviderReopen(
+        _ expected: UsageProvider, controller: AppDelegate, button: NSStatusBarButton
+    ) {
+        button.performClick(nil)
+        precondition(!controller.dropdown.isVisible)
+        button.performClick(nil)
+        let view = controller.dashboard.rootView
+        precondition(controller.dropdown.isVisible && view.detailsExpanded && view.display.provider == expected)
     }
 
     @MainActor private static func checkSummaryProviders(_ controller: AppDelegate, expected: [UsageProvider]) {
@@ -945,6 +1164,111 @@ enum MenuChecks {
         precondition(host.rootView.summaries[1].display.limitingWindow?.remaining == 52)
         precondition(host.rootView.detailsExpanded == detailsVisible)
         checkContentFits(host, in: controller.dropdown)
+    }
+
+    @MainActor private static func checkReportFooter(_ display: QuotaDisplay, in window: NSWindow) {
+        guard let reading = display.reading else { preconditionFailure("Expected the selected provider's reading.") }
+        let expectedTime = display.reportTime(reading.fetchedAt)
+        var row: [NSRect] = []
+        func visit(_ node: AnyObject) {
+            let readValue: (() -> Any?)? = node.accessibilityValue
+            let value = readValue?() as? String ?? ""
+            let label = node.accessibilityLabel?() ?? ""
+            if node.accessibilityIdentifier?() == "limit-report-time" {
+                precondition(node.accessibilityRole?() == .staticText && value.contains(expectedTime))
+                row.append(node.accessibilityFrame?() ?? .zero)
+            } else if node.accessibilityRole?() == .staticText && value.hasPrefix("Refresh")
+                || label == "Refresh limits and token totals" || node.accessibilityIdentifier?() == "open-settings"
+            {
+                row.append(node.accessibilityFrame?() ?? .zero)
+            }
+            for child in node.accessibilityChildren?() ?? [] { visit(child as AnyObject) }
+        }
+        visit(window)
+        precondition(row.count == 4, "Expected the report time, countdown, Refresh and Settings in the footer.")
+        for frame in row {
+            precondition(!frame.isEmpty && window.frame.contains(frame))
+            precondition(abs(frame.midY - row[0].midY) <= 2, "Footer items must share one line.")
+        }
+        for (leading, trailing) in zip(row, row.dropFirst()) {
+            precondition(leading.maxX <= trailing.minX, "Footer reading order must follow its visual order.")
+        }
+    }
+
+    @MainActor private static func checkProviderAccessibility(in window: NSWindow) {
+        // Ask only this running app for its role so SwiftUI builds its accessibility tree.
+        var appRole: CFTypeRef?
+        _ = AXUIElementCopyAttributeValue(
+            AXUIElementCreateApplication(getpid()), kAXRoleAttribute as CFString, &appRole)
+        var buttons: [String: String] = [:]
+        var countdowns: [String] = []
+        func visit(_ node: AnyObject) {
+            let readValue: (() -> Any?)? = node.accessibilityValue
+            let value = readValue?() as? String
+            switch node.accessibilityRole?() {
+            case .button:
+                if let label = node.accessibilityLabel?(), let value { buttons[label] = value }
+            case .staticText:
+                if let value { countdowns.append(value) }
+            default: break
+            }
+            for child in node.accessibilityChildren?() ?? [] { visit(child as AnyObject) }
+        }
+        visit(window)
+        for (label, value) in [
+            ("Codex 5-hour limit", "72% remaining"), ("Codex weekly limit", "46% remaining"),
+            ("Claude 5-hour limit", "84% remaining"), ("Claude weekly limit", "52% remaining"),
+        ] {
+            precondition(buttons[label] == value, "Missing quota button \(label) in \(buttons)")
+            precondition(
+                countdowns.contains { $0.hasPrefix(label + ". Limit resets in ") }, "Missing countdown for \(label)")
+        }
+    }
+
+    @MainActor private static func checkHistoryAccessibility() {
+        var totals = TokenTotals(allTime: 8, month: 8, week: 8, yesterday: 7, today: 1, partial: false)
+        let date = Date(timeIntervalSinceReferenceDate: 800_000_000)
+        totals.peakDay = TokenPeakDay(date: date, tokens: 7)
+        totals.spend.today.add(nil)
+        totals.spend.yesterday.add(0.25)
+        totals.spend.yesterday.add(nil)
+        let partialAmount = totals.spend.yesterday.formattedUSD(historyPartial: false)!
+        for spend in [false, true] {
+            let table = TokenHistoryTable(totals: totals, provider: .codex, showSpend: spend)
+            let host = NSHostingView(rootView: table.frame(width: 280))
+            let window = NSWindow(
+                contentRect: NSRect(origin: .zero, size: host.fittingSize), styleMask: .borderless,
+                backing: .buffered, defer: false)
+            window.contentView = host
+            host.layoutSubtreeIfNeeded()
+            var rows: [String] = []
+            var peakRecords: [String] = []
+            func visit(_ node: AnyObject) {
+                if node.accessibilityIdentifier?() == "history-peak-day" {
+                    precondition(node.accessibilityLabel?() == "Peak day")
+                    peakRecords.append(node.accessibilityValueDescription?() ?? "")
+                }
+                let readValue: (() -> Any?)? = node.accessibilityValue
+                if node.accessibilityRole?() == .staticText, let value = readValue?() as? String {
+                    rows.append(value)
+                }
+                for child in node.accessibilityChildren?() ?? [] { visit(child as AnyObject) }
+            }
+            visit(window)
+            let peakDescription = date.formatted(date: .long, time: .omitted) + ", 7 tokens"
+            precondition(peakRecords == (spend ? [] : [peakDescription]))
+            let periods = ["All retained sessions", "Last 30 days", "Last 7 days", "Yesterday", "Today"]
+            for period in periods {
+                precondition(rows.filter { $0.hasPrefix(period + ", ") }.count == 1, "Missing history row: \(rows)")
+                precondition(!rows.contains(period))
+            }
+            if spend {
+                precondition(rows.contains("Today, estimated API cost unavailable"))
+                precondition(rows.contains("Yesterday, partial estimated API cost, " + partialAmount))
+            } else {
+                precondition(rows.contains("Today, 1 token") && rows.contains("Yesterday, 7 tokens"))
+            }
+        }
     }
 
     private static func shownPercentage(_ mode: PercentageMode, original: QuotaDisplay) -> String {
@@ -966,7 +1290,7 @@ enum MenuChecks {
         precondition(button.title == expected || button.title == expected + (mode == .remaining ? " left" : " used"))
         guard let label = button.accessibilityLabel() else { preconditionFailure("Expected a status label.") }
         checkReadout(mode, original: original, in: label)
-        precondition(button.toolTip?.hasPrefix(label) == true)
+        precondition(button.toolTip == nil)
     }
 
     @MainActor private static func combinedPoint(
@@ -1007,7 +1331,7 @@ enum MenuChecks {
 
     @MainActor private static func postClick(
         at point: NSPoint, in window: NSWindow, app: NSApplication, secondary: Bool = false,
-        modifiers: NSEvent.ModifierFlags = []
+        modifiers: NSEvent.ModifierFlags = [], clickCount: Int = 1
     ) {
         let types: [NSEvent.EventType] = secondary ? [.rightMouseDown, .rightMouseUp] : [.leftMouseDown, .leftMouseUp]
         for type in types {
@@ -1016,7 +1340,7 @@ enum MenuChecks {
                     with: type, location: point, modifierFlags: modifiers,
                     timestamp: ProcessInfo.processInfo.systemUptime,
                     windowNumber: window.windowNumber, context: nil, eventNumber: 0,
-                    clickCount: 1, pressure: 1), event.window === window
+                    clickCount: clickCount, pressure: 1), event.window === window
             else {
                 preconditionFailure("Could not create a click in the test window.")
             }
@@ -1050,16 +1374,17 @@ enum MenuChecks {
     }
 
     @MainActor private static func sendKey(
-        _ characters: String, code: UInt16, modifiers: NSEvent.ModifierFlags = [], to window: NSWindow,
-        in app: NSApplication
+        _ characters: String, code: UInt16, modifiers: NSEvent.ModifierFlags = [], repeats: Int = 0,
+        to window: NSWindow, in app: NSApplication
     ) {
-        for type in [NSEvent.EventType.keyDown, .keyUp] {
+        for index in 0..<(repeats + 2) {
+            let type: NSEvent.EventType = index <= repeats ? .keyDown : .keyUp
             guard
                 let event = NSEvent.keyEvent(
                     with: type, location: .zero, modifierFlags: modifiers,
                     timestamp: ProcessInfo.processInfo.systemUptime,
                     windowNumber: window.windowNumber, context: nil, characters: characters,
-                    charactersIgnoringModifiers: characters, isARepeat: false, keyCode: code
+                    charactersIgnoringModifiers: characters, isARepeat: index > 0 && type == .keyDown, keyCode: code
                 )
             else { preconditionFailure("Could not create a keyboard event for the dropdown.") }
             app.sendEvent(event)
@@ -1084,6 +1409,23 @@ enum MenuChecks {
 
     @MainActor private static func descendants(of view: NSView) -> [NSView] {
         view.subviews.flatMap { [$0] + descendants(of: $0) }
+    }
+
+    @MainActor private static func checkSettingsPresentation(
+        _ host: NSHostingController<Dashboard>, in panel: NSPanel
+    ) {
+        panel.contentView?.layoutSubtreeIfNeeded()
+        precondition(panel.frame.width <= 288, "Settings should stay in one narrow column.")
+        // A Settings host nested inside the SwiftUI placeholder can expose controls while painting a blank panel.
+        guard let body = host.view.superview, let settings = body.subviews.last, settings !== host.view,
+            settings.window === panel, !settings.isHiddenOrHasHiddenAncestor, settings.frame == host.view.frame,
+            let picker = descendants(of: settings).compactMap({ $0 as? NSSegmentedControl }).first
+        else { preconditionFailure("Settings controls must occupy the frontmost sibling above the dashboard.") }
+        let center = NSPoint(x: picker.bounds.midX, y: picker.bounds.midY)
+        let point = picker.convert(center, to: body.superview)
+        guard let hit = body.hitTest(point), hit === settings || hit.isDescendant(of: settings) else {
+            preconditionFailure("The visible Settings host must receive hits at its picker.")
+        }
     }
 
     @MainActor private static func clickPercentageMode(
@@ -1139,8 +1481,23 @@ enum MenuChecks {
 
     }
 
+    @MainActor private static func checkPanelAnchor(_ dropdown: NSPanel, under button: NSStatusBarButton) {
+        guard let window = button.window, let screen = window.screen else {
+            preconditionFailure("The status button must remain on screen.")
+        }
+        // The menu bar can reposition the status item after a layout change or posted click.
+        let anchor = window.convertToScreen(button.convert(button.bounds, to: nil))
+        let limits = screen.visibleFrame.insetBy(dx: 4, dy: 4)
+        let frame = dropdown.frame
+        let x = min(max(anchor.midX - frame.width / 2, limits.minX), limits.maxX - frame.width)
+        let y = max(limits.minY, min(anchor.minY, limits.maxY) - frame.height)
+        precondition(
+            abs(frame.minX - x) <= 1 && abs(frame.minY - y) <= 1,
+            "Panel \(frame) must follow anchor \(anchor) within \(limits), expected origin \(NSPoint(x: x, y: y)).")
+    }
+
     @MainActor private static func checkDisclosureSizing(
-        _ host: NSHostingController<Dashboard>, compact: NSRect, in dropdown: NSPanel
+        _ host: NSHostingController<Dashboard>, compact: NSRect, in dropdown: NSPanel, under button: NSStatusBarButton
     ) {
         checkContentFits(host, in: dropdown)
         let expanded = dropdown.frame
@@ -1153,12 +1510,14 @@ enum MenuChecks {
 
         host.rootView.setDetailsExpanded(false)
         checkContentFits(host, in: dropdown)
-        precondition(dropdown.frame == compact && !host.rootView.detailsExpanded)
+        precondition(dropdown.frame.size == compact.size && !host.rootView.detailsExpanded)
+        checkPanelAnchor(dropdown, under: button)
         precondition(footer.frame.minY == footerFrame.minY && footer.frame.width == footerFrame.width)
         host.rootView.setDetailsExpanded(true)
         precondition(host.rootView.detailsExpanded)
         checkContentFits(host, in: dropdown)
-        precondition(dropdown.frame == expanded && footer.frame == footerFrame)
+        precondition(dropdown.frame.size == expanded.size && footer.frame == footerFrame)
+        checkPanelAnchor(dropdown, under: button)
         print("The refresh and settings footer stayed pinned while Details expanded and collapsed.")
         print("Details expanded all secondary information together and restored the compact panel geometry.")
     }

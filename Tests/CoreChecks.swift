@@ -78,7 +78,16 @@ enum CoreChecks {
             {"rateLimits":{"primary":{"usedPercent":1,"windowDurationMins":300,"resetsAt":1700000000},
             "secondary":{"usedPercent":98,"windowDurationMins":300,"resetsAt":1800000600}}}
             """)
-        precondition(divergent.windows.filter { $0.resetsAt! > fetchedAt }.map(\.remaining) == [2])
+        precondition(divergent.windows.map(\.remaining) == [2])
+        let mixed = """
+            {"rateLimits":{"primary":{"usedPercent":100,"windowDurationMins":300,"resetsAt":1800000000},
+            "secondary":{"usedPercent":35,"windowDurationMins":10080}}}
+            """
+        let currentWeek = try read(mixed)
+        precondition(currentWeek.windows.map(\.remaining) == [65])
+        let restricted = try read(
+            #"{"ordinaryUsageAllowed":false,"rateLimits":{"primary":{"usedPercent":100,"resetsAt":1800000000}}}"#)
+        precondition(restricted.ordinaryUsageAllowed == false && restricted.windows.isEmpty)
         func unavailable(_ json: String) throws {
             do {
                 _ = try read(json)
@@ -92,6 +101,13 @@ enum CoreChecks {
              "alternate":{"primary":{"usedPercent":"unknown"}}}}
             """)
         try unavailable(#"{"rateLimitsByLimitId":"bad","rateLimits":{"primary":{"usedPercent":1}}}"#)
+        let expiredWithBalance = try read(
+            """
+            {"rateLimits":{"primary":{"usedPercent":100,"resetsAt":1800000000}},
+             "rateLimitResetCredits":{"availableCount":2}}
+            """)
+        precondition(expiredWithBalance.windows.first?.resetsAt == fetchedAt)
+        precondition(expiredWithBalance.resetCredits?.availableCount == 2)
         for invalid in [
             #"{"usedPercent":-0.1}"#, #"{"usedPercent":1,"resetsAt":1800000000000}"#,
             #"{"usedPercent":1,"resetsAt":0}"#, #"{"usedPercent":1,"windowDurationMins":-1}"#,
@@ -116,6 +132,26 @@ enum CoreChecks {
                 """)
             precondition(blocked.ordinaryUsageAllowed == false && blocked.windows.first?.remaining == 80)
         }
+        for flag in [#""spendControlReached":true"#, #""rateLimitReachedType":{"kind":"new"}"#] {
+            let snapshot = #"{"primary":{"usedPercent":null},\#(flag)}"#
+            for legacy in ["", #","rateLimits":{"limitId":"codex","primary":{"usedPercent":2}}"#] {
+                let report = try read(
+                    #"{"ordinaryUsageAllowed":true,"rateLimitsByLimitId":{"codex":\#(snapshot)}\#(legacy)}"#)
+                precondition(report.ordinaryUsageAllowed == false && report.windows.isEmpty)
+            }
+        }
+        let partialRestriction = try read(
+            #"{"ordinaryUsageAllowed":"unknown","rateLimits":{"spendControlReached":"unknown","rateLimitReachedType":"blocked","primary":{"usedPercent":41}}}"#
+        )
+        precondition(
+            partialRestriction.ordinaryUsageAllowed == false && partialRestriction.windows.map(\.remaining) == [59])
+        let otherBucket = try read(
+            """
+            {"ordinaryUsageAllowed":true,"rateLimitsByLimitId":{"codex":{
+                "limitId":"other","rateLimitReachedType":"blocked","primary":{"usedPercent":null}}},
+                "rateLimits":{"limitId":"codex","primary":{"usedPercent":2}}}
+            """)
+        precondition(otherBucket.ordinaryUsageAllowed == true && otherBucket.windows.map(\.remaining) == [98])
         let futureRestriction = try read(
             """
             {
@@ -354,6 +390,7 @@ enum CoreChecks {
             ("quotaMissingIdentityField", .requestFailed), ("quotaRejected", .requestFailed),
             ("quotaUnknownIdentity", .requestFailed),
             ("quotaStall", .timedOut), ("quotaDropped", .transportFailed), ("quotaMalformed", .invalidResponse),
+            ("quotaPartialEOF", .transportFailed), ("quotaUnrelatedEOF", .transportFailed),
         ] {
             let (failure, requests) = try withMock(scenario) { () -> QuotaError? in
                 do {
@@ -367,6 +404,8 @@ enum CoreChecks {
             precondition(!requests.contains { ($0["method"] as? String)?.contains("consume") == true })
         }
 
+        let finalReading = try read("quotaFinalEOF", expectsUserRead: false)
+        precondition(finalReading.windows.map(\.used) == [37])
         let countOnly = try read("default", expectsUserRead: true)
         let otherUser = try read("otherUser", expectsUserRead: true)
         let noUser = try read("missingUser", expectsUserRead: true)
@@ -501,6 +540,15 @@ enum CoreChecks {
                 case "quotaSignedOut", "quotaApiKey", "quotaRejected", "quotaUnknownIdentity",
                     "quotaMissingIdentityField":
                     try reply(#"{"id":2,"error":{"code":-32603,"message":"Provider request failed"}}"#)
+                case "quotaFinalEOF", "quotaPartialEOF", "quotaUnrelatedEOF":
+                    let final: String
+                    switch scenario {
+                    case "quotaPartialEOF": final = #"{"id":2,"result":{"rateLimits":"#
+                    case "quotaUnrelatedEOF": final = #"{"id":99,"result":{}}"#
+                    default: final = #"{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":37}}}}"#
+                    }
+                    try FileHandle.standardOutput.write(contentsOf: Data(final.utf8))
+                    return
                 case "quotaDropped": return
                 case "quotaStall": break
                 case "quotaMalformed": try reply(#"{"id":2,"result":"bad"}"#)

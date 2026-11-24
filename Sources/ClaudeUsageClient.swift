@@ -195,6 +195,11 @@ enum ClaudeUsageClient {
                 var bytes = [UInt8](repeating: 0, count: 64 * 1024)
                 let count = Darwin.read(reader.fileDescriptor, &bytes, bytes.count)
                 if count < 0, errno == EINTR || errno == EAGAIN { continue }
+                if count == 0, !buffer.isEmpty {
+                    // A CLI can exit immediately after its last JSON object.
+                    buffer.append(0x0A)
+                    continue
+                }
                 guard count > 0 else { throw Failure.unavailable }
                 let chunk = Data(bytes.prefix(count))
                 receivedBytes += chunk.count

@@ -146,9 +146,13 @@ struct ClaudeHistoryMemoryChecks {
 
         func expectTokens(_ total: Int64) throws {
             let actual = try history.read(now: now)
+            var unpriced = TokenSpendTotals()
+            unpriced.record(
+                nil, tokens: total, date: now, now: now, days: TokenDayBoundaries(now: now, calendar: calendar))
             let expected = TokenTotals(
                 allTime: total, month: total, week: total, yesterday: 0, today: total,
-                partial: false, hasRetainedUsage: true, claudeStatsLifetime: nil
+                partial: false, hasRetainedUsage: true, claudeStatsLifetime: nil, spend: unpriced,
+                peakDay: TokenPeakDay(date: calendar.startOfDay(for: now), tokens: total)
             )
             precondition(actual == expected, "Expected \(expected), received \(actual).")
         }

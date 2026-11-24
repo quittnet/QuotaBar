@@ -69,6 +69,39 @@ struct ClaudeQuotaChecks {
         precondition(reading(after: 110)?.windows.map(\.minutes) == [10_080])
         precondition(reading(after: 600) == nil)
 
+        // Earlier builds could save an already expired window alongside a valid fresh observation.
+        let previousBuild = directory.appendingPathComponent("previous-build.json")
+        var persisted = legacy
+        persisted["observedAt"] = start.addingTimeInterval(100).timeIntervalSinceReferenceDate
+        try JSONSerialization.data(withJSONObject: persisted).write(to: previousBuild)
+        let migrated = try ClaudeQuotaSource.read(file: previousBuild, now: start.addingTimeInterval(100))
+        precondition(migrated?.windows.map(\.minutes) == [10_080])
+
+        // A fresh report may still include a sibling window that expired before it was observed.
+        for (shortReset, weekReset, active) in [(99, 600, 10_080), (100, 600, 10_080), (600, 99, 300)] {
+            let mixed = directory.appendingPathComponent("mixed-\(shortReset)-\(weekReset).json")
+            let now = start.addingTimeInterval(100)
+            let payload = """
+                {"rate_limits":{"five_hour":{"used_percentage":12,"resets_at":\(1_800_000_000 + shortReset)},
+                "seven_day":{"used_percentage":35,"resets_at":\(1_800_000_000 + weekReset)}}}
+                """
+            try ClaudeQuotaSource.capture(statusLine: Data(payload.utf8), file: mixed, now: now, currentDate: { now })
+            let fresh = try ClaudeQuotaSource.read(file: mixed, now: now)
+            precondition(fresh?.fetchedAt == now && fresh?.windows.map(\.minutes) == [active])
+        }
+        let mixedReplay = directory.appendingPathComponent("mixed-replay.json")
+        let weekOnly =
+            #"{"session_id":"same","rate_limits":{"seven_day":{"used_percentage":35,"resets_at":1800000600}}}"#
+        let expiredAdded = weekOnly.replacingOccurrences(
+            of: #""seven_day":"#, with: #""five_hour":{"used_percentage":50,"resets_at":1800000050},"seven_day":"#)
+        for (seconds, payload) in [(0, weekOnly), (100, expiredAdded), (110, expiredAdded)] {
+            let now = start.addingTimeInterval(Double(seconds))
+            try ClaudeQuotaSource.capture(
+                statusLine: Data(payload.utf8), file: mixedReplay, now: now, currentDate: { now })
+            let read = try ClaudeQuotaSource.read(file: mixedReplay, now: now)
+            precondition(read?.fetchedAt == start && read?.windows.map(\.minutes) == [10_080])
+        }
+
         try capture(
             #"{"rate_limits":{"five_hour":{"used_percentage":true,"resets_at":1800000700},"seven_day":{"used_percentage":0,"resets_at":1800000900}}}"#,
             after: 610)
@@ -179,9 +212,102 @@ struct ClaudeQuotaChecks {
             let malformedReading = try ClaudeQuotaSource.read(file: idleFile, now: start.addingTimeInterval(2))
             precondition(malformedReading == nil)
         }
+        try checkRenewedPeriods(in: directory, start: start)
         try checkOverlappingClockCorrection(in: directory, start: start)
         try checkClockCorrection(in: directory, start: start)
         print("Claude quota fixtures passed")
+    }
+
+    private static func checkRenewedPeriods(in directory: URL, start: Date) throws {
+        typealias Window = (used: Int, deadline: Int?)
+        let short: Window = (2, 3600)
+        let weekly: Window = (20, 7000)
+        let old: Window = (98, 5)
+        let boot = UUID()
+        func capture(_ file: URL, _ session: String, _ five: Window?, _ week: Window?, at t: Int) throws {
+            var windows: [String: [String: Int]] = [:]
+            for (name, value) in [("five_hour", five), ("seven_day", week)] {
+                guard let value else { continue }
+                windows[name] = ["used_percentage": value.used]
+                windows[name]?["resets_at"] = value.deadline.map { Int(start.timeIntervalSince1970) + $0 }
+            }
+            var report: [String: Any] = ["session_id": session]
+            if !windows.isEmpty { report["rate_limits"] = windows }
+            let payload = try JSONSerialization.data(withJSONObject: report)
+            let now = start.addingTimeInterval(Double(t))
+            try ClaudeQuotaSource.capture(
+                statusLine: payload, file: file, order: .init(boot: boot, ticks: UInt64(t)), now: now,
+                currentDate: { now })
+        }
+        func verify(_ file: URL, at t: Int, used: [Double]?, observed: Int?) throws {
+            let reading = try ClaudeQuotaSource.read(file: file, now: start.addingTimeInterval(Double(t)))
+            precondition(reading?.windows.map(\.used) == used, file.lastPathComponent)
+            precondition(
+                reading?.fetchedAt == observed.map { start.addingTimeInterval(Double($0)) }, file.lastPathComponent)
+        }
+        // The previous snapshot was captured at t=10. An explicit deadline at t=5 proves the older period ended.
+        let cases: [(String, Window?, Window?, Window?, Window?, [Double]?, Int?)] = [
+            ("short-only", short, nil, old, nil, [2], 10),
+            ("weekly-only", nil, weekly, nil, old, [20], 10),
+            ("both-renewed", short, weekly, old, old, [2, 20], 10),
+            ("unchanged-sibling", short, weekly, old, weekly, [2, 20], 10),
+            ("omitted-sibling", short, weekly, old, nil, [2], 10),
+            ("changed-sibling", short, weekly, old, (22, 7000), [22], 12),
+            ("changed-short", short, weekly, (3, 3600), old, [3], 12),
+            ("different-weekly-period", short, weekly, old, (20, 8000), [20], 12),
+            ("no-matching-successor", nil, weekly, old, nil, nil, nil),
+            ("no-successor-deadline", (2, nil), nil, old, nil, nil, nil),
+            ("predecessor-ended-after-observation", short, nil, (98, 11), nil, nil, nil),
+            ("at-predecessor-boundary", short, nil, (98, 10), nil, [2], 10),
+            ("successor-already-ended", (2, 12), nil, old, nil, nil, nil),
+            ("genuine-same-period-use", short, weekly, (98, 3600), weekly, [98, 20], 12),
+        ]
+        for (name, firstShort, firstWeek, nextShort, nextWeek, used, observed) in cases {
+            let file = directory.appendingPathComponent(name + ".json")
+            try capture(file, "fresh", firstShort, firstWeek, at: 10)
+            try capture(file, "other", nextShort, nextWeek, at: 12)
+            try verify(file, at: 12, used: used, observed: observed)
+        }
+
+        let file = directory.appendingPathComponent("after-obsolete-report.json")
+        try capture(file, "fresh", short, weekly, at: 10)
+        try capture(file, "other", old, weekly, at: 14)
+        // A protected replay advances capture order, even when another process finishes later.
+        try capture(file, "late", (91, 3600), (86, 7000), at: 13)
+        try verify(file, at: 14, used: [2, 20], observed: 10)
+        try capture(file, "other", old, weekly, at: 220)
+        try verify(file, at: 220, used: [2, 20], observed: 10)
+        try capture(file, "other", nil, weekly, at: 221)
+        try verify(file, at: 221, used: [20], observed: 221)
+        try capture(file, "other", nil, old, at: 222)
+        try verify(file, at: 222, used: [20], observed: 221)
+        try capture(file, "other", nil, nil, at: 223)
+        try verify(file, at: 223, used: nil, observed: nil)
+
+        let replay = directory.appendingPathComponent("after-new-sibling.json")
+        try capture(replay, "fresh", short, weekly, at: 10)
+        try capture(replay, "idle", old, weekly, at: 11)
+        try capture(replay, "fresh", short, (22, 7000), at: 12)
+        try capture(replay, "idle", old, weekly, at: 13)
+        try verify(replay, at: 13, used: [2, 22], observed: 12)
+        try capture(replay, "idle", old, weekly, at: 14)
+        try verify(replay, at: 14, used: [2, 22], observed: 12)
+        try capture(replay, "idle", nil, weekly, at: 15)
+        try verify(replay, at: 15, used: [20], observed: 15)
+        try capture(replay, "idle", nil, nil, at: 16)
+        try verify(replay, at: 16, used: nil, observed: nil)
+
+        let omitted = directory.appendingPathComponent("repeated-missing-sibling.json")
+        try capture(omitted, "fresh", short, weekly, at: 10)
+        try capture(omitted, "idle", old, nil, at: 11)
+        try verify(omitted, at: 11, used: [2], observed: 10)
+        try capture(omitted, "fresh", short, (22, 7000), at: 12)
+        try capture(omitted, "idle", old, nil, at: 13)
+        try verify(omitted, at: 13, used: [2, 22], observed: 12)
+        try capture(omitted, "idle", old, nil, at: 14)
+        try verify(omitted, at: 14, used: [2, 22], observed: 12)
+        try capture(omitted, "idle", nil, nil, at: 15)
+        try verify(omitted, at: 15, used: nil, observed: nil)
     }
 
     private static func checkOverlappingClockCorrection(in directory: URL, start: Date) throws {

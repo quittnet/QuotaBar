@@ -69,7 +69,7 @@ enum PresentationChecks {
         precondition(sample([week], age: QuotaDisplay.maximumAge - 1).hasCurrentPercentage)
         precondition(!sample([week], age: QuotaDisplay.maximumAge).hasCurrentPercentage)
         precondition(sample([week], age: -1).title == "–%")
-        precondition(sample([week]).tooltipReading.contains("Codex read "))
+        precondition(sample([week]).accessibilityReading.contains("Codex read "))
         func shown(
             _ windows: [QuotaWindow], provider: UsageProvider = .claude, limits: MenuBarLimits = .fiveHour,
             mode: PercentageMode = .remaining, failed: Bool = false
@@ -106,6 +106,13 @@ enum PresentationChecks {
                 let daily = QuotaWindow(minutes: 1_440, remaining: 20, resetsAt: now.addingTimeInterval(600))
                 let noFive = shown([busyWeek, daily], provider: provider, limits: limits)
                 precondition(noFive.menuBarTitle == "20%" && !noFive.offersFiveHourChoice)
+            }
+            let tighterSession = QuotaWindow(minutes: 300, remaining: 4, resetsAt: now.addingTimeInterval(90))
+            for order in [[session, tighterSession], [tighterSession, session]] {
+                let compact = shown(order, provider: provider)
+                precondition(compact.menuBarTitle == "4%" && compact.accessibilityTitle.contains("4% remaining"))
+                precondition(shown(order, provider: provider, mode: .used).menuBarTitle == "96%")
+                precondition(shown(order, provider: provider, limits: .both).menuBarWindows.count == 2)
             }
             precondition(!shown([session], provider: provider).offersFiveHourChoice)
         }

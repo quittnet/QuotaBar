@@ -5,6 +5,8 @@ import SQLite3
 @main
 struct TokenChecks {
     static func main() throws {
+        TokenPricingChecks.run()
+        try slicedChunks()
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -12,6 +14,9 @@ struct TokenChecks {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(identifier: "America/New_York")!
         let now = ISO8601DateFormatter().date(from: "2026-11-18T15:00:00Z")!
+        try reconcileCounters(in: root.appendingPathComponent("reconcile"), now: now, calendar: calendar)
+        try costAttribution(in: root.appendingPathComponent("cost"), now: now, calendar: calendar)
+        try legacyForkDates(in: root.appendingPathComponent("legacy-fork"), now: now, calendar: calendar)
         try compressedLimits(in: root.appendingPathComponent("limits"), now: now, calendar: calendar)
         try cacheLifecycle(in: root.appendingPathComponent("cache-lifecycle"), now: now, calendar: calendar)
         let cache = root.appendingPathComponent("derived-history.json")
@@ -39,7 +44,9 @@ struct TokenChecks {
             response("2024-09-02T04:30:00Z", thread: "transition", response: "week", tokens: 7),
         ]
         try (transitionRows.joined(separator: "\n") + "\n").write(to: transitionLog, atomically: true, encoding: .utf8)
-        try expect(transitionHistory, now: transitionDay, all: 18, month: 18, week: 7, today: 0)
+        try expect(
+            transitionHistory, now: transitionDay, all: 18, month: 18, week: 7, today: 0,
+            peak: TokenPeakDay(date: ISO8601DateFormatter().date(from: "2024-08-10T04:00:00Z")!, tokens: 11))
         try FileManager.default.removeItem(at: transitionLog)
 
         let parent = sessions.appendingPathComponent("rollout-parent.jsonl")
@@ -151,7 +158,7 @@ struct TokenChecks {
             (metadata("child", parent: "parent") + "\n"
             + response("2026-11-18T06:00:00Z", thread: "parent", response: "before-30", tokens: 10) + "\n")
             .write(to: child, atomically: false, encoding: .utf8)
-        try expect(recovered, now: now, all: 37, month: 27, week: 27, today: 27, partial: true)
+        try expect(recovered, now: now, all: 37, month: 27, week: 27, today: 27, partial: true, undated: true)
         let isolated = root.appendingPathComponent("reordered")
         let directory = isolated.appendingPathComponent("sessions")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -255,7 +262,8 @@ struct TokenChecks {
             #"{"type":"compacted","timestamp":"2026-11-18T08:00:00Z","payload":{"latest_token_usage_record":{"thread_id":"test","response_id":"checkpoint","usage":{"total_tokens":13}}}}"#
         try ([metadata("test"), checkpoint, checkpoint].joined(separator: "\n") + "\n")
             .write(to: log, atomically: true, encoding: .utf8)
-        try expect(historyWithReorderedKeys, now: now, all: 13, month: 0, week: 0, today: 0, partial: true)
+        try expect(
+            historyWithReorderedKeys, now: now, all: 13, month: 0, week: 0, today: 0, partial: true, undated: true)
         try append(counter(recordedAt, cumulative: 13, last: 13) + "\n", to: log)
         try expect(historyWithReorderedKeys, now: now, all: 13, month: 13, week: 13, today: 13, partial: true)
         try
@@ -266,16 +274,45 @@ struct TokenChecks {
         print("Token history checks passed.")
     }
 
+    private static func slicedChunks() throws {
+        // A chunk may be a nonzero-based Data slice, and a record can span more than one such slice.
+        let chunks = ["\nA\0", "B\ncafé", " noir\npartial"].map { Data(("ignored" + $0).utf8).dropFirst(7) }
+        var source = chunks.makeIterator()
+        var lines: [Data] = []
+        let read = { source.next() ?? Data() }
+        let committed = try readTokenLogLines(read: read) { line in
+            guard case .complete(let data) = line else { fatalError("Unexpected oversized line") }
+            lines.append(data)
+        }
+        let expected = ["", "A\0B", "café noir"].map { Data($0.utf8) }
+        precondition(lines == expected && committed == expected.reduce(0) { $0 + UInt64($1.count + 1) })
+    }
+
     private static func expect(
         _ history: TokenHistory, now: Date,
         all: Int64, month: Int64, week: Int64, yesterday: Int64 = 0, today: Int64, partial: Bool = false,
-        retained: Bool = true,
+        retained: Bool = true, undated: Bool = false, peak: TokenPeakDay? = nil,
         line: UInt = #line
     ) throws {
+        func unpriced(_ tokens: Int64) -> TokenSpendAmount {
+            var amount = TokenSpendAmount()
+            if tokens > 0 || undated { amount.add(nil) }
+            return amount
+        }
+        let actual = try history.read(now: now)
+        // These New York fixtures peak today or yesterday unless an older peak is supplied.
+        let peakDate = yesterday >= today ? "2026-11-17T05:00:00Z" : "2026-11-18T05:00:00Z"
+        let recentPeak = max(yesterday, today)
+        let expectedPeak =
+            peak
+            ?? (recentPeak > 0
+                ? TokenPeakDay(date: ISO8601DateFormatter().date(from: peakDate)!, tokens: recentPeak) : nil)
         let expected = TokenTotals(
             allTime: all, month: month, week: week, yesterday: yesterday, today: today, partial: partial,
-            hasRetainedUsage: retained)
-        let actual = try history.read(now: now)
+            hasRetainedUsage: retained,
+            spend: TokenSpendTotals(
+                allTime: unpriced(all), month: unpriced(month), week: unpriced(week),
+                yesterday: unpriced(yesterday), today: unpriced(today)), peakDay: expectedPeak)
         precondition(actual == expected, "Line \(line), expected \(expected) and received \(actual)")
     }
 
@@ -293,6 +330,510 @@ struct TokenChecks {
         _ date: String, cumulative: Int64, last: Int64, estimated: Bool = false, ordinal: Int = 0
     ) -> String {
         #"{"timestamp":"\#(date)","ordinal":\#(ordinal),"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":\#(cumulative)},"last_token_usage":{"input_tokens":\#(estimated ? 0 : last),"output_tokens":0,"total_tokens":\#(last)}}}}"#
+    }
+
+    private static func legacyForkDates(in root: URL, now: Date, calendar: Calendar) throws {
+        let fm = FileManager.default
+        let sessions = root.appendingPathComponent("sessions")
+        try fm.createDirectory(at: sessions, withIntermediateDirectories: true)
+        let fork = sessions.appendingPathComponent("fork.jsonl")
+        let parent = sessions.appendingPathComponent("parent.jsonl")
+        let cache = root.appendingPathComponent("cache.json")
+        let yesterday = "2026-11-17T12:00:00Z"
+        let today = "2026-11-18T12:00:00Z"
+        let forkHeader =
+            #"{"timestamp":"2026-11-18T11:00:00Z","type":"session_meta","payload":{"id":"fork","forked_from_id":"parent"}}"#
+        func counters(at date: String) -> [String] {
+            [counter(date, cumulative: 10, last: 10), counter(date, cumulative: 30, last: 20)]
+        }
+        func write(_ rows: [String], to file: URL) throws {
+            try (rows.joined(separator: "\n") + "\n").write(to: file, atomically: true, encoding: .utf8)
+        }
+
+        var bytes = 0
+        func reader() -> TokenHistory {
+            TokenHistory(home: root, cacheURL: cache, calendar: calendar) { bytes += $0 }
+        }
+        try write([forkHeader, metadata("parent")] + counters(at: today), to: fork)
+        try write([metadata("parent")] + counters(at: yesterday), to: parent)
+        let grandchild = sessions.appendingPathComponent("grandchild.jsonl")
+        let grandchildHeader =
+            #"{"timestamp":"2026-11-18T11:30:00Z","type":"session_meta","payload":{"id":"grandchild","forked_from_id":"fork"}}"#
+        try write([grandchildHeader, forkHeader, metadata("parent")] + counters(at: today), to: grandchild)
+        try expect(reader(), now: now, all: 30, month: 30, week: 30, yesterday: 30, today: 0)
+        try fm.removeItem(at: parent)
+        let orphan = try reader().read(now: now)
+        precondition(
+            orphan.allTime == 30 && orphan.month == 0 && orphan.week == 0 && orphan.yesterday == 0
+                && orphan.today == 0 && orphan.partial && orphan.peakDay == nil)
+        precondition(
+            orphan.spend.allTime.partial && orphan.spend.month.partial && orphan.spend.week.partial
+                && orphan.spend.yesterday.partial && orphan.spend.today.partial && !orphan.spend.today.hasPricedUsage)
+        bytes = 0
+        let warm = try reader().read(now: now)
+        precondition(warm == orphan && bytes == 0)
+        try fm.removeItem(at: grandchild)
+
+        let dateRetained = [forkHeader] + counters(at: yesterday)
+        try write(dateRetained, to: fork)
+        try expect(reader(), now: now, all: 30, month: 30, week: 30, yesterday: 30, today: 0)
+
+        // The child response proves the copied prefix is over. Subsequent counter-only requests have normal dates.
+        try write(
+            [forkHeader] + counters(at: today) + [
+                response(today, thread: "fork", response: "own", tokens: 3),
+                counter(today, cumulative: 33, last: 3),
+                counter(today, cumulative: 38, last: 5),
+            ], to: fork)
+        try expect(reader(), now: now, all: 38, month: 8, week: 8, today: 8, partial: true, undated: true)
+    }
+
+    private static func reconcileCounters(in root: URL, now: Date, calendar: Calendar) throws {
+        let sessions = root.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        let log = sessions.appendingPathComponent("requests.jsonl")
+        let cache = root.appendingPathComponent("history")
+        let context = #"{"type":"turn_context","payload":{"model":"gpt-5"}}"#
+        let today = "2026-11-18T06:00:00Z"
+        let yesterday = "2026-11-18T04:00:00Z"  // November 17 in New York, November 18 in UTC.
+        func native(_ tokens: Int, at date: String) -> String {
+            let usage =
+                #"{"input_tokens":\#(tokens),"output_tokens":0,"cached_input_tokens":0,"total_tokens":\#(tokens)}"#
+            return
+                #"{"type":"token_usage_record","timestamp":"\#(date)","payload":{"response_id":"r","thread_id":"t","usage":\#(usage)}}"#
+        }
+        func sample(_ total: Int64, _ last: Int64, at date: String) -> String {
+            counter(date, cumulative: total, last: last)
+                .replacingOccurrences(of: #""output_tokens":0"#, with: #""cached_input_tokens":0,"output_tokens":0"#)
+        }
+        func write(_ rows: [String]) throws {
+            try (([context] + rows).joined(separator: "\n") + "\n").write(to: log, atomically: true, encoding: .utf8)
+        }
+        func verify(
+            _ totals: TokenTotals, yesterday: Int64, today: Int64, partial: Bool = false, line: UInt = #line
+        ) {
+            precondition(
+                totals.yesterday == yesterday && totals.today == today && totals.partial == partial, "At \(line)")
+            precondition(
+                totals.allTime == yesterday + today && totals.week == totals.allTime && totals.month == totals.allTime)
+            for (amount, count) in [
+                (totals.spend.today, today), (totals.spend.yesterday, yesterday),
+                (totals.spend.allTime, totals.allTime),
+            ] {
+                precondition(!amount.partial && abs(amount.usd - Double(count) * 1.25e-6) < 1e-14, "Spend at \(line)")
+            }
+        }
+        let history = TokenHistory(home: root, cacheURL: cache, calendar: calendar)
+        try write([native(10, at: yesterday), sample(30, 20, at: today)])
+        verify(try history.read(now: now), yesterday: 10, today: 20)
+        try write([sample(100, 100, at: yesterday), native(10, at: today), sample(30, 20, at: today)])
+        verify(try history.read(now: now), yesterday: 100, today: 30)
+        try write([sample(100, 100, at: yesterday), sample(30, 20, at: today)])
+        verify(try history.read(now: now), yesterday: 100, today: 20, partial: true)
+
+        try write([sample(10, 10, at: yesterday), native(10, at: today)])
+        verify(try history.read(now: now), yesterday: 10, today: 10)
+        try append(sample(10, 10, at: today) + "\n", to: log)
+        verify(try history.read(now: now), yesterday: 10, today: 10)
+        let restarted = TokenHistory(home: root, cacheURL: cache, calendar: calendar)
+        try append(sample(20, 10, at: today) + "\n", to: log)
+        verify(try restarted.read(now: now), yesterday: 10, today: 10)
+        var utc = calendar
+        utc.timeZone = TimeZone(secondsFromGMT: 0)!
+        var bytes = 0
+        let afterMove = TokenHistory(home: root, cacheURL: cache, calendar: utc) { bytes += $0 }
+        let moved = try afterMove.read(now: now)
+        verify(moved, yesterday: 0, today: 20)
+        precondition(moved.peakDay == TokenPeakDay(date: utc.startOfDay(for: now), tokens: 20))
+        precondition(bytes == 0, "A warm checkpoint must rebucket when the timezone changes")
+
+        try write([native(10, at: today), sample(10, 10, at: today)])
+        verify(try history.read(now: now), yesterday: 0, today: 10)
+        try write([sample(10, 10, at: today), native(10, at: today)])
+        verify(try history.read(now: now), yesterday: 0, today: 10, partial: true)
+        try append(sample(10, 10, at: today) + "\n", to: log)
+        verify(try restarted.read(now: now), yesterday: 0, today: 10, partial: true)
+        let another = native(10, at: today).replacingOccurrences(of: #""response_id":"r""#, with: #""response_id":"s""#)
+        try append(
+            [another, sample(10, 10, at: today), sample(20, 10, at: today)].joined(separator: "\n") + "\n", to: log)
+        verify(try history.read(now: now), yesterday: 0, today: 20, partial: true)
+
+        let expensive = context.replacingOccurrences(of: "gpt-5", with: "gpt-6.2-astra")
+        try write([sample(10, 10, at: yesterday), expensive, native(10, at: yesterday), sample(20, 10, at: today)])
+        let tied = try history.read(now: now)
+        precondition(tied.allTime == 20 && tied.yesterday == 10 && tied.today == 0 && tied.partial)
+        precondition(tied.week == 20 && tied.month == 20)
+        let provenDay = TokenPeakDay(date: ISO8601DateFormatter().date(from: "2026-11-17T05:00:00Z")!, tokens: 10)
+        precondition(tied.peakDay == provenDay)
+        let rebucketed = try afterMove.read(now: now)
+        precondition(rebucketed.peakDay == TokenPeakDay(date: utc.startOfDay(for: now), tokens: 20))
+        precondition(tied.spend.allTime.partial && abs(tied.spend.allTime.usd - 0.00008) < 1e-14)
+
+        try write([sample(10, 10, at: yesterday), native(10, at: yesterday), sample(20, 10, at: today)])
+        let sameRate = try history.read(now: now)
+        precondition(sameRate.week == 20 && sameRate.month == 20 && sameRate.today == 0 && sameRate.yesterday == 10)
+        precondition(sameRate.peakDay == provenDay)
+        precondition(sameRate.spend.week == sameRate.spend.month && sameRate.spend.month == sameRate.spend.allTime)
+        precondition(!sameRate.spend.week.partial && abs(sameRate.spend.week.usd - 0.000025) < 1e-14)
+        precondition(sameRate.spend.today.partial && sameRate.spend.yesterday.partial)
+
+        let copy = sessions.appendingPathComponent("copy.jsonl")
+        let ambiguous = [
+            metadata("t"), sample(10, 10, at: yesterday), native(10, at: yesterday), sample(20, 10, at: today),
+        ]
+        let exact = [metadata("t"), sample(20, 10, at: yesterday)]
+        for (first, second) in [(ambiguous, exact), (exact, ambiguous)] {
+            try write(first)
+            try (second.joined(separator: "\n") + "\n").write(to: copy, atomically: true, encoding: .utf8)
+            let reconciled = try history.read(now: now)
+            precondition(reconciled.peakDay == TokenPeakDay(date: provenDay.date, tokens: 20))
+            precondition(reconciled.yesterday == 20 && reconciled.today == 0 && reconciled.allTime == 20)
+        }
+        try FileManager.default.removeItem(at: copy)
+
+        let future = "2026-11-19T06:00:00Z"
+        try write([sample(100, 100, at: yesterday), sample(5, 5, at: future), sample(105, 100, at: today)])
+        verify(try history.read(now: now), yesterday: 100, today: 100)
+        verify(try restarted.read(now: now), yesterday: 100, today: 100)
+        let corrected = try history.read(now: now.addingTimeInterval(86_400))
+        precondition(corrected.allTime == 205 && corrected.today == 5 && corrected.yesterday == 100)
+
+        try write([native(20, at: yesterday), native(10, at: future)])
+        verify(try restarted.read(now: now), yesterday: 20, today: 0)
+        let later = try restarted.read(now: now.addingTimeInterval(86_400))
+        precondition(later.allTime == 10 && later.today == 10 && later.partial)
+    }
+
+    private static func costAttribution(in root: URL, now: Date, calendar: Calendar) throws {
+        let fm = FileManager.default
+        let sessions = root.appendingPathComponent("sessions")
+        let archive = root.appendingPathComponent("archived_sessions")
+        try fm.createDirectory(at: sessions, withIntermediateDirectories: true)
+        try fm.createDirectory(at: archive, withIntermediateDirectories: true)
+        let log = sessions.appendingPathComponent("primary.jsonl")
+        let copy = archive.appendingPathComponent("duplicate.jsonl")
+        let today = "2026-11-18T12:00:00Z"
+        let yesterday = "2026-11-17T12:00:00Z"
+        let usage =
+            #"{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100,"reasoning_output_tokens":60,"total_tokens":1100}"#
+        let usd = 0.0018  // (600 * 1.25 + 400 * 0.125 + 100 * 10) per million
+        let cache = root.appendingPathComponent("cache.json")
+        var bytes = 0
+        func reader() -> TokenHistory {
+            TokenHistory(home: root, cacheURL: cache, calendar: calendar) { bytes += $0 }
+        }
+        let history = reader()
+        func context(_ turn: String, _ model: String) -> String {
+            #"{"type":"turn_context","payload":{"turn_id":"\#(turn)","model":"\#(model)"}}"#
+        }
+        func native(
+            _ id: String, turn: String = "t", date: String = "2026-11-18T12:00:00Z", model: String? = nil
+        ) -> String {
+            let field = model.map { ",\"model\":\"\($0)\"" } ?? ""
+            return
+                #"{"type":"token_usage_record","timestamp":"\#(date)","payload":{"thread_id":"owner","turn_id":"\#(turn)","response_id":"\#(id)"\#(field),"usage":\#(usage)}}"#
+        }
+        func sample(_ total: Int) -> String {
+            #"{"type":"event_msg","timestamp":"\#(today)","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":\#(total)},"last_token_usage":\#(usage)}}}"#
+        }
+        func write(_ rows: [String], to url: URL) throws {
+            try (rows.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+        }
+        func amount(_ actual: TokenSpendAmount, _ expected: Double?, partial: Bool = false, line: UInt = #line) {
+            precondition(actual.hasPricedUsage == (expected != nil), "Missing or unexpected estimate at \(line)")
+            precondition(abs(actual.usd - (expected ?? 0)) < 1e-12 && actual.partial == partial, "Spend at \(line)")
+        }
+
+        let original = [
+            metadata("owner"), context("t", "gpt-5-codex"), native("r", date: yesterday), sample(1100),
+        ]
+        try write(original, to: log)
+        try write(original, to: copy)
+        let single = try history.read(now: now)
+        precondition(single.allTime == 1100)
+        amount(single.spend.allTime, usd)
+        amount(single.spend.yesterday, usd)
+        amount(single.spend.today, nil)
+
+        // A warm reader must retain both the price and the active turn's model across an append.
+        let restarted = reader()
+        bytes = 0
+        let warm = try restarted.read(now: now)
+        precondition(single == warm && bytes == 0)
+        try append(native("next") + "\n", to: log)
+        let added = try restarted.read(now: now)
+        amount(added.spend.today, usd)
+        amount(added.spend.week, usd * 2)
+        try fm.removeItem(at: copy)
+
+        let start = #"{"type":"event_msg","payload":{"type":"task_started","turn_id":"next"}}"#
+        try write(
+            [
+                metadata("owner"), context("t", "gpt-5-codex"), native("model-override", model: "gpt-5-mini"),
+                native("wrong-turn", turn: "other"), start, native("no-model", turn: "next"),
+                context("next", "unknown-model"), native("unknown", turn: "next"),
+                native("future", date: "2026-11-19T12:00:00Z", model: "gpt-5-codex"),
+            ], to: log)
+        let switched = try restarted.read(now: now)
+        precondition(switched.allTime == 4400 && !switched.partial)
+        amount(switched.spend.allTime, 0.00036, partial: true)
+        amount(switched.spend.today, 0.00036, partial: true)
+        amount(switched.spend.yesterday, nil)
+
+        let sameTurnStart = #"{"type":"event_msg","payload":{"type":"task_started","turn_id":"t"}}"#
+        func started(model: String) -> String {
+            #"{"type":"event_msg","payload":{"type":"task_started","turn_id":"t","model":\#(model)}}"#
+        }
+        try write(
+            [
+                context("t", "gpt-5-codex"), started(model: #""gpt-5-mini""#), native("updated"),
+                sameTurnStart, native("preserved"), started(model: "{}"), native("invalidated"),
+            ], to: log)
+        let markers = try restarted.read(now: now)
+        precondition(markers.allTime == 3300 && !markers.partial)
+        amount(markers.spend.today, 2 * 0.00036, partial: true)
+
+        let direct = native("direct", model: "gpt-5-mini")
+        func withUsageModel(_ row: String, _ json: String) -> String {
+            row.replacingOccurrences(of: #""input_tokens":1000"#, with: #""model":\#(json),"input_tokens":1000"#)
+        }
+        let precedence: [(row: String, cost: Double?)] = [
+            (withUsageModel(native("nested"), #""gpt-5-mini""#), 0.00036),
+            (withUsageModel(direct, #""gpt-5-codex""#), 0.00036),
+            (withUsageModel(native("malformed-nested"), "[]"), nil),
+            (withUsageModel(direct.replacingOccurrences(of: #""gpt-5-mini""#, with: "{}"), #""gpt-5-codex""#), nil),
+            (direct.replacingOccurrences(of: #""gpt-5-mini""#, with: "null"), nil),
+        ]
+        for (row, cost) in precedence {
+            try write([context("t", "gpt-5-codex"), row], to: log)
+            let result = try restarted.read(now: now)
+            precondition(result.allTime == 1100 && !result.partial)
+            amount(result.spend.today, cost, partial: cost == nil)
+        }
+
+        let padding = String(repeating: "A", count: TokenLogLine.maximumSize)
+        let imageHeader =
+            #"{"timestamp":"2026-11-18T12:00:00Z","type":"event_msg","payload": { "type" : "user_message", "images":["data:image/png;base64,"#
+        let image = imageHeader + padding + #""]}}"#
+        try write([context("t", "gpt-5-codex"), image, native("after-image")], to: log)
+        let withImage = try restarted.read(now: now)
+        precondition(withImage.allTime == 1100 && !withImage.partial)
+        amount(withImage.spend.today, usd)
+        bytes = 0
+        let warmImage = try reader().read(now: now)
+        precondition(warmImage == withImage && bytes == 0)
+
+        let unknownImage = image.replacingOccurrences(of: #""user_message""#, with: #""model_reroute""#)
+        try write([context("t", "gpt-5-codex"), unknownImage, native("after-unidentified-event")], to: log)
+        let unknownEvent = try restarted.read(now: now)
+        precondition(unknownEvent.allTime == 1100 && unknownEvent.partial)
+        amount(unknownEvent.spend.today, nil, partial: true)
+
+        try write([metadata("owner"), context("t", "gpt-5-codex"), sample(1100), sample(1100), sample(1650)], to: log)
+        let clipped = try restarted.read(now: now)
+        precondition(clipped.allTime == 1650)
+        amount(clipped.spend.allTime, usd, partial: true)
+        let checkpoint =
+            #"{"type":"compacted","timestamp":"\#(today)","payload":{"latest_token_usage_record":{"thread_id":"owner","turn_id":"t","response_id":"r","usage":\#(usage)}}}"#
+        try write([metadata("child", parent: "owner"), context("t", "gpt-5-codex"), native("r"), checkpoint], to: log)
+        let foreign = try restarted.read(now: now)
+        precondition(foreign.allTime == 1100 && foreign.today == 0)
+        amount(foreign.spend.allTime, nil, partial: true)
+        // A copied response's model and usage travel with its ID. The fork's date and turn model do not.
+        let fork = [metadata("child", parent: "owner"), context("t", "gpt-5-mini")]
+        let directCopy = native("r", model: "gpt-5-codex")
+        let nestedCopy = withUsageModel(native("r"), #""gpt-5-codex""#)
+        try write(fork + [directCopy, nestedCopy], to: log)
+        let copied = try restarted.read(now: now)
+        precondition(copied.allTime == 1100 && copied.today == 0 && copied.partial)
+        amount(copied.spend.allTime, usd)
+        amount(copied.spend.today, nil, partial: true)
+        bytes = 0
+        let warmCopy = try reader().read(now: now)
+        precondition(warmCopy == copied && bytes == 0)
+
+        try write([metadata("owner"), native("r", date: yesterday)], to: copy)
+        let dated = try restarted.read(now: now)
+        precondition(dated.allTime == 1100 && dated.yesterday == 1100 && !dated.partial)
+        amount(dated.spend.yesterday, nil, partial: true)
+        amount(dated.spend.today, nil)
+        try write([metadata("owner"), native("r", date: yesterday, model: "unknown-model")], to: copy)
+        let unknownOwner = try restarted.read(now: now)
+        amount(unknownOwner.spend.yesterday, nil, partial: true)
+        try write([metadata("owner"), native("r", date: yesterday, model: "gpt-5-mini")], to: copy)
+        let authoritative = try restarted.read(now: now)
+        amount(authoritative.spend.yesterday, 0.00036)
+        try write([metadata("owner"), response(yesterday, thread: "owner", response: "r", tokens: 5)], to: copy)
+        let differentCount = try restarted.read(now: now)
+        precondition(differentCount.allTime == 5 && differentCount.yesterday == 5 && differentCount.partial)
+        amount(differentCount.spend.allTime, nil, partial: true)
+        try fm.removeItem(at: copy)
+
+        // A file may establish its thread after the response. A preceding turn in the fork cannot price it.
+        try write([context("t", "gpt-5-mini"), native("r"), metadata("child", parent: "owner")], to: log)
+        let lateMetadata = try restarted.read(now: now)
+        precondition(lateMetadata.allTime == 1100 && lateMetadata.today == 0)
+        amount(lateMetadata.spend.allTime, nil, partial: true)
+        try write([metadata("owner"), context("t", "gpt-5-codex"), checkpoint], to: log)
+        let compacted = try restarted.read(now: now)
+        amount(compacted.spend.allTime, nil, partial: true)
+        try append(sample(1100) + "\n", to: log)
+        let shadow = try restarted.read(now: now)
+        precondition(shadow.allTime == 1100 && shadow.today == 1100)
+        amount(shadow.spend.today, nil, partial: true)
+
+        // An anonymous counter can overlap a single distinct compaction ID. A copied checkpoint
+        // or an uncommitted tail cannot create another response or date its original request.
+        let otherCheckpoint = checkpoint.replacingOccurrences(of: #""response_id":"r""#, with: #""response_id":"s""#)
+        let prefix = [metadata("owner"), context("t", "gpt-5-codex"), sample(1100), checkpoint]
+        try write(prefix, to: log)
+        try write(prefix, to: copy)
+        try append(otherCheckpoint, to: log)
+        let tail = try restarted.read(now: now)
+        precondition(tail.allTime == 1100 && tail.today == 1100)
+        try append("\n" + otherCheckpoint + "\n", to: log)
+        let multiple = try restarted.read(now: now)
+        precondition(multiple.allTime == 2200 && multiple.today == 1100 && multiple.partial)
+        amount(multiple.spend.today, nil, partial: true)
+        bytes = 0
+        let warmMultiple = try reader().read(now: now)
+        precondition(warmMultiple == multiple && bytes == 0)
+
+        // The shared turn makes the owner's counter eligible for both checkpoints. The other
+        // thread also has a counter of its own. Each response can be explained exactly once.
+        let otherThread = checkpoint.replacingOccurrences(of: #""thread_id":"owner""#, with: #""thread_id":"other""#)
+        try write(prefix + [otherThread], to: log)
+        try write([metadata("other"), context("separate", "gpt-5-mini"), sample(1100)], to: copy)
+        let paired = try restarted.read(now: now)
+        precondition(paired.allTime == 2200 && paired.today == 2200 && paired.partial)
+
+        // Saturating one thread must neither use nor unprice another thread's free counter.
+        let counters = (1...32).map { sample($0 * 1100) }
+        let checkpoints = (1...64).map { index in
+            checkpoint.replacingOccurrences(of: #""response_id":"r""#, with: #""response_id":"r-\#(index)""#)
+                .replacingOccurrences(of: #""turn_id":"t""#, with: #""turn_id":"turn-\#(index)""#)
+        }
+        try write([metadata("owner"), context("t", "gpt-5-codex")] + counters + checkpoints, to: log)
+        let saturated = try restarted.read(now: now)
+        precondition(saturated.allTime == 65 * 1100 && saturated.today == 33 * 1100 && saturated.partial)
+        amount(saturated.spend.today, 0.00036, partial: true)
+        try append(otherThread + "\n", to: log)
+        let remaining = try restarted.read(now: now)
+        precondition(remaining.allTime == saturated.allTime && remaining.today == saturated.today)
+        amount(remaining.spend.today, nil, partial: true)
+        try fm.removeItem(at: copy)
+
+        // A clipped counter can cover only the tokens it actually contributed. Both IDs
+        // independently establish a lifetime lower bound even when their request dates differ.
+        let smaller = response(yesterday, thread: "owner", response: "small", tokens: 550)
+        try write([metadata("owner"), context("t", "gpt-5-codex"), smaller, sample(1100), checkpoint], to: log)
+        let clippedOverlap = try restarted.read(now: now)
+        precondition(clippedOverlap.allTime == 1650 && clippedOverlap.yesterday == 550 && clippedOverlap.today == 550)
+        precondition(clippedOverlap.partial && clippedOverlap.spend.allTime.partial)
+
+        let first = native("r", model: "gpt-5-mini")
+        let second = native("r", model: "gpt-5-codex")
+        for rows in [[first, second, first], [second, first, second]] {
+            try write(rows, to: log)
+            let conflict = try restarted.read(now: now)
+            precondition(conflict.allTime == 1100)
+            amount(conflict.spend.today, nil, partial: true)
+        }
+        let badCached = second.replacingOccurrences(
+            of: "\"cached_input_tokens\":400", with: "\"cached_input_tokens\":[]")
+        let badWrites = second.replacingOccurrences(
+            of: "\"cached_input_tokens\":400", with: "\"cached_input_tokens\":400,\"cache_write_input_tokens\":\"bad\"")
+        let badInput = second.replacingOccurrences(of: #""input_tokens":1000"#, with: #""input_tokens":"unknown""#)
+        let badOutput = second.replacingOccurrences(of: #""output_tokens":100"#, with: #""output_tokens":{}"#)
+        let missingInput = second.replacingOccurrences(of: #""input_tokens":1000,"#, with: "")
+        let missingOutput = second.replacingOccurrences(of: #""output_tokens":100,"#, with: "")
+        for row in [badCached, badWrites, badInput, badOutput, missingInput, missingOutput] {
+            try write([row], to: log)
+            let bad = try restarted.read(now: now)
+            precondition(bad.allTime == 1100 && !bad.partial)
+            amount(bad.spend.today, nil, partial: true)
+        }
+        // Repeated copies of a cumulative counter represent one request even if the
+        // later copy supplies its cache breakdown or contradicts the earlier price.
+        let emptyCache = sample(1100).replacingOccurrences(of: #""cached_input_tokens":400,"#, with: "")
+        let otherCache = sample(1100).replacingOccurrences(
+            of: #""cached_input_tokens":400"#, with: #""cached_input_tokens":0"#)
+        let startRows = [metadata("owner"), context("t", "gpt-5-codex")]
+        for rows in [[emptyCache, sample(1100)], [sample(1100), emptyCache]] {
+            try write(startRows + rows, to: log)
+            let supplemented = try restarted.read(now: now)
+            precondition(supplemented.today == 1100 && !supplemented.partial)
+            amount(supplemented.spend.today, usd)
+        }
+        for rows in [[sample(1100), otherCache], [otherCache, sample(1100), otherCache]] {
+            try write(startRows + rows, to: log)
+            let conflict = try restarted.read(now: now)
+            precondition(conflict.today == 1100 && !conflict.partial)
+            amount(conflict.spend.today, nil, partial: true)
+        }
+        let laterCounter = sample(1100).replacingOccurrences(of: today, with: "2026-11-18T13:00:00Z")
+        try write(startRows + [emptyCache, context("t", "gpt-5-mini"), laterCounter], to: log)
+        let laterContext = try restarted.read(now: now)
+        amount(laterContext.spend.today, nil, partial: true)
+        try write(startRows + [sample(1100), context("t", "gpt-5-mini"), sample(1100)], to: log)
+        let sameTimeContext = try restarted.read(now: now)
+        amount(sameTimeContext.spend.today, usd)
+        try write(startRows + [emptyCache, context("t", "gpt-5-mini"), laterCounter], to: log)
+        let directCounter = laterCounter.replacingOccurrences(
+            of: #""cached_input_tokens":400"#, with: #""model":"gpt-5-codex","cached_input_tokens":400"#)
+        try append(directCounter + "\n", to: log)
+        let explicitPrice = try restarted.read(now: now)
+        amount(explicitPrice.spend.today, usd)
+        bytes = 0
+        let retained = try reader().read(now: now)
+        precondition(retained == explicitPrice && bytes == 0)
+
+        // Simulate a stale SQLite price table with the same source fingerprint.
+        try write([second], to: log)
+        let before = try restarted.read(now: now)
+        amount(before.spend.allTime, usd)
+        let db = CodexHistoryCache(
+            url: cache.appendingPathExtension("sqlite"), home: root.standardizedFileURL.path,
+            maximumBytes: 128 * 1024 * 1024)!
+        var stale: Data?
+        var cachedPath: String?
+        db.load { path, data in
+            guard URL(fileURLWithPath: path).lastPathComponent == log.lastPathComponent else { return }
+            cachedPath = path
+            var entry = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+            var file = entry["file"] as! [String: Any]
+            file["priceRevision"] = TokenPricing.revision - 1
+            entry["file"] = file
+            stale = try! JSONSerialization.data(withJSONObject: entry)
+        }
+        guard let cachedPath, let stale else { fatalError("Missing price checkpoint") }
+        precondition(db.save(paths: [cachedPath], payload: { _ in stale }, acknowledge: { _ in }) == SQLITE_OK)
+        bytes = 0
+        let repriced = try reader().read(now: now)
+        precondition(bytes > 0 && repriced == before)
+
+        // The earlier parser discarded this row and cached an empty, partial event list.
+        try write([badInput], to: log)
+        let recovered = try restarted.read(now: now)
+        var oldParser: Data?
+        db.load { path, data in
+            guard path == cachedPath else { return }
+            var entry = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+            var file = entry["file"] as! [String: Any]
+            file.removeValue(forKey: "parserRevision")
+            file["events"] = []
+            file["partial"] = true
+            entry["file"] = file
+            oldParser = try! JSONSerialization.data(withJSONObject: entry)
+        }
+        guard let oldParser else { fatalError("Missing parser checkpoint") }
+        precondition(db.save(paths: [cachedPath], payload: { _ in oldParser }, acknowledge: { _ in }) == SQLITE_OK)
+        bytes = 0
+        let migrated = try reader().read(now: now)
+        precondition(bytes > 0 && migrated.allTime == 1100 && migrated == recovered)
+        bytes = 0
+        let warmMigration = try reader().read(now: now)
+        precondition(bytes == 0 && warmMigration == recovered)
     }
 
     private static func cacheLifecycle(in root: URL, now: Date, calendar: Calendar) throws {
@@ -329,6 +870,19 @@ struct TokenChecks {
         try check(reader(cache), 1)
         precondition(reads == 0, "A repaired database must serve a warm restart")
 
+        try fm.removeItem(at: dbURL)
+        try check(current, 1)
+        try check(reader(cache), 1)
+        precondition(reads == 0, "A live reader must repopulate an evicted cache from memory")
+
+        // Another process can publish a replacement at the same path while our connection is open.
+        let replacement = root.appendingPathComponent("replacement.sqlite")
+        precondition(CodexHistoryCache(url: replacement, home: root.path, maximumBytes: 128 * 1024 * 1024) != nil)
+        precondition(rename(replacement.path, dbURL.path) == 0)
+        try check(current, 1)
+        try check(reader(cache), 1)
+        precondition(reads == 0, "An atomically replaced database must receive the live checkpoints")
+
         try locked(dbURL, "IMMEDIATE") {
             try append(row(1), to: log)
             try check(current, 2)
@@ -347,12 +901,14 @@ struct TokenChecks {
         try check(reader(cache), 2)
         precondition(reads == 0, "A transient write lock must not lose dirty checkpoints")
 
-        // Use the legacy v3 envelope and checkpoint format against unchanged real fixture files.
+        // A pre-pricing checkpoint can have an identical fingerprint. Its source must still be replayed.
         var oldFiles: [String: Any] = [:]
         let db = CodexHistoryCache(url: dbURL, home: root.standardizedFileURL.path, maximumBytes: 128 * 1024 * 1024)!
         db.load { path, data in
             let entry = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
-            oldFiles[path] = entry["file"]
+            var oldFile = entry["file"] as! [String: Any]
+            oldFile.removeValue(forKey: "priceRevision")
+            oldFiles[path] = oldFile
         }
         precondition(oldFiles.count == 1)
         let migrated = root.appendingPathComponent("migration.json")
@@ -368,10 +924,12 @@ struct TokenChecks {
             try check(bridge, 2)
             precondition(fm.fileExists(atPath: migrated.path))
         }
+        precondition(reads > 0, "A legacy count-only checkpoint must be rescanned")
+        reads = 0
         try check(bridge, 2)
         precondition(!fm.fileExists(atPath: migrated.path))
         try check(reader(migrated), 2)
-        precondition(reads == 0, "Migration must retain valid checkpoints across transient locks")
+        precondition(reads == 0, "Rebuilt checkpoints must persist after a transient lock")
 
         let limited = root.appendingPathComponent("limited.json")
         let cap = 16384

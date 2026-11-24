@@ -33,19 +33,15 @@ esac
 output_dir=${1:-"release-updates/v${version}"}
 mkdir -p "${output_dir}"
 output_dir=$(cd "${output_dir}" && pwd)
-for name in QuotaBar-macOS.zip appcast.xml SHA256SUMS.txt; do
-    if [ -e "${output_dir}/${name}" ] || [ -L "${output_dir}/${name}" ]; then
-        printf 'Release output already exists: %s\n' "${name}" >&2
-        exit 1
-    fi
-done
+python3 Helpers/PublishArchives.py update "${output_dir}"
 stage=
 sparkle=$(./fetch-sparkle.sh)
 cleanup() {
     if [ -n "${stage}" ]; then rm -r "${stage}"; fi
     rm -r "${sparkle}"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 account=${QUOTABAR_UPDATE_KEY_ACCOUNT:-quotabar-updates}
 public_key=$("${sparkle}/bin/generate_keys" --account "${account}" -p)
 if [ "${public_key}" != "${QUOTABAR_UPDATE_PUBLIC_KEY}" ]; then
@@ -106,7 +102,5 @@ if [ "${feed_version}" != "${build}" ] || \
     exit 1
 fi
 (cd "${stage}/updates" && shasum -a 256 QuotaBar-macOS.zip appcast.xml > SHA256SUMS.txt)
-for name in QuotaBar-macOS.zip appcast.xml SHA256SUMS.txt; do
-    mv "${stage}/updates/${name}" "${output_dir}/${name}"
-done
+python3 Helpers/PublishArchives.py update "${output_dir}" "${stage}/updates"
 printf 'Verified signed update artifacts saved in %s\n' "${output_dir}"

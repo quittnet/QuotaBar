@@ -12,9 +12,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var percentageMode: PercentageMode
     private(set) var menuBarLimits: [UsageProvider: MenuBarLimits]
     private var page = Dashboard.Page.usage
+    private var settingsVisit: UInt64 = 0
     private(set) var detailsExpanded: Bool
+    private var showTokenSpend: Bool
+    private var dailyUsageMode: DailyUsageMode
     private var updaterObservation: AnyCancellable?
     private var badges: MenuBarBadges?
+    private var loadingBadgeFrames: [Int: MenuBarBadges] = [:]
     private var lastStatusClickTime: TimeInterval?
     private var modeFeedbackTimer: Timer?
     private var loadingTimer: Timer?
@@ -26,11 +30,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var networkAvailable: Bool?
     private var retryLaunchReadOnFailure: Set<UsageProvider> = []
     private var clockObservers: [NSObjectProtocol] = []
+    private enum RefreshTrigger { case standard, scheduled, legacyCache }
+
     private final class ProviderState {
         var reading: QuotaReading?
         var failure: String?
         var missingCLI = false
-        var refreshing = false
+        var pendingCLIChoice: UUID?
+        var refreshTrigger: RefreshTrigger?
+        var refreshing: Bool { refreshTrigger != nil }
         var generation = 0
         var needsVerification = false
         var restrictionUnconfirmed = false
@@ -38,14 +46,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var balancePoll: UsageResets.BalancePoll?
         var consecutiveFailures = 0
         var lastAttempt = Date.distantPast
+        let tokenReader = LocalTokenReader()
+        var configurationGeneration = 0
         var tokens: TokenTotals?
         var tokenFailure: String?
         var countingTokens = false
+        var tokenRefreshPending = false
         var lastTokenScan = Date.distantPast
         var tokenTimeZone = TimeZone.current
 
+        func hasCurrentTokenDay(at now: Date, calendar: Calendar) -> Bool {
+            tokenTimeZone == calendar.timeZone && lastTokenScan <= now
+                && calendar.isDate(lastTokenScan, inSameDayAs: now)
+        }
+
         func nextRetry(at now: Date) -> Date? {
             retryAt ?? balancePoll?.fireDate(at: now)
+        }
+
+        var nextWindowReset: Date? {
+            reading?.windows.compactMap(\.resetsAt).filter { $0 > lastAttempt }.min()
         }
     }
 
@@ -69,12 +89,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var claudeConnectionStatus = ClaudeConnection.Status.notConfigured
     private var claudeConnectionCheck: Task<Void, Never>?
+    private var claudeConnectionCheckPending = false
     private var claudeUsesLegacyReport = false
     private var canDisconnectClaude = false
     private var connectingClaude = false
     private var claudeSetupError: String?
 
-    private let tokenReader = LocalTokenReader()
     var tokenTotals: TokenTotals? { current.tokens }
 
     init(
@@ -120,6 +140,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return (source, saved ?? .fiveHour)
             })
         self.detailsExpanded = defaults.stringArray(forKey: "expandedDashboardSections")?.contains("details") == true
+        self.showTokenSpend = defaults.bool(forKey: "showTokenSpend")
+        self.dailyUsageMode = DailyUsageMode.saved(in: defaults)
         self.resets = resetStore ?? UsageResets()
         self.redeem = redeem
         super.init()
@@ -145,7 +167,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             button.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
         }
-        dashboard = NSHostingController(rootView: makePanel())
+        var initial = makePanel()
+        initial.isPresented = false
+        dashboard = NSHostingController(rootView: initial)
         dashboard.sizingOptions = []
         dropdown = DropdownPanel(dashboard: dashboard)
         updaterObservation = UpdateController.shared.objectWillChange.sink { [weak self] _ in
@@ -155,6 +179,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         dropdown.onDismiss = { [weak self] in
             self?.page = .usage
             self?.resets.cancel()
+            self?.updateLoadingAnimation()
+            self?.scheduleTimers()
         }
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(wokeUp),
@@ -166,13 +192,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 })
         }
 
-        let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.tick() }
-        }
-        timer.tolerance = 3
-        RunLoop.main.add(timer, forMode: .common)
-        displayTimer = timer
-
         refreshAndRestartTimer()
         networkMonitor?.onChange = { [weak self] available in self?.networkChanged(available: available) }
         networkMonitor?.start()
@@ -182,6 +201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         modeFeedbackTimer?.invalidate()
         loadingTimer?.invalidate()
         networkMonitor?.stop()
+        cancelClaudeConnectionCheck()
         dropdown?.dismiss()
         displayTimer?.invalidate()
         autoRefreshTimer?.invalidate()
@@ -191,53 +211,93 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
-    private var canRetryCodex: Bool {
-        networkAvailable != false && resets.phase != .confirming && resets.phase != .submitting
+    private func canRefreshQuota(for source: UsageProvider) -> Bool {
+        networkAvailable != false && (source != .codex || (resets.phase != .confirming && resets.phase != .submitting))
+    }
+
+    private func retryDate(for source: UsageProvider, at now: Date) -> Date? {
+        let state = state(for: source)
+        guard canRefreshQuota(for: source), !state.refreshing else { return nil }
+        return state.nextRetry(at: now)
     }
 
     var nextRefreshDate: Date? {
-        let scheduled = autoRefreshTimer?.fireDate
-        guard networkAvailable != false, provider != .codex || canRetryCodex else { return nil }
-        guard let retry = current.nextRetry(at: quotaNow()) else { return scheduled }
-        return scheduled.map { min($0, retry) } ?? retry
+        guard networkAvailable != false else { return nil }
+        let enabled = enabledProviders.filter { canRefreshQuota(for: $0) }
+        let now = quotaNow()
+        var deadlines = enabled.compactMap { retryDate(for: $0, at: now) }
+        if !enabled.isEmpty, let regular = autoRefreshTimer?.fireDate { deadlines.append(regular) }
+        // An expiring reading cancels an open confirmation and triggers a fresh Codex read.
+        if enabledProviders.contains(.codex), resets.phase == .confirming,
+            let expiry = display(for: .codex).validUntil
+        {
+            deadlines.append(expiry)
+        }
+        for source in enabled {
+            let state = state(for: source)
+            if !state.refreshing, let reset = state.nextWindowReset { deadlines.append(reset) }
+        }
+        return deadlines.min()
     }
 
-    func makePanel() -> Dashboard {
-        let currentRanges =
-            current.lastTokenScan <= Date() && Calendar.current.isDateInToday(current.lastTokenScan)
-            && current.tokenTimeZone == .current
+    func makePanel(forPresentation: Bool = false) -> Dashboard {
+        let now = Date()
+        let calendar = Calendar.current
+        let confirmation = resets.confirmationGeneration
+        let offline = networkAvailable == false ? "Offline. QuotaBar will check when the connection returns." : nil
+        func currentTokens(_ state: ProviderState) -> TokenTotals? {
+            state.hasCurrentTokenDay(at: now, calendar: calendar) ? state.tokens : nil
+        }
+        // A callback issued for Settings is valid only while that Settings visit remains visible.
+        let scopedSettingsAction = forPresentation && page == .settings
+        let visit = settingsVisit
+        let owner: @MainActor @Sendable () -> AppDelegate? = { [weak self] in
+            guard let self else { return nil }
+            if scopedSettingsAction
+                && (self.page != .settings || self.settingsVisit != visit || self.dropdown?.isVisible != true)
+            {
+                return nil
+            }
+            return self
+        }
         return Dashboard(
             display: display,
-            summaries: enabledProviders.map {
-                Dashboard.Summary(
-                    display: display(for: $0), failure: state(for: $0).failure, missingCLI: state(for: $0).missingCLI)
+            summaries: enabledProviders.map { source in
+                let state = state(for: source)
+                return Dashboard.Summary(
+                    display: display(for: source), failure: offline ?? state.failure, missingCLI: state.missingCLI,
+                    tokens: currentTokens(state), countingTokens: state.countingTokens)
             }, nextAutoRefresh: nextRefreshDate,
-            selectProvider: { [weak self] in self?.selectProvider($0) },
+            selectProvider: { owner()?.selectProvider($0) },
             providerSelection: providerSelection,
-            selectProviderSelection: { [weak self] in self?.selectProviderSelection($0) },
-            chooseCLI: { [weak self] in self?.chooseCLI($0) },
-            automaticCLI: { [weak self] source in
-                ProviderExecutable.useAutomatic(source.rawValue)
-                self?.providerCLIChanged(source)
+            selectProviderSelection: { owner()?.selectProviderSelection($0) },
+            chooseCLI: { owner()?.chooseCLI($0) },
+            automaticCLI: { source in
+                guard let self = owner() else { return }
+                self.state(for: source).pendingCLIChoice = nil
+                ProviderExecutable.useAutomatic(source.rawValue, defaults: self.defaults)
+                self.providerCLIChanged(source)
             },
-            menuLayout: menuLayout, selectLayout: { [weak self] in self?.selectLayout($0) },
-            selectPercentageMode: { [weak self] in self?.selectPercentageMode($0) },
+            menuLayout: menuLayout, selectLayout: { owner()?.selectLayout($0) },
+            selectPercentageMode: { owner()?.selectPercentageMode($0) },
             menuBarLimits: menuBarLimits,
             fiveHourChoices: enabledProviders.filter { display(for: $0).offersFiveHourChoice },
-            selectMenuBarLimits: { [weak self] in self?.selectMenuBarLimits($0, for: $1) },
-            page: page, selectPage: { [weak self] in self?.selectPage($0) },
-            detailsExpanded: detailsExpanded, setDetailsExpanded: { [weak self] in self?.setDetailsExpanded($0) },
+            selectMenuBarLimits: { owner()?.selectMenuBarLimits($0, for: $1) },
+            page: page, selectPage: { owner()?.selectPage($0) },
+            detailsExpanded: detailsExpanded, setDetailsExpanded: { owner()?.setDetailsExpanded($0) },
+            showSpend: showTokenSpend, setShowSpend: { owner()?.setShowSpend($0) },
+            dailyUsageMode: dailyUsageMode, setDailyUsageMode: { owner()?.setDailyUsageMode($0) },
             claudeUsesLegacyReport: claudeUsesLegacyReport,
             claudeConnectionStatus: enabledProviders.contains(.claude) ? claudeConnectionStatus : .notConfigured,
             connectingClaude: connectingClaude,
             claudeSetupError: claudeSetupError,
-            connectClaude: { [weak self] in self?.changeClaudeConnection(disconnect: false) },
+            connectClaude: { owner()?.changeClaudeConnection(disconnect: false) },
             canDisconnectClaude: canDisconnectClaude,
-            disconnectClaude: { [weak self] in self?.changeClaudeConnection(disconnect: true) },
+            disconnectClaude: { owner()?.changeClaudeConnection(disconnect: true) },
             claudeProfilePath: ClaudeProfile.resolve(defaults: defaults).path,
-            chooseClaudeProfile: { [weak self] in self?.chooseClaudeProfile() },
-            useDefaultClaudeProfile: { [weak self] in self?.selectClaudeProfile(nil) },
-            failure: current.failure, tokens: currentRanges ? current.tokens : nil,
+            chooseClaudeProfile: { owner()?.chooseClaudeProfile() },
+            useDefaultClaudeProfile: { owner()?.selectClaudeProfile(nil) },
+            failure: offline ?? current.failure, tokens: currentTokens(current),
             tokenFailure: current.tokenFailure, countingTokens: current.countingTokens,
             resetPhase: provider == .codex ? resets.phase : .ready,
             resetNotice: provider == .codex ? resets.notice : nil,
@@ -245,29 +305,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 && (resets.awaitingUpdatedBalance || resets.phase == .uncertain || resets.phase == .submitting),
             resetRetry: provider == .codex && resets.isRetry,
             canReviewReset: provider == .codex && resets.canReviewRecovery(display),
-            reviewReset: { [weak self] in self?.reviewReset() },
+            reviewReset: { owner()?.reviewReset() },
             canUseReset: provider == .codex && resets.canPrepare(display),
-            prepareReset: { [weak self] in self?.prepareReset() },
-            cancelReset: { [weak self] in self?.cancelReset() },
-            confirmReset: { [weak self] in self?.confirmReset() },
-            refresh: { [weak self] in self?.refreshFromPanel() },
-            checkForUpdates: { [weak self] in
-                self?.dropdown.dismiss()
+            prepareReset: { owner()?.prepareReset() },
+            cancelReset: { owner()?.cancelReset(confirmation: confirmation) },
+            confirmReset: { owner()?.confirmReset(confirmation: confirmation) },
+            refresh: { owner()?.refreshFromPanel() },
+            checkForUpdates: {
+                guard let delegate = owner() else { return }
+                delegate.dropdown.dismiss()
                 NSApp.activate()
                 UpdateController.shared.checkForUpdates()
             },
-            quit: { NSApp.terminate(nil) })
+            quit: { if owner() != nil { NSApp.terminate(nil) } }, settingsActionsEnabled: { owner() != nil })
     }
 
-    private func refreshClaudeConnectionStatus() {
-        guard !connectingClaude else { return }
+    private func cancelClaudeConnectionCheck() {
         claudeConnectionCheck?.cancel()
+        claudeConnectionCheck = nil
+        claudeConnectionCheckPending = false
+    }
+
+    private func refreshClaudeConnectionStatus(retryingProfile: Bool = false) {
+        guard !connectingClaude, enabledProviders.contains(.claude) else { return }
+        if claudeConnectionCheck != nil {
+            claudeConnectionCheckPending = true
+            return
+        }
         let readStatus = readClaudeConnectionStatus
+        let profile = ClaudeProfile.resolve(defaults: defaults)
         claudeConnectionCheck = Task { [weak self] in
-            let (status, managed) = await Task.detached(priority: .utility) { readStatus() }.value
-            guard !Task.isCancelled, let self, claudeConnectionStatus != status || canDisconnectClaude != managed else {
+            guard !Task.isCancelled else { return }
+            let result = await Task.detached(priority: .utility) {
+                try? ClaudeProfile.read(at: profile) { _ in readStatus() }
+            }.value
+            guard !Task.isCancelled, let self else { return }
+            claudeConnectionCheck = nil
+            if result == nil {
+                claudeConnectionStatus = .notConfigured
+                canDisconnectClaude = false
+                updateViews()
+            }
+            guard let (status, managed) = result, !claudeConnectionCheckPending else {
+                let shouldRetry = claudeConnectionCheckPending || !retryingProfile
+                claudeConnectionCheckPending = false
+                if shouldRetry { refreshClaudeConnectionStatus(retryingProfile: result == nil) }
                 return
             }
+            guard claudeConnectionStatus != status || canDisconnectClaude != managed else { return }
             claudeConnectionStatus = status
             canDisconnectClaude = managed
             updateViews()
@@ -286,11 +371,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         dropdown?.dismiss()
         NSApp.activate()
         guard picker.runModal() == .OK, let url = picker.url else { return }
-        Task {
+        chooseCLI(for: source) { try ProviderExecutable.Selection(url) }
+    }
+
+    @discardableResult
+    func chooseCLI(for source: UsageProvider, preparing: @escaping @Sendable () throws -> ProviderExecutable.Selection)
+        -> Task<Void, Never>
+    {
+        let state = state(for: source)
+        let request = UUID()
+        state.pendingCLIChoice = request
+        return Task {
+            let prepared = await Task.detached(priority: .userInitiated) { Result(catching: preparing) }.value
+            // A new choice or a switch to automatic can finish while this file is being hashed.
+            guard state.pendingCLIChoice == request else { return }
+            state.pendingCLIChoice = nil
             do {
-                try await Task.detached(priority: .userInitiated) {
-                    try ProviderExecutable.choose(url, name: source.rawValue)
-                }.value
+                try prepared.get().save(name: source.rawValue, defaults: defaults)
                 providerCLIChanged(source)
             } catch {
                 let alert = NSAlert()
@@ -302,9 +399,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func providerCLIChanged(_ source: UsageProvider) {
-        let state = state(for: source)
-        state.reading = nil
-        invalidate(source)
+        clearQuotaResults(source)
         refresh(source: source)
         updateViews()
     }
@@ -331,28 +426,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             previousDirectory != ClaudeProfile.resolve(defaults: defaults)
                 || previousOverride != ClaudeProfile.childConfigurationDirectory(defaults: defaults)
         else { return }
-        claudeConnectionCheck?.cancel()
-        invalidate(.claude)
-        claude.reading = nil
-        claude.tokens = nil
-        claude.failure = nil
-        claude.missingCLI = false
-        claude.tokenFailure = nil
-        claude.lastTokenScan = .distantPast
-        claudeConnectionStatus = .notConfigured
-        canDisconnectClaude = false
-        claudeUsesLegacyReport = false
-        claudeSetupError = nil
-        refreshClaudeConnectionStatus()
-        refresh(source: .claude)
+        clearProviderResults(.claude)
+        refreshClaudeAfterConfigurationChange()
         refreshTokens(source: .claude)
         updateViews()
     }
 
+    private func refreshClaudeAfterConfigurationChange() {
+        refresh(source: .claude)
+        // A quota read already in flight skips the ordinary status check.
+        if claudeConnectionCheck == nil { refreshClaudeConnectionStatus() }
+    }
+
     private func changeClaudeConnection(disconnect: Bool) {
         guard enabledProviders.contains(.claude), !connectingClaude else { return }
-        claudeConnectionCheck?.cancel()
+        cancelClaudeConnectionCheck()
         connectingClaude = true
+        let generation = claude.configurationGeneration
         claudeSetupError = nil
         updateViews()
         Task {
@@ -360,14 +450,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Result { if disconnect { try ClaudeConnection.disconnect() } else { try ClaudeConnection.connect() } }
             }.value
             connectingClaude = false
+            guard enabledProviders.contains(.claude) else {
+                updateViews()
+                return
+            }
+            // A profile manager can change the selected folder while the operation holds
+            // its original profile lock. Recheck before offering Reconnect or Disconnect.
+            claudeConnectionStatus = .notConfigured
+            canDisconnectClaude = false
             switch result {
             case .success:
-                claudeConnectionStatus = disconnect ? .notConfigured : .configured
-                refreshClaudeConnectionStatus()
                 invalidate(.claude)
-                refresh(source: .claude)
+                refreshClaudeAfterConfigurationChange()
             case .failure(let error):
-                claudeSetupError = error.localizedDescription
+                if generation == claude.configurationGeneration { claudeSetupError = error.localizedDescription }
+                refreshClaudeConnectionStatus()
             }
             updateViews()
         }
@@ -377,6 +474,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard page != next else { return }
         if page == .usage { resets.cancel() }
         page = next
+        if next == .settings { settingsVisit &+= 1 }
+        if next == .usage, dropdown?.isVisible == true { refreshVisibleTokensIfDue() }
         updateViews()
     }
 
@@ -385,6 +484,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         detailsExpanded = expanded
         if !expanded { resets.cancel() }
         defaults.set(expanded ? ["details"] : [], forKey: "expandedDashboardSections")
+        if expanded, dropdown?.isVisible == true { refreshVisibleTokensIfDue() }
+        updateViews()
+    }
+
+    private func setShowSpend(_ show: Bool) {
+        guard show != showTokenSpend else { return }
+        showTokenSpend = show
+        defaults.set(show, forKey: "showTokenSpend")
+        updateViews()
+    }
+
+    private func setDailyUsageMode(_ mode: DailyUsageMode) {
+        guard mode != dailyUsageMode else { return }
+        dailyUsageMode = mode
+        defaults.set(mode.rawValue, forKey: DailyUsageMode.preferenceKey)
+        if mode != .off, dropdown?.isVisible == true { refreshVisibleTokensIfDue() }
         updateViews()
     }
 
@@ -394,7 +509,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         providerSelection = next
         defaults.set(next.rawValue, forKey: "providerSelection")
         if let single = next.singleProvider {
-            invalidate(single == .codex ? .claude : .codex)
+            clearProviderResults(single == .codex ? .claude : .codex)
             provider = single
             menuLayout = menuLayout.showing(both: false)
         } else {
@@ -455,7 +570,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateViews()
     }
 
-    private func cancelReset() {
+    private func cancelReset(confirmation: UInt64) {
+        guard resets.confirmationGeneration == confirmation else { return }
         guard provider == .codex else { return }
         resets.cancel()
         updateViews()
@@ -485,7 +601,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateViews()
     }
 
-    private func confirmReset() {
+    private func confirmReset(confirmation: UInt64) {
+        guard resets.confirmationGeneration == confirmation else { return }
         guard resetControlsVisible else { return }
         guard let attempt = resets.begin(display) else {
             if resets.awaitingUpdatedBalance { refresh(source: .codex, checkingResetBalance: true) }
@@ -503,11 +620,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func finishReset(_ outcome: QuotaResetClaimResult) {
         resets.finish(outcome, reading: codex.reading)
-        refresh(source: .codex, checkingResetBalance: outcome == .reset)
+        if networkAvailable == false {
+            updateViews()
+        } else {
+            refresh(source: .codex, checkingResetBalance: outcome == .reset)
+        }
     }
 
     private var resetControlsVisible: Bool {
         provider == .codex && dropdown?.isVisible == true && detailsExpanded && page == .usage
+    }
+
+    private func updateLoadingAnimation() {
+        if let button = item?.button { renderMenuBar(button) }
     }
 
     private func renderMenuBar(_ button: NSStatusBarButton) {
@@ -519,9 +644,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return value.refreshing && !value.hasCurrentPercentage && value.restrictionMessage == nil
                 ? MenuBarBadges.loadingDots : value.menuBarTitle
         }
-        let titles = visibleProviders.map { title(display(for: $0)) }
+        let providers = visibleProviders
+        let titles = providers.map { title(display(for: $0)) }
         let animate =
             titles.contains(MenuBarBadges.loadingDots) && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            && (dropdown?.isVisible == true
+                || zip(providers, titles).contains { source, text in
+                    text == MenuBarBadges.loadingDots && state(for: source).refreshTrigger == .standard
+                })
         if animate && loadingTimer == nil {
             let timer = Timer(timeInterval: 0.28, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated {
@@ -539,75 +669,103 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let phase = animate ? loadingPhase : nil
         if menuLayout.showsBoth {
-            let left = titles[0]
-            let right = titles[1]
-            let logos = menuLayout.showsLogos
-            if badges?.codex != left || badges?.claude != right || badges?.loadingPhase != phase
-                || badges?.logos != logos
-            {
-                let rendered = MenuBarBadges(codex: left, claude: right, font: font, loadingPhase: phase, logos: logos)
-                badges = rendered
+            let style = MenuBarBadges.Style(
+                codex: titles[0], claude: titles[1], logos: menuLayout.showsLogos, font: font,
+                appearance: button.effectiveAppearance)
+            if badges == nil {
                 button.attributedTitle = NSAttributedString(string: "")
                 button.imagePosition = .imageOnly
                 button.imageScaling = .scaleNone
-                button.image = rendered.image
             }
+            guard badges?.style != style || badges?.loadingPhase != phase else { return }
+            if badges?.style != style || phase == nil { loadingBadgeFrames.removeAll(keepingCapacity: true) }
+            let rendered: MenuBarBadges
+            if let phase, let cached = loadingBadgeFrames[phase] {
+                rendered = cached
+            } else {
+                rendered = MenuBarBadges(style: style, loadingPhase: phase)
+                if let phase { loadingBadgeFrames[phase] = rendered }
+            }
+            badges = rendered
+            button.image = rendered.image
         } else {
             badges = nil
-            button.imagePosition = menuLayout.showsLogos ? .imageLeading : .noImage
-            button.image = menuLayout.showsLogos ? ProviderLogo.image(for: provider) : nil
+            loadingBadgeFrames.removeAll(keepingCapacity: true)
+            let position: NSControl.ImagePosition = menuLayout.showsLogos ? .imageLeading : .noImage
+            if button.imagePosition != position { button.imagePosition = position }
+            let image = menuLayout.showsLogos ? ProviderLogo.image(for: provider) : nil
+            if button.image !== image { button.image = image }
             let text = titles[0]
+            let title: NSAttributedString
             if !menuLayout.showsLogos {
                 // Without a logo, the provider's color identifies the percentage.
-                button.attributedTitle = MenuBarBadges.label(
+                title = MenuBarBadges.label(
                     text, font: font, color: provider.menuBarColor, loadingPhase: phase)
             } else {
-                button.attributedTitle =
+                title =
                     text == MenuBarBadges.loadingDots
                     ? MenuBarBadges.label(text, font: font, color: .labelColor, loadingPhase: phase)
                     : NSAttributedString(string: text)
             }
+            if !button.attributedTitle.isEqual(to: title) { button.attributedTitle = title }
         }
     }
 
     private func updateViews() {
         guard let button = item?.button else { return }
         renderMenuBar(button)
-        let accessibility = visibleProviders.map { display(for: $0).tooltipReading }.joined(separator: "\n")
-        let hasPercentage = visibleProviders.contains { display(for: $0).hasCurrentPercentage }
-        let toggleHint =
-            percentageMode == .remaining
-            ? "Secondary-click to show the amount used." : "Secondary-click to show the amount left."
-        button.toolTip =
-            accessibility + "\nClick for details." + (hasPercentage ? " " + toggleHint : "")
+        let accessibility = visibleProviders.map { display(for: $0).accessibilityReading }.joined(separator: "\n")
         button.setAccessibilityLabel(accessibility)
         button.setAccessibilityHelp("Open details to change how percentages are shown.")
         if dropdown.isVisible {
-            dashboard.rootView = makePanel()
+            dropdown.presentPage(makePanel(forPresentation: true))
             dropdown.fitToDashboard()
         }
-        scheduleExpiry()
+        scheduleTimers()
     }
 
-    private func scheduleExpiry() {
+    private func updateDisplayTimer() {
+        let pollLegacyCache = enabledProviders.contains(.claude) && claudeUsesLegacyReport && networkAvailable != false
+        guard (dropdown.isVisible && page == .usage) || pollLegacyCache else {
+            displayTimer?.invalidate()
+            displayTimer = nil
+            return
+        }
+        guard displayTimer == nil else { return }
+        let timer = Timer(fire: Date().addingTimeInterval(30), interval: 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tick() }
+        }
+        timer.tolerance = 3
+        RunLoop.main.add(timer, forMode: .common)
+        displayTimer = timer
+    }
+
+    private func scheduleTimers() {
+        updateDisplayTimer()
         let now = quotaNow()
-        var deadlines = enabledProviders.compactMap { source -> Date? in
-            let value = display(for: source)
-            return value.stale ? nil : value.validUntil
-        }
+        var deadlines: [Date] = []
         for source in enabledProviders {
+            if let retry = retryDate(for: source, at: now) { deadlines.append(retry) }
             let state = state(for: source)
-            if !state.refreshing, networkAvailable != false, source != .codex || canRetryCodex,
-                let retry = state.nextRetry(at: now)
-            {
-                deadlines.append(retry)
+            guard let reading = state.reading else { continue }
+            let value = display(for: source)
+            if !value.stale, let expiry = value.validUntil { deadlines.append(expiry) }
+            if reading.fetchedAt > now { deadlines.append(reading.fetchedAt) }
+            // A later reset can still trigger a new read after an earlier window or reading has expired.
+            if !state.refreshing, canRefreshQuota(for: source), let reset = state.nextWindowReset {
+                deadlines.append(reset)
             }
         }
-        if dropdown.isVisible, let day = Calendar.current.dateInterval(of: .day, for: now) {
+        if let day = Calendar.current.dateInterval(of: .day, for: now),
+            dropdown.isVisible
+                || visibleProviders.contains(where: { source in
+                    state(for: source).reading.map { day.contains($0.fetchedAt) } == true
+                })
+        {
             deadlines.append(day.end)
-            if provider == .codex, let expiry = codex.reading?.resetCredits?.nextExpiration(at: now) {
-                deadlines.append(expiry)
-            }
+        }
+        if dropdown.isVisible, provider == .codex, let expiry = codex.reading?.resetCredits?.nextExpiration(at: now) {
+            deadlines.append(expiry)
         }
         let deadline = deadlines.min()
         guard deadline != expiryTimer?.fireDate else { return }
@@ -641,7 +799,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             selectPercentageMode(percentageMode.toggled)
             return
         }
-        if target != provider {
+        if secondaryClick, dropdown.isVisible, target == provider {
+            // The unavailable-badge shortcut shows this provider's status, even if already open.
+            selectPage(.usage)
+            return
+        }
+        let clickAnchor = DropdownPanel.AnchorGeometry(button)
+        // Either badge toggles expanded Details. The provider picker controls which history it shows.
+        let keepsDetailsProvider = !secondaryClick && page == .usage && detailsExpanded
+        if target != provider && !keepsDetailsProvider {
             selectProvider(target)
             if dropdown.isVisible {
                 selectPage(.usage)
@@ -652,10 +818,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         tick()
-        refreshTokensIfDue()
-        dashboard.rootView = makePanel()
-        dropdown.show(under: button)
-        scheduleExpiry()
+        refreshVisibleTokensIfDue()
+        dropdown.presentPage(makePanel(forPresentation: true))
+        showDropdown(under: button, fallback: clickAnchor)
+    }
+
+    private func showDropdown(under button: NSStatusBarButton, fallback: DropdownPanel.AnchorGeometry? = nil) {
+        dropdown.show(under: button, fallback: fallback)
+        updateLoadingAnimation()
+        scheduleTimers()
     }
 
     func applicationDidResignActive(_ notification: Notification) {
@@ -679,10 +850,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         retryLaunchReadOnFailure.removeAll()
         if available { codex.consecutiveFailures = 0 }
-        for source in enabledProviders {
-            invalidate(source)
-            if !available { state(for: source).failure = "Offline. QuotaBar will check when the connection returns." }
-        }
+        for source in enabledProviders { invalidate(source) }
         updateViews()
         if available {
             for source in enabledProviders { refresh(source: source) }
@@ -693,64 +861,113 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         codex.consecutiveFailures = 0
         for source in UsageProvider.allCases { invalidate(source) }
         updateViews()
-        refreshAll()
+        refreshAndRestartTimer()
     }
 
     private func invalidate(_ source: UsageProvider) {
         let state = state(for: source)
         state.generation += 1
         state.needsVerification = true
+        if source == .codex, resets.phase == .confirming {
+            resets.cancelInvalidConfirmation(display(for: .codex))
+        }
+    }
+
+    private func clearQuotaResults(_ source: UsageProvider) {
+        invalidate(source)
+        let state = state(for: source)
+        state.reading = nil
+        state.failure = nil
+        state.missingCLI = false
+        state.restrictionUnconfirmed = false
+        state.consecutiveFailures = 0
+        if source == .codex { resets.clearUnverifiedBalanceNotice(for: nil) }
+        if source == .claude { claudeUsesLegacyReport = false }
+    }
+
+    private func clearProviderResults(_ source: UsageProvider) {
+        clearQuotaResults(source)
+        let state = state(for: source)
+        state.tokens = nil
+        state.tokenFailure = nil
+        state.lastTokenScan = .distantPast
+        state.configurationGeneration += 1
+        if source == .claude {
+            cancelClaudeConnectionCheck()
+            claudeConnectionStatus = .notConfigured
+            canDisconnectClaude = false
+            claudeSetupError = nil
+        }
     }
 
     private func refreshFromPanel() {
         for source in enabledProviders where state(for: source).refreshing {
-            invalidate(source)
+            let state = state(for: source)
+            // Supersede the in-flight read while keeping the last verified reading visible.
+            state.generation += 1
+            state.refreshTrigger = .standard
         }
         refreshAndRestartTimer()
+        updateLoadingAnimation()
     }
 
-    private func refreshAndRestartTimer() {
+    private func refreshAndRestartTimer(_ trigger: RefreshTrigger = .standard) {
         autoRefreshTimer?.invalidate()
         let timer = Timer(
             fire: quotaNow().addingTimeInterval(QuotaDisplay.refreshInterval), interval: 0, repeats: false
         ) {
             [weak self] _ in
-            MainActor.assumeIsolated { self?.refreshAndRestartTimer() }
+            MainActor.assumeIsolated { self?.refreshAndRestartTimer(.scheduled) }
         }
         autoRefreshTimer = timer
         RunLoop.main.add(timer, forMode: .common)
-        refreshAll()
+        refreshAll(trigger)
     }
 
-    private func refreshAll() {
+    private func refreshAll(_ trigger: RefreshTrigger = .standard) {
         for source in enabledProviders {
-            refresh(source: source)
+            refresh(source: source, trigger: trigger)
             refreshTokens(source: source)
         }
     }
 
-    private func refreshTokensIfDue() {
-        if Date().timeIntervalSince(current.lastTokenScan) >= 15
-            || current.lastTokenScan > Date()
-            || !Calendar.current.isDateInToday(current.lastTokenScan)
-            || current.tokenTimeZone != .current
-        {
-            refreshTokens(source: provider)
+    func refreshVisibleTokensIfDue() {
+        guard page == .usage else { return }
+        let now = Date()
+        let calendar = Calendar.current
+        for source in enabledProviders where dailyUsageMode != .off || (detailsExpanded && source == provider) {
+            let state = state(for: source)
+            guard !state.countingTokens else { continue }
+            if now.timeIntervalSince(state.lastTokenScan) >= 15
+                || !state.hasCurrentTokenDay(at: now, calendar: calendar)
+            {
+                refreshTokens(source: source)
+            }
         }
     }
 
-    private func refreshTokens(source: UsageProvider) {
+    private func refreshTokens(source: UsageProvider, retryingProfile: Bool = false) {
         let state = state(for: source)
-        guard enabledProviders.contains(source), !state.countingTokens else { return }
+        guard enabledProviders.contains(source) else { return }
+        if state.countingTokens {
+            state.tokenRefreshPending = true
+            return
+        }
         let asOf = Date()
         let timeZone = TimeZone.current
         let profile = ClaudeProfile.resolve(defaults: defaults)
+        let generation = state.configurationGeneration
         state.countingTokens = true
         updateViews()
         Task(priority: .utility) {
+            var profileChanged = false
             do {
-                state.tokens = try await tokenReader.totals(for: source, now: asOf, claudeProfile: profile)
+                state.tokens = try await state.tokenReader.totals(for: source, now: asOf, claudeProfile: profile)
                 state.tokenFailure = nil
+            } catch ClaudeProfile.ReadError.directoryChanged {
+                state.tokens = nil
+                state.tokenFailure = nil
+                profileChanged = true
             } catch {
                 state.tokens = nil
                 state.tokenFailure = "Local \(source.name) token history is unavailable. Refresh to try again."
@@ -758,47 +975,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             state.lastTokenScan = asOf
             state.tokenTimeZone = timeZone
             state.countingTokens = false
-            if (source == .claude && profile != ClaudeProfile.resolve(defaults: defaults)) || asOf > Date()
-                || !Calendar.current.isDateInToday(asOf) || timeZone != .current
-            {
+            let obsolete =
+                generation != state.configurationGeneration
+                || (source == .claude && profile != ClaudeProfile.resolve(defaults: defaults))
+                || asOf > Date() || !Calendar.current.isDateInToday(asOf) || timeZone != .current
+            if obsolete {
                 state.tokens = nil
-                refreshTokens(source: source)
+                state.tokenFailure = nil
             }
-            if provider == source { updateViews() }
+            if obsolete || state.tokenRefreshPending || (profileChanged && !retryingProfile) {
+                state.tokenRefreshPending = false
+                refreshTokens(source: source, retryingProfile: profileChanged)
+            }
+            if provider == source || dropdown?.isVisible == true { updateViews() }
         }
     }
 
     func tick() {
         let now = quotaNow()
-        if dropdown?.isVisible == true { refreshTokensIfDue() }
+        if resets.phase == .confirming {
+            let value = display(for: .codex)
+            resets.cancelInvalidConfirmation(value)
+            if value.stale { refresh(source: .codex) }
+        }
+        if dropdown?.isVisible == true { refreshVisibleTokensIfDue() }
         for source in enabledProviders {
             let state = state(for: source)
-            let crossedReset =
-                state.reading?.windows.contains { window in
-                    guard let reset = window.resetsAt else { return false }
-                    return reset > state.lastAttempt && reset <= now
-                } ?? false
+            let crossedReset = state.nextWindowReset.map { $0 <= now } == true
             if state.retryAt.map({ $0 <= now }) == true || crossedReset {
                 refresh(source: source)
             } else if state.balancePoll?.fireDate(at: now).map({ $0 <= now }) == true {
                 refresh(source: source, checkingResetBalance: true)
             } else if source == .claude && claudeUsesLegacyReport {
-                refresh(source: source, legacyCacheOnly: true)
+                refresh(source: source, trigger: .legacyCache)
             }
         }
         updateViews()
     }
 
-    private func refresh(source: UsageProvider, legacyCacheOnly: Bool = false, checkingResetBalance: Bool = false) {
+    private func refresh(
+        source: UsageProvider, checkingResetBalance: Bool = false,
+        trigger: RefreshTrigger = .standard, retryingClaudeProfile: Bool = false
+    ) {
         let state = state(for: source)
-        guard enabledProviders.contains(source), !state.refreshing else { return }
+        guard enabledProviders.contains(source) else { return }
+        if state.refreshing {
+            // A status-line cache read cannot satisfy a requested live account check.
+            if state.refreshTrigger == .legacyCache, trigger != .legacyCache {
+                state.refreshTrigger = trigger
+            }
+            return
+        }
         if source == .claude { refreshClaudeConnectionStatus() }
         guard networkAvailable != false else { return }
         if source == .codex, resets.phase == .submitting || resets.phase == .confirming {
             if !checkingResetBalance { state.retryAt = quotaNow() }
             return
         }
-        state.refreshing = true
+        state.refreshTrigger = trigger
         state.retryAt = nil
         state.balancePoll = nil
         state.lastAttempt = quotaNow()
@@ -811,28 +1045,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let readCodex = self.readCodex
         let readClaude = self.readClaude
         let readLegacyClaude = self.readLegacyClaude
+        let profile = source == .claude ? ClaudeProfile.resolve(defaults: defaults) : nil
         updateViews()
         Task {
             let (result, usesLegacyReport) = await Task.detached(priority: .utility) {
                 () -> (Result<QuotaReading?, Error>, Bool) in
-                if source == .codex {
+                guard let profile else {
                     return (Result { try readCodex(needsUserIdentity) }, false)
                 }
-                if !legacyCacheOnly {
-                    do {
-                        return (.success(try readClaude()), false)
-                    } catch ClaudeUsageClient.Failure.unsupported {
-                        // Older clients report usage through the status line.
-                    } catch {
-                        return (.failure(error), false)
+                var legacy = trigger == .legacyCache
+                let reading = Result {
+                    try ClaudeProfile.read(at: profile) { _ in
+                        if !legacy {
+                            do {
+                                return try readClaude()
+                            } catch ClaudeUsageClient.Failure.unsupported {
+                                legacy = true
+                            }
+                        }
+                        return try readLegacyClaude()
                     }
                 }
-                return (Result { try readLegacyClaude() }, true)
+                return (reading, legacy)
             }.value
-            state.refreshing = false
-            guard generation == state.generation else {
+            let requestedTrigger = state.refreshTrigger
+            state.refreshTrigger = nil
+            guard generation == state.generation, requestedTrigger == trigger else {
                 updateViews()
-                refresh(source: source)
+                let scheduledFollowUp = trigger == .legacyCache && requestedTrigger == .scheduled
+                refresh(source: source, trigger: scheduledFollowUp ? .scheduled : .standard)
+                return
+            }
+            if case .failure(ClaudeProfile.ReadError.directoryChanged) = result {
+                state.reading = nil
+                state.missingCLI = false
+                state.needsVerification = true
+                claudeUsesLegacyReport = false
+                if retryingClaudeProfile {
+                    state.failure = "Claude’s profile changed during refresh. QuotaBar will check again shortly."
+                    state.retryAt = quotaNow().addingTimeInterval(5)
+                    updateViews()
+                } else {
+                    state.failure = nil
+                    refresh(source: source, retryingClaudeProfile: true)
+                }
                 return
             }
             if source == .claude {
@@ -857,17 +1113,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 state.failure =
                     (error as? LocalizedError)?.errorDescription
                     ?? "Couldn’t read \(source.name) limits. Try refreshing."
-                if checkingResetBalance { break }
-                state.consecutiveFailures = min(state.consecutiveFailures + 1, 4)
-                let delay: TimeInterval
+                let transientCodexFailure: Bool
                 switch error as? QuotaError {
-                case .codexNotFound?, .signInRequired?, .subscriptionRequired?, .quotaUnavailable?:
-                    delay = QuotaDisplay.refreshInterval
-                default:
-                    delay =
-                        source == .codex
-                        ? [5.0, 15, 30, 60][state.consecutiveFailures - 1] : QuotaDisplay.refreshInterval
+                case .signInRequired?, .subscriptionRequired?:
+                    // A verified sign-out or API-key session ends the previous subscription account.
+                    state.reading = nil
+                    state.restrictionUnconfirmed = false
+                    resets.clearUnverifiedBalanceNotice(for: nil)
+                    transientCodexFailure = false
+                case .codexNotFound?, .quotaUnavailable?: transientCodexFailure = false
+                default: transientCodexFailure = source == .codex
                 }
+                if checkingResetBalance {
+                    if transientCodexFailure, let reading = state.reading {
+                        state.balancePoll = resets.nextBalancePoll(for: reading, at: quotaNow())
+                    }
+                    break
+                }
+                state.consecutiveFailures = min(state.consecutiveFailures + 1, 4)
+                let delay =
+                    transientCodexFailure
+                    ? [5.0, 15, 30, 60][state.consecutiveFailures - 1] : QuotaDisplay.refreshInterval
                 state.retryAt = quotaNow().addingTimeInterval(delay)
                 if retryOnFailure { refresh(source: source) }
             }
@@ -875,8 +1141,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 updateViews()
                 if state.missingCLI, !defaults.bool(forKey: "didPresentCLISetup"), let button = item?.button {
                     if !dropdown.isVisible {
-                        dashboard.rootView = makePanel()
-                        dropdown.show(under: button)
+                        dropdown.presentPage(makePanel(forPresentation: true))
+                        showDropdown(under: button)
                     }
                     if dropdown.isVisible { defaults.set(true, forKey: "didPresentCLISetup") }
                 }

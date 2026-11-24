@@ -63,15 +63,16 @@ enum ClaudeConnection {
             let command = line["command"] as? String
         else { return .notConfigured }
         let root = directory.appendingPathComponent(".quotabar", isDirectory: true)
-        if isManagedCommand(command, root: root) {
-            var info = stat()
-            guard lstat(root.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR,
-                let state = try? loadState(root).state,
-                let script = try? read(root.appendingPathComponent("statusline.sh")),
+        var info = stat()
+        let directoryExists = lstat(root.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFDIR
+        let state = directoryExists ? try? loadState(root).state : nil
+        if isManagedCommand(command, root: root, previousProfile: state?.captureProfile) {
+            guard let state, let script = try? read(root.appendingPathComponent("statusline.sh")),
                 let version = version(of: script, state: state)
             else { return .notConfigured }
             let installed = URL(fileURLWithPath: state.executable)
             return version == .current && state.disconnectHelperSHA256 != nil
+                && state.disconnectHelperSHA256 == bundledHelperDigest
                 && FileManager.default.isExecutableFile(atPath: root.appendingPathComponent(helperName).path)
                 && FileManager.default.isExecutableFile(atPath: root.appendingPathComponent("uninstall.sh").path)
                 && !isTranslocated(installed)
@@ -92,14 +93,19 @@ enum ClaudeConnection {
         let files = FileManager.default
         try files.createDirectory(
             at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        try withProfileLock(directory) { try install(directory: directory, executable: executable, observe: observe) }
+        try withProfileLock(directory) { try install(directory: $0, executable: executable, observe: observe) }
     }
 
-    private static func withProfileLock(_ directory: URL, body: () throws -> Void) throws {
-        let lock = open(directory.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    private static func withProfileLock(_ selected: URL, body: (URL) throws -> Void) throws {
+        let lock = open(selected.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         guard lock >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
         defer { close(lock) }
         guard flock(lock, LOCK_EX) == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        // The selected profile can be a symlink. Keep every write and rollback in the
+        // directory we locked, even if a profile manager switches the selection.
+        var path = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        guard fcntl(lock, F_GETPATH, &path) == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        let directory = URL(fileURLWithFileSystemRepresentation: path, isDirectory: true, relativeTo: nil)
         // Cooperate with earlier installers while migrating their lock file.
         let legacyLock = directory.appendingPathComponent(".quotabar-connection.lock")
         let oldLock = open(legacyLock.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
@@ -112,7 +118,7 @@ enum ClaudeConnection {
                 throw POSIXError(.init(rawValue: errno) ?? .EIO)
             }
         }
-        try body()
+        try body(directory)
     }
 
     private static func isTranslocated(_ url: URL) -> Bool {
@@ -146,7 +152,7 @@ enum ClaudeConnection {
         }
         let root = directory.appendingPathComponent(".quotabar", isDirectory: true)
         let currentCommand = line["command"] as? String
-        let currentlyManaged = currentCommand.map { isManagedCommand($0, root: root) } ?? false
+        var currentlyManaged = currentCommand.map { isManagedCommand($0, root: root) } ?? false
         if let currentCommand, !currentlyManaged, legacyConnection(currentCommand) { return }
         let scriptURL = root.appendingPathComponent("statusline.sh")
         let stateURL = root.appendingPathComponent("state.json")
@@ -163,8 +169,21 @@ enum ClaudeConnection {
             }
             let record = try loadState(root)
             oldState = record.state
+            if !currentlyManaged, let currentCommand, let previous = record.state.captureProfile {
+                currentlyManaged = isManagedCommand(currentCommand, root: root, previousProfile: previous)
+            }
             guard oldState?.disconnecting == nil else {
                 throw SetupError(message: "Finish disconnecting this Claude profile before reconnecting.")
+            }
+            // Making a command that calls our own wrapper its new original would erase the
+            // previous command and backup. The recursion guard would then skip its output.
+            if !currentlyManaged, let currentCommand,
+                referencesWrapper(currentCommand, root: root, previousProfile: record.state.captureProfile)
+            {
+                throw SetupError(
+                    message:
+                        "The edited Claude status line still calls QuotaBar’s script. Remove that reference or restore the original wrapper invocation before reconnecting."
+                )
             }
             oldScript = try read(scriptURL)
             oldStateData = record.bytes
@@ -359,7 +378,7 @@ enum ClaudeConnection {
     }
 
     static func disconnect(directory: URL, observe: ClaudeSettingsCommit.Observer? = nil) throws {
-        try withProfileLock(directory) {
+        try withProfileLock(directory) { directory in
             let root = directory.appendingPathComponent(".quotabar")
             guard canDisconnect(directory: directory) else {
                 throw SetupError(
@@ -387,7 +406,8 @@ enum ClaudeConnection {
                 let document = try ClaudeSettingsDocument(current)
                 _ = try document.rawStatusLine()
                 if let line = document.object["statusLine"] as? [String: Any], line["type"] as? String == "command",
-                    let command = line["command"] as? String, isManagedCommand(command, root: root)
+                    let command = line["command"] as? String,
+                    isManagedCommand(command, root: root, previousProfile: state.captureProfile)
                 {
                     if missingDuringCleanup, state.settingsBackup != nil && state.settingsBackup != "absent" {
                         throw SetupError(
@@ -404,7 +424,7 @@ enum ClaudeConnection {
                     try ClaudeSettingsCommit.apply(updated, replacing: current, at: settingsURL, observe: observe)
                 } else if let line = document.object["statusLine"] as? [String: Any],
                     let command = line["command"] as? String,
-                    referencesWrapper(command, root: root)
+                    referencesWrapper(command, root: root, previousProfile: state.captureProfile)
                 {
                     throw SetupError(
                         message:
@@ -412,7 +432,7 @@ enum ClaudeConnection {
                     )
                 }
             }
-            guard try !selectsWrapper(settingsURL, root: root) else {
+            guard try !selectsWrapper(settingsURL, root: root, previousProfile: state.captureProfile) else {
                 throw SetupError(
                     message:
                         "A Claude settings edit selected the wrapper again. Review the current status line before disconnecting."
@@ -433,25 +453,43 @@ enum ClaudeConnection {
         }
     }
 
-    private static func selectsWrapper(_ url: URL, root: URL) throws -> Bool {
+    private static func selectsWrapper(_ url: URL, root: URL, previousProfile: String? = nil) throws -> Bool {
         guard let data = try read(url) else { return false }
         let doc = try ClaudeSettingsDocument(data)
         _ = try doc.rawStatusLine()
         guard let line = doc.object["statusLine"] as? [String: Any], let command = line["command"] as? String else {
             return false
         }
-        return referencesWrapper(command, root: root)
+        return referencesWrapper(command, root: root, previousProfile: previousProfile)
     }
 
-    private static func referencesWrapper(_ command: String, root: URL) -> Bool {
-        if isManagedCommand(command, root: root) { return true }
+    private static func referencesWrapper(_ command: String, root: URL, previousProfile: String? = nil) -> Bool {
+        if let path = literalInvocationPath(command) {
+            return isManagedPath(path, root: root, previousProfile: previousProfile)
+        }
+        // Also recognize literal wrapper operands in pipelines, including escaped paths and aliases.
+        if let words = literalWords(command, compoundProfile: root.deletingLastPathComponent()),
+            words.contains(where: {
+                $0.hasPrefix("/") && isManagedPath($0, root: root, previousProfile: previousProfile)
+            })
+        {
+            return true
+        }
         let script = root.appendingPathComponent("statusline.sh")
         var paths = [script.path, script.resolvingSymlinksInPath().path]
         if let physical = realpath(script.path, nil) {
             paths.append(String(cString: physical))
             free(physical)
         }
-        return paths.contains { command.contains($0) || command.contains(quote($0)) }
+        if let previous = missingRecordedWrapper(in: previousProfile) { paths.append(previous) }
+        // A shell command embedded inside a quoted argument may still name the wrapper.
+        // Require the end of its name so scripts such as statusline.sh.personal remain independent.
+        return paths.contains { path in
+            [path, quote(path)].contains { spelling in
+                let pattern = NSRegularExpression.escapedPattern(for: spelling) + #"(?=$|[\s'";&|<>()`])"#
+                return command.range(of: pattern, options: .regularExpression) != nil
+            }
+        }
     }
 
     private static func restoredSettings(
@@ -509,46 +547,96 @@ enum ClaudeConnection {
         "/bin/bash " + quote(root.appendingPathComponent("statusline.sh").path)
     }
 
-    private static func isManagedCommand(_ command: String, root: URL) -> Bool {
+    private static func isManagedCommand(_ command: String, root: URL, previousProfile: String? = nil) -> Bool {
+        guard let path = literalInvocationPath(command) else { return false }
+        return isManagedPath(path, root: root, previousProfile: previousProfile)
+    }
+
+    private static func literalInvocationPath(_ command: String) -> String? {
         guard let words = literalWords(command), let path = words.last,
+            path.hasPrefix("/"),
             words.count == 1 || (words.count == 2 && ["/bin/bash", "bash"].contains(words[0]))
-        else { return false }
-        guard path.hasPrefix("/") else { return false }
+        else { return nil }
+        return path
+    }
+
+    private static func isManagedPath(_ path: String, root: URL, previousProfile: String?) -> Bool {
         let script = root.appendingPathComponent("statusline.sh")
         if sameFile(path, script.path) { return true }
         // When the script is missing, recognize the installer's target through directory aliases for repair.
         let suffix = "/.quotabar/statusline.sh"
         guard path.hasSuffix(suffix) else { return false }
         let parent = String(path.dropLast(suffix.count))
+        // A renamed profile still selects its old absolute path. Keep a live source wrapper
+        // distinct so that a copied profile can continue chaining to the original one.
+        if parent == previousProfile, missingRecordedWrapper(in: previousProfile) == path { return true }
         return sameFile(parent.isEmpty ? "/" : parent, root.deletingLastPathComponent().path)
+    }
+
+    private static func missingRecordedWrapper(in profile: String?) -> String? {
+        guard let profile, profile.hasPrefix("/") else { return nil }
+        let path = URL(fileURLWithPath: profile).appendingPathComponent(".quotabar/statusline.sh").path
+        var info = stat()
+        return lstat(path, &info) != 0 && errno == ENOENT ? path : nil
     }
 
     // Decode shell quoting and escapes for literal words only. An active shell operator or expansion
     // makes the entire command custom, even when one operand happens to identify our wrapper.
-    private static func literalWords(_ command: String) -> [String]? {
+    private static func literalWords(_ command: String, compoundProfile: URL? = nil) -> [String]? {
         guard !command.utf8.contains(0) else { return nil }
+        let allowCompound = compoundProfile != nil
         let operators = CharacterSet(charactersIn: ";&|<>(){}*?[]\r\n")
-        var scalars = command.unicodeScalars.makeIterator()
+        var scalars = command.unicodeScalars[...]
         var delimiter: Unicode.Scalar?
         var words: [String] = []
         var word = ""
         var started = false
-        while let scalar = scalars.next() {
+        // These shell roots can identify a dependency while checking an edited command.
+        // They never establish ownership or allow QuotaBar to replace a dynamic command.
+        let shellRoots = compoundProfile.map {
+            (profile: $0.path, home: ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory())
+        }
+        while let scalar = scalars.popFirst() {
             if scalar == delimiter {
                 delimiter = nil
             } else if scalar == "\\", delimiter != "'" {
-                guard let escaped = scalars.next(), escaped != "\n" else { return nil }
+                guard let escaped = scalars.popFirst(), escaped != "\n" else { return nil }
                 if delimiter == "\"", !["$", "`", "\"", "\\"].contains(escaped) {
                     word.unicodeScalars.append("\\")
                 }
                 word.unicodeScalars.append(escaped)
-            } else if delimiter != "'", scalar == "$" || scalar == "`" {
+            } else if scalar == "~", !started, delimiter == nil, scalars.first == "/", let shellRoots {
+                word = shellRoots.home
+            } else if scalar == "$", delimiter != "'", word.isEmpty, let shellRoots {
+                // Claude uses the selected directory when set, and $HOME/.claude otherwise.
+                // Both branches of this conventional default name the active profile. Match
+                // active home expansions and balanced quotes, leaving other defaults alone.
+                if scalars.starts(with: "{CLAUDE_CONFIG_DIR:-".unicodeScalars),
+                    let fallback = Substring(scalars).prefixMatch(
+                        of: #/\{CLAUDE_CONFIG_DIR:-("?)\$(?:HOME|\{HOME\})(?:\1/\.claude|/\.claude\1)\}/#)
+                {
+                    scalars = scalars.dropFirst(fallback.0.utf8.count)
+                    word = shellRoots.profile
+                    started = true
+                    continue
+                }
+                word = "$"
+                for (name, value) in [("CLAUDE_CONFIG_DIR", shellRoots.profile), ("HOME", shellRoots.home)] {
+                    let spelling = scalars.first == "{" ? "{" + name + "}" : name
+                    guard scalars.starts(with: spelling.unicodeScalars) else { continue }
+                    let tail = scalars.dropFirst(spelling.utf8.count)
+                    guard tail.first == "/" || tail.first == "\"" || tail.first == "'" else { continue }
+                    scalars = tail
+                    word = value
+                    break
+                }
+            } else if !allowCompound, delimiter != "'", scalar == "$" || scalar == "`" {
                 return nil
             } else if delimiter != nil {
                 word.unicodeScalars.append(scalar)
             } else if scalar == "'" || scalar == "\"" {
                 delimiter = scalar
-            } else if scalar == " " || scalar == "\t" {
+            } else if scalar == " " || scalar == "\t" || (allowCompound && operators.contains(scalar)) {
                 if started {
                     words.append(word)
                     word = ""
@@ -556,10 +644,10 @@ enum ClaudeConnection {
                 }
                 continue
             } else {
-                guard !operators.contains(scalar), started || scalar != "#" else { return nil }
+                guard allowCompound || (!operators.contains(scalar) && (started || scalar != "#")) else { return nil }
                 word.unicodeScalars.append(scalar)
             }
-            guard words.count < 2 else { return nil }
+            guard allowCompound || words.count < 2 else { return nil }
             started = true
         }
         guard delimiter == nil else { return nil }
@@ -625,6 +713,9 @@ enum ClaudeConnection {
     }
 
     private static let helperName = "QuotaBarClaudeDisconnect"
+    // A same-path app update can replace its helper without changing the wrapper or capture executable.
+    // The bundle belongs to this running app version. Fingerprint it once across status polls.
+    private static let bundledHelperDigest = (try? bundledHelper()).map(digest)
 
     private static func bundledHelper() throws -> Data {
         guard let executable = Bundle.main.executableURL else { throw CocoaError(.fileNoSuchFile) }

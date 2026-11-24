@@ -8,10 +8,12 @@ actor LocalTokenReader {
         switch provider {
         case .codex: return try codex.read(now: now)
         case .claude:
-            if let claude, claude.profile == claudeProfile { return try claude.history.read(now: now) }
-            let history = ClaudeTokenHistory(profile: claudeProfile)
-            claude = (claudeProfile, history)
-            return try history.read(now: now)
+            return try ClaudeProfile.read(at: claudeProfile) { directory in
+                if let claude, claude.profile == directory { return try claude.history.read(now: now) }
+                let history = ClaudeTokenHistory(profile: directory)
+                claude = (directory, history)
+                return try history.read(now: now)
+            }
         }
     }
 }

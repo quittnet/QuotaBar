@@ -4,9 +4,12 @@ import SwiftUI
 @MainActor
 final class DropdownPanel: NSPanel {
     private let dashboard: NSHostingController<Dashboard>
+    private var settingsDashboard: NSHostingController<Dashboard>?
     private let body = NSView()
     private let footer: NSHostingView<AnyView>
     private weak var anchor: NSStatusBarButton?
+    private var anchorObservers: [NSObjectProtocol] = []
+    private var fittedScreenSize: NSSize?
     private var globalClick: Any?
     private var localMonitor: Any?
     var onDismiss: (() -> Void)?
@@ -55,43 +58,148 @@ final class DropdownPanel: NSPanel {
         contentViewController = container
     }
 
-    func show(under button: NSStatusBarButton) {
-        guard button.window?.screen != nil else { return }
+    /// The primary dashboard remains the mounted page model and keeps its view/controller identity.
+    /// The Settings controls stay in one native host. Hidden hosts do not enter fitting or event routing.
+    func presentPage(_ model: Dashboard) {
+        guard model.page == .settings else {
+            hideSettings()
+            dashboard.rootView = model
+            return
+        }
+        let renderer: NSHostingController<Dashboard>
+        if let settingsDashboard {
+            renderer = settingsDashboard
+            renderer.rootView = model
+        } else {
+            renderer = NSHostingController(rootView: model)
+            renderer.sizingOptions = []
+            settingsDashboard = renderer
+            contentViewController?.addChild(renderer)
+        }
+        if renderer.view.superview == nil {
+            body.addSubview(renderer.view, positioned: .above, relativeTo: dashboard.view)
+        }
+        renderer.view.isHidden = false
+        var page = model
+        page.hostedSettingsSize = renderer.view.bounds.size
+        dashboard.rootView = page
+    }
+
+    private func hideSettings() {
+        guard let renderer = settingsDashboard, !renderer.view.isHidden else { return }
+        if let responder = firstResponder as? NSView, responder.isDescendant(of: renderer.view) {
+            makeFirstResponder(nil)
+        }
+        renderer.view.isHidden = true
+        renderer.view.removeFromSuperview()
+        renderer.rootView.discardHiddenSettingsData()
+    }
+
+    @MainActor struct AnchorGeometry {
+        let window: NSWindow
+        let buttonRect: NSRect
+        let limits: NSRect
+
+        init?(_ button: NSStatusBarButton) {
+            guard let window = button.window, let screen = window.screen else { return nil }
+            self.window = window
+            buttonRect = window.convertToScreen(button.convert(button.bounds, to: nil))
+            limits = screen.visibleFrame.insetBy(dx: 4, dy: 4)
+        }
+    }
+
+    func show(under button: NSStatusBarButton, fallback: AnchorGeometry? = nil) {
+        // Updating the badge can briefly detach its screen after AppKit has delivered the click.
+        guard let geometry = AnchorGeometry(button) ?? fallback else {
+            if !isVisible { dashboard.rootView.isPresented = false }
+            return
+        }
+        if !dashboard.rootView.isPresented { dashboard.rootView.isPresented = true }
+        dashboard.view.isHidden = false
+        stopTrackingAnchor()
         anchor = button
-        fitToDashboard()
+        fitToDashboard(at: geometry)
         makeKeyAndOrderFront(nil)
         button.highlight(true)
         installEventMonitors()
+        let events: [(Notification.Name, AnyObject)] = [
+            (NSWindow.didMoveNotification, geometry.window), (NSWindow.didResizeNotification, geometry.window),
+            (NSWindow.didChangeScreenNotification, geometry.window),
+            (NSApplication.didChangeScreenParametersNotification, NSApp),
+        ]
+        for (name, object) in events {
+            let token = NotificationCenter.default.addObserver(forName: name, object: object, queue: .main) {
+                [weak self] _ in MainActor.assumeIsolated { self?.anchorGeometryChanged() }
+            }
+            anchorObservers.append(token)
+        }
+    }
+
+    private func anchorGeometryChanged() {
+        guard isVisible, let anchor, let geometry = AnchorGeometry(anchor) else { return }
+        if fittedScreenSize != geometry.limits.size {
+            fitToDashboard(at: geometry)
+        } else {
+            place(size: frame.size, at: geometry)
+        }
     }
 
     func fitToDashboard() {
-        guard let button = anchor, let window = button.window, let screen = window.screen else { return }
-        let limits = screen.visibleFrame.insetBy(dx: 4, dy: 4)
+        guard let anchor, let geometry = AnchorGeometry(anchor) else { return }
+        fitToDashboard(at: geometry)
+    }
+
+    private func fitToDashboard(at geometry: AnchorGeometry) {
+        let limits = geometry.limits
         dashboard.view.layoutSubtreeIfNeeded()
         let showsFooter = dashboard.rootView.page == .usage
-        let size = dashboard.sizeThatFits(in: CGSize(width: limits.width, height: .greatestFiniteMagnitude))
+        let renderer = dashboard.rootView.hostedSettingsSize == nil ? dashboard : settingsDashboard ?? dashboard
+        // Give Settings the screen height so it can compact its controls within the same column.
+        let proposedHeight = renderer.rootView.page == .settings ? limits.height : CGFloat.greatestFiniteMagnitude
+        let size = renderer.sizeThatFits(in: CGSize(width: limits.width, height: proposedHeight))
+        if renderer !== dashboard, dashboard.rootView.hostedSettingsSize != size {
+            dashboard.rootView.hostedSettingsSize = size
+        }
         let width = min(ceil(size.width), limits.width)
+        if showsFooter {
+            footer.rootView = AnyView(dashboard.rootView.footerControls)
+        } else if !footer.isHidden {
+            footer.rootView = AnyView(EmptyView())
+        }
         footer.isHidden = !showsFooter
-        if showsFooter { footer.rootView = AnyView(dashboard.rootView.footerControls) }
         let footerHeight = showsFooter ? ceil(footer.fittingSize.height) : 0
-        let height = min(ceil(size.height) + footerHeight, limits.height)
+        let bodyHeight = ceil(size.height)
+        let widthScale = min(1, width / max(1, size.width))
+        let height = min(ceil(bodyHeight * widthScale) + footerHeight, limits.height)
         guard width > 0, height > 0 else { return }
-        let buttonRect = window.convertToScreen(button.convert(button.bounds, to: nil))
-        let x = max(limits.minX, min(buttonRect.midX - width / 2, limits.maxX - width))
-        let y = max(limits.minY, min(buttonRect.minY, limits.maxY) - height)
-        let target = NSRect(x: x, y: y, width: width, height: height)
+        fittedScreenSize = limits.size
+        place(size: NSSize(width: width, height: height), at: geometry)
+        footer.frame = NSRect(x: 0, y: 0, width: width, height: footerHeight)
+        let availableHeight = max(0, height - footerHeight)
+        let scale = min(widthScale, availableHeight / max(1, bodyHeight))
+        // Scale the rendered SwiftUI content, keeping AppKit's event coordinates in window points.
+        // Scaling an ancestor's bounds leaves hosted control frames and pointer routing out of sync.
+        if renderer.rootView.contentScale != scale { renderer.rootView.contentScale = scale }
+        body.frame = NSRect(x: 0, y: footerHeight, width: width, height: availableHeight)
+        if showsFooter {
+            // Usage exposes its full intrinsic height even when the screen constrains its viewport.
+            dashboard.view.frame = NSRect(x: 0, y: (availableHeight - bodyHeight) / 2, width: width, height: bodyHeight)
+        } else {
+            dashboard.view.frame = body.bounds
+        }
+        if renderer !== dashboard { renderer.view.frame = dashboard.view.frame }
+    }
+
+    private func place(size: NSSize, at geometry: AnchorGeometry) {
+        let limits = geometry.limits
+        let buttonRect = geometry.buttonRect
+        let x = max(limits.minX, min(buttonRect.midX - size.width / 2, limits.maxX - size.width))
+        let y = max(limits.minY, min(buttonRect.minY, limits.maxY) - size.height)
+        let target = NSRect(origin: NSPoint(x: x, y: y), size: size)
         if frame != target {
             setFrame(target, display: true)
             invalidateShadow()
         }
-        footer.frame = NSRect(x: 0, y: 0, width: width, height: footerHeight)
-        let bodyHeight = ceil(size.height)
-        let availableHeight = max(0, height - footerHeight)
-        let scale = min(1, availableHeight / max(1, bodyHeight))
-        body.frame = NSRect(
-            x: (width - width * scale) / 2, y: footerHeight, width: width * scale, height: availableHeight)
-        body.bounds = NSRect(x: 0, y: 0, width: width, height: bodyHeight)
-        dashboard.view.frame = body.bounds
     }
 
     override func cancelOperation(_ sender: Any?) {
@@ -103,16 +211,39 @@ final class DropdownPanel: NSPanel {
     }
 
     func dismiss() {
+        stopTrackingAnchor()
+        guard isVisible else { return }
+        // AppKit can retain a closing animation and its rendered contents when this panel reopens.
+        let openingAnimation = animationBehavior
+        animationBehavior = .none
+        orderOut(nil)
+        animationBehavior = openingAnimation
+        hideSettings()
+        if dashboard.rootView.hostedSettingsSize != nil { dashboard.rootView.discardHiddenSettingsData() }
+        // Retain a previously opened Usage page with its timers and actions suspended.
+        var inactive = dashboard.rootView
+        inactive.isPresented = false
+        inactive.retainsClosedUsage = inactive.page == .usage
+        dashboard.view.isHidden = true
+        dashboard.rootView = inactive
+        footer.rootView = AnyView(EmptyView())
+        onDismiss?()
+    }
+
+    private func stopTrackingAnchor() {
+        for observer in anchorObservers { NotificationCenter.default.removeObserver(observer) }
+        anchorObservers.removeAll()
         if let globalClick { NSEvent.removeMonitor(globalClick) }
         if let localMonitor { NSEvent.removeMonitor(localMonitor) }
         globalClick = nil
         localMonitor = nil
-        guard isVisible else { return }
-        orderOut(nil)
-        footer.rootView = AnyView(EmptyView())
         anchor?.highlight(false)
         anchor = nil
-        onDismiss?()
+    }
+
+    override func close() {
+        dismiss()
+        super.close()
     }
 
     private func installEventMonitors() {
@@ -146,7 +277,7 @@ final class DropdownPanel: NSPanel {
                 }
             }
             guard event.charactersIgnoringModifiers == "\u{1b}", modifiers.isEmpty else { return false }
-            cancelOperation(nil)
+            if !event.isARepeat { cancelOperation(nil) }
             return true
         }
         if let target = event.window, target !== self, target !== anchor?.window,

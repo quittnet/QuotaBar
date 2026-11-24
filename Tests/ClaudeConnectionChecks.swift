@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -30,9 +31,11 @@ struct ClaudeConnectionChecks {
         precondition(capturedJSON["rate_limits"] is [String: Any])
         try checkCommandSpellings(root: root, executable: executable)
         try checkProfileChain(root: root)
+        try checkActiveProfileSwitch(root: root, executable: executable)
         try checkConcurrentSettings(root: root, executable: executable)
         try checkUndoAndMetadata(root: root, executable: executable)
         try checkReformattedSettings(root: root, executable: executable)
+        try checkSamePathHelperUpdate(root: root, executable: executable)
         try checkStandaloneUninstall(root: root, executable: executable)
         try checkV1Migration(root: root, executable: executable, captured: captured)
         let configured = try Data(contentsOf: fresh.appendingPathComponent("settings.json"))
@@ -187,12 +190,57 @@ struct ClaudeConnectionChecks {
             try setCommand(custom, in: directory)
             precondition(!ClaudeConnection.isConfigured(directory: directory))
         }
-        let compound = "printf ok && /bin/bash " + quote(path)
-        try setCommand(compound, in: directory)
-        precondition(!ClaudeConnection.isConfigured(directory: directory))
-        try ClaudeConnection.connect(directory: directory, executable: executable)
-        let data = try Data(contentsOf: directory.appendingPathComponent(".quotabar/state.json"))
-        try check((try JSONSerialization.jsonObject(with: data) as? [String: String])?["originalCommand"] == compound)
+        let folder = directory.appendingPathComponent(".quotabar")
+        let backup = folder.appendingPathComponent("previous-settings.json")
+        let state = folder.appendingPathComponent("state.json")
+        let originalBackup = try Data(contentsOf: backup)
+        let originalState = try Data(contentsOf: state)
+        for invocation in [
+            "/bin/bash " + quote(path), alias.path,
+            "/bin/bash " + spacePath.replacingOccurrences(of: " ", with: "\\ "),
+            #"/bin/bash "$CLAUDE_CONFIG_DIR/.quotabar/statusline.sh""#,
+            #"/bin/bash "${CLAUDE_CONFIG_DIR}"/.quotabar/statusline.sh"#,
+            #"/bin/bash "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.quotabar/statusline.sh""#,
+            #"/bin/bash "${CLAUDE_CONFIG_DIR:-"${HOME}"/.claude}"/.quotabar/statusline.sh"#,
+        ] {
+            let compound = invocation + " | /usr/bin/tr a-z A-Z"
+            let profileEnvironment = "export CLAUDE_CONFIG_DIR=" + quote(directory.path) + "; "
+            try setCommand(compound, in: directory)
+            let url = directory.appendingPathComponent("settings.json")
+            let edit = try Data(contentsOf: url)
+            try check(try run(profileEnvironment + compound, input: "hello") == "HELLO CUSTOM")
+            try mustFail { try ClaudeConnection.connect(directory: directory, executable: executable) }
+            try mustFail { try ClaudeConnection.disconnect(directory: directory) }
+            try check(try Data(contentsOf: url) == edit)
+            try check(try Data(contentsOf: state) == originalState)
+            try check(try Data(contentsOf: backup) == originalBackup)
+            try check(
+                try run(profileEnvironment + statusCommand(settings(directory)), input: "hello") == "HELLO CUSTOM")
+        }
+
+        // An independent script can share the wrapper's filename prefix.
+        let personal = folder.appendingPathComponent("statusline.sh.personal")
+        try script("#!/bin/sh\nprintf personal\n", to: personal)
+        for independent in [quote(personal.path), "/bin/bash " + quote(personal.path) + " | /bin/cat"] {
+            try setCommand(independent, in: directory)
+            try ClaudeConnection.connect(directory: directory, executable: executable)
+            try check(try run(statusCommand(settings(directory)), input: "") == "personal")
+        }
+        let lastCommand = "/bin/bash " + quote(personal.path) + " | /bin/cat"
+        try ClaudeConnection.disconnect(directory: directory)
+        try check(try statusCommand(settings(directory)) == lastCommand)
+        try check(try run(lastCommand, input: "") == "personal")
+
+        let literalDirectory = root.appendingPathComponent("literal-dollar")
+        try ClaudeConnection.connect(directory: literalDirectory, executable: executable)
+        let literal = #"printf '%s' '$CLAUDE_CONFIG_DIR/.quotabar/statusline.sh'"#
+        try setCommand(literal, in: literalDirectory)
+        try ClaudeConnection.connect(directory: literalDirectory, executable: executable)
+        try check(
+            try run(statusCommand(settings(literalDirectory)), input: "")
+                == "$CLAUDE_CONFIG_DIR/.quotabar/statusline.sh")
+        try ClaudeConnection.disconnect(directory: literalDirectory)
+        try check(try statusCommand(settings(literalDirectory)) == literal)
     }
 
     private static func checkProfileChain(root: URL) throws {
@@ -435,6 +483,37 @@ struct ClaudeConnectionChecks {
         print("Claude disconnect after full settings rewrite: original command and all edited fields preserved.")
     }
 
+    private static func checkSamePathHelperUpdate(root: URL, executable: URL) throws {
+        let profile = root.appendingPathComponent("same-app-path")
+        try setCommand("printf original", in: profile)
+        let settingsURL = profile.appendingPathComponent("settings.json")
+        let original = try Data(contentsOf: settingsURL)
+        try ClaudeConnection.connect(directory: profile, executable: executable)
+        let folder = profile.appendingPathComponent(".quotabar")
+        let helper = folder.appendingPathComponent("QuotaBarClaudeDisconnect")
+        let current = try Data(contentsOf: helper)
+        let record = folder.appendingPathComponent("state.json")
+        let launcher = folder.appendingPathComponent("uninstall.sh")
+        var state = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: record))
+        let currentDigest = state["disconnectHelperSHA256"]!
+        let earlier = Data("#!/bin/sh\nexit 0\n".utf8)
+        let earlierDigest = SHA256.hash(data: earlier).map { String(format: "%02x", $0) }.joined()
+        try earlier.write(to: helper)
+        try String(contentsOf: launcher, encoding: .utf8).replacingOccurrences(of: currentDigest, with: earlierDigest)
+            .write(to: launcher, atomically: false, encoding: .utf8)
+        state["disconnectHelperSHA256"] = earlierDigest
+        try JSONEncoder().encode(state).write(to: record)
+        precondition(ClaudeConnection.status(directory: profile, executable: executable) == .needsUpgrade)
+        try ClaudeConnection.connect(directory: profile, executable: executable)
+        precondition(ClaudeConnection.status(directory: profile, executable: executable) == .configured)
+        try check(try Data(contentsOf: helper) == current)
+        try ClaudeConnection.connect(directory: profile, executable: executable) { _ in
+            throw CocoaError(.fileWriteUnknown)
+        }
+        try ClaudeConnection.disconnect(directory: profile)
+        try check(try Data(contentsOf: settingsURL) == original)
+    }
+
     /// The connection folder carries an uninstaller that still works after QuotaBar.app is deleted.
     private static func checkStandaloneUninstall(root: URL, executable: URL) throws {
         let files = FileManager.default
@@ -483,6 +562,51 @@ struct ClaudeConnectionChecks {
         precondition(after["theme"] as? String == "dark" && after["permissions"] != nil && after["nothing"] is NSNull)
         precondition(!files.fileExists(atPath: restoring.appendingPathComponent(".quotabar").path))
 
+        // Renaming a whole profile leaves the installed command pointing at the former location.
+        let movedSource =
+            #"{ "theme":"light", "value":1.250e+02, "statusLine":{"type":"command","command":"printf \u0068i"} }"#
+        for upgrade in [false, true] {
+            let old = try connectRemovableApp("move-" + String(upgrade), settings: movedSource)
+            let moved = root.appendingPathComponent("renamed profile " + String(upgrade))
+            try files.moveItem(at: old, to: moved)
+            let settingsURL = moved.appendingPathComponent("settings.json")
+            let edited = try String(contentsOf: settingsURL, encoding: .utf8)
+                .replacingOccurrences(of: "light", with: "dark")
+            try Data(edited.utf8).write(to: settingsURL)
+            let note = moved.appendingPathComponent(".quotabar/personal.txt")
+            try Data("keep".utf8).write(to: note)
+            precondition(ClaudeConnection.status(directory: moved, executable: executable) == .needsUpgrade)
+            if upgrade {
+                try ClaudeConnection.connect(directory: moved, executable: executable)
+                precondition(ClaudeConnection.status(directory: moved, executable: executable) == .configured)
+                let backup = try Data(contentsOf: moved.appendingPathComponent(".quotabar/previous-settings.json"))
+                precondition(backup == Data(movedSource.utf8))
+                try check(try run(statusCommand(settings(moved)), input: "") == "hi")
+            }
+            let result = try runUninstaller(moved)
+            precondition(result.status == 0, result.output)
+            try check(
+                try Data(contentsOf: settingsURL)
+                    == Data(movedSource.replacingOccurrences(of: "light", with: "dark").utf8))
+            try check(try Data(contentsOf: note) == Data("keep".utf8))
+            try check(try files.contentsOfDirectory(atPath: note.deletingLastPathComponent().path) == ["personal.txt"])
+        }
+
+        // A copy may intentionally use the still-live original profile's wrapper.
+        let live = try connectRemovableApp("live-source", settings: movedSource)
+        let copy = root.appendingPathComponent("profile copy")
+        try files.copyItem(at: live, to: copy)
+        let copyURL = copy.appendingPathComponent("settings.json")
+        let liveURL = live.appendingPathComponent("settings.json")
+        let selected = try Data(contentsOf: copyURL)
+        precondition(ClaudeConnection.status(directory: copy, executable: executable) == .notConfigured)
+        try ClaudeConnection.connect(directory: copy, executable: executable)
+        try check(try run(statusCommand(settings(copy)), input: "") == "hi")
+        try ClaudeConnection.disconnect(directory: copy)
+        try check(try Data(contentsOf: copyURL) == selected)
+        try check(try Data(contentsOf: liveURL) == selected)
+        try check(try run(statusCommand(settings(live)), input: "") == "hi")
+
         // Without a previous status line, the QuotaBar entry is removed.
         let empty = try connectRemovableApp("empty", settings: #"{"theme":"light"}"#)
         let removed = try runUninstaller(empty)
@@ -492,16 +616,26 @@ struct ClaudeConnectionChecks {
         precondition(!files.fileExists(atPath: empty.appendingPathComponent(".quotabar").path))
 
         // A replacement status line that still calls the wrapper is left for the user to resolve.
-        let chained = try connectRemovableApp("chained", settings: "{}")
-        let wrapper = chained.appendingPathComponent(".quotabar/statusline.sh").resolvingSymlinksInPath().path
+        let chained = try connectRemovableApp("chained ' profile", settings: "{}")
+        let commandWithPipe = try statusCommand(settings(chained)) + " | tr a-z A-Z"
         let replacement = try JSONSerialization.data(withJSONObject: [
-            "statusLine": ["type": "command", "command": "bash '\(wrapper)' | tr a-z A-Z"]
+            "statusLine": ["type": "command", "command": commandWithPipe]
         ])
         try replacement.write(to: chained.appendingPathComponent("settings.json"))
-        let refused = try runUninstaller(chained)
-        precondition(refused.status != 0 && refused.output.contains("still calls QuotaBar"), refused.output)
-        try check(try Data(contentsOf: chained.appendingPathComponent("settings.json")) == replacement)
-        precondition(files.fileExists(atPath: chained.appendingPathComponent(".quotabar/state.json").path))
+        let copied = root.appendingPathComponent("copied compound profile")
+        try files.copyItem(at: chained, to: copied)
+        let copyCleanup = try runUninstaller(copied)
+        precondition(copyCleanup.status == 0, copyCleanup.output)
+        try check(try Data(contentsOf: copied.appendingPathComponent("settings.json")) == replacement)
+        precondition(!files.fileExists(atPath: copied.appendingPathComponent(".quotabar").path))
+
+        for dir in [chained, root.appendingPathComponent("renamed compound profile")] {
+            if dir != chained { try files.moveItem(at: chained, to: dir) }
+            let refused = try runUninstaller(dir)
+            precondition(refused.status != 0 && refused.output.contains("still calls QuotaBar"), refused.output)
+            try check(try Data(contentsOf: dir.appendingPathComponent("settings.json")) == replacement)
+            precondition(files.fileExists(atPath: dir.appendingPathComponent(".quotabar/state.json").path))
+        }
 
         // A linked settings file is never replaced through the link.
         let linked = try connectRemovableApp("linked", settings: "{}")
@@ -749,6 +883,42 @@ struct ClaudeConnectionChecks {
     private static func mustFail(_ operation: () throws -> Void, line: UInt = #line) throws {
         do { try operation() } catch { return }
         preconditionFailure("Expected refusal at line " + String(line))
+    }
+
+    private static func checkActiveProfileSwitch(root: URL, executable: URL) throws {
+        let files = FileManager.default
+        let first = root.appendingPathComponent("first selected profile")
+        let second = root.appendingPathComponent("second selected profile")
+        let active = root.appendingPathComponent("selected profile")
+        let next = root.appendingPathComponent("next profile")
+        func select(_ directory: URL) throws {
+            try files.createSymbolicLink(at: next, withDestinationURL: directory)
+            precondition(rename(next.path, active.path) == 0)
+        }
+        for profile in [first, second] {
+            try files.createDirectory(at: profile, withIntermediateDirectories: false)
+            try Data(#"{"theme":"dark","statusLine":{"type":"command","command":"printf original"}}"#.utf8)
+                .write(to: profile.appendingPathComponent("settings.json"))
+        }
+        let original = try Data(contentsOf: first.appendingPathComponent("settings.json"))
+        try select(first)
+        try ClaudeConnection.connect(directory: active, executable: executable) { stage in
+            if stage == .installingUninstaller { try select(second) }
+        }
+        precondition(ClaudeConnection.isConfigured(directory: first))
+        precondition(!ClaudeConnection.canDisconnect(directory: second))
+        try check(try Data(contentsOf: second.appendingPathComponent("settings.json")) == original)
+
+        try ClaudeConnection.connect(directory: second, executable: executable)
+        try select(first)
+        try ClaudeConnection.disconnect(directory: active) { stage in
+            if stage == .cleanup { try select(second) }
+        }
+        precondition(!files.fileExists(atPath: first.appendingPathComponent(".quotabar").path))
+        try check(try Data(contentsOf: first.appendingPathComponent("settings.json")) == original)
+        precondition(ClaudeConnection.isConfigured(directory: second))
+        try ClaudeConnection.disconnect(directory: second)
+        try check(try Data(contentsOf: second.appendingPathComponent("settings.json")) == original)
     }
 
     private static func checkConcurrentSettings(root: URL, executable: URL) throws {

@@ -70,6 +70,9 @@ struct DataStressChecks {
     }
 
     private struct Ledger {
+        let todayStart: Date
+        let calendar: Calendar
+        var days: [Int: Int64] = [:]
         var all: Int64 = 0
         var month: Int64 = 0
         var week: Int64 = 0
@@ -77,6 +80,7 @@ struct DataStressChecks {
         var today: Int64 = 0
 
         mutating func add(_ count: Int64, age: Int) {
+            days[age, default: 0] += count
             all += count
             if age < 30 { month += count }
             if age < 7 { week += count }
@@ -85,7 +89,22 @@ struct DataStressChecks {
         }
 
         var totals: TokenTotals {
-            TokenTotals(allTime: all, month: month, week: week, yesterday: yesterday, today: today, partial: false)
+            // Both generators omit priceable model usage. Every nonempty period must disclose that.
+            func unpriced(_ count: Int64) -> TokenSpendAmount {
+                var amount = TokenSpendAmount()
+                if count > 0 { amount.add(nil) }
+                return amount
+            }
+            let peak = days.max { lhs, rhs in
+                lhs.value == rhs.value ? lhs.key < rhs.key : lhs.value < rhs.value
+            }.map {
+                TokenPeakDay(date: calendar.date(byAdding: .day, value: -$0.key, to: todayStart)!, tokens: $0.value)
+            }
+            return TokenTotals(
+                allTime: all, month: month, week: week, yesterday: yesterday, today: today, partial: false,
+                spend: TokenSpendTotals(
+                    allTime: unpriced(all), month: unpriced(month), week: unpriced(week),
+                    yesterday: unpriced(yesterday), today: unpriced(today)), peakDay: peak)
         }
     }
 
@@ -108,7 +127,7 @@ struct DataStressChecks {
         let codex = TokenHistory(home: codexRoot, cacheURL: cache, calendar: calendar)
         let claude = ClaudeTokenHistory(home: claudeRoot, calendar: calendar)
         let formatter = ISO8601DateFormatter()
-        var expected = Ledger()
+        var expected = Ledger(todayStart: calendar.startOfDay(for: now), calendar: calendar)
         for fileIndex in 0..<64 {
             var codexRows = [#"{"type":"session_meta","payload":{"id":"thread-\#(fileIndex)"}}"#]
             var claudeRows: [String] = []
@@ -159,6 +178,23 @@ struct DataStressChecks {
             try files.removeItem(at: projects.appendingPathComponent("copy-\(index).jsonl"))
         }
         try expect(restarted, claude, now: now, expected: expected)
+        // Two equal records outside every rolling period choose the older local date.
+        // A later append on the newer day must replace the record immediately.
+        for (index, age, tokens) in [(0, 90, Int64(100_000)), (1, 100, 100_000), (2, 90, 1)] {
+            let timestamp = formatter.string(from: calendar.date(byAdding: .day, value: -age, to: now)!)
+            try append(codexRow(timestamp, id: 20_000 + index, thread: 999, tokens: tokens) + "\n", to: codexAppend)
+            try append(claudeRow(timestamp, id: 20_000 + index, tokens: tokens) + "\n", to: claudeAppend)
+            expected.add(tokens, age: age)
+            try expect(restarted, claude, now: now, expected: expected)
+        }
+        let older = calendar.date(byAdding: .day, value: -100, to: now)!
+        let timestamp = formatter.string(from: older)
+        try append(codexRow(timestamp, id: 30_000, thread: 999, tokens: .max) + "\n", to: codexAppend)
+        try append(claudeRow(timestamp, id: 30_000, tokens: .max) + "\n", to: claudeAppend)
+        for totals in [try restarted.read(now: now), try claude.read(now: now)] {
+            precondition(totals.partial && totals.allTime == .max)
+            precondition(totals.peakDay == TokenPeakDay(date: calendar.startOfDay(for: older), tokens: .max))
+        }
         let cached = try Data(contentsOf: cache.appendingPathExtension("sqlite"))
         precondition(cached.starts(with: "SQLite format 3".utf8))
         precondition(cached.range(of: Data("PRIVATE_STRESS_TEXT".utf8)) == nil)

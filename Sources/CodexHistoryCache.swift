@@ -58,6 +58,8 @@ final class CodexHistoryCache {
         close(lock)
     }
 
+    var needsReopening: Bool { PrivateFile.databaseNeedsReopening(db) }
+
     private static func open(_ path: String, maximumBytes: Int, checkIntegrity: Bool) throws -> OpaquePointer {
         var connection: OpaquePointer?
         let status = sqlite3_open_v2(

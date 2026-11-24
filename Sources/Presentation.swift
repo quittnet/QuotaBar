@@ -87,6 +87,20 @@ enum MenuBarLimits: String, CaseIterable {
     var title: String { self == .fiveHour ? "5-Hour Limit" : "All Reported Limits" }
 }
 
+enum DailyUsageMode: String, CaseIterable {
+    case off, tokens, spend, both
+
+    static let preferenceKey = "dailyUsageMode"
+
+    static func saved(in defaults: UserDefaults) -> Self {
+        if let value = defaults.string(forKey: preferenceKey), let mode = Self(rawValue: value) { return mode }
+        // Earlier betas used the Details selector for the main dropdown too.
+        let initial: Self = defaults.bool(forKey: "showTokenSpend") ? .spend : .tokens
+        defaults.set(initial.rawValue, forKey: preferenceKey)
+        return initial
+    }
+}
+
 enum PercentageMode: String, CaseIterable {
     case remaining, used
 
@@ -170,7 +184,9 @@ struct QuotaDisplay {
     var menuBarWindows: [QuotaWindow] {
         guard hasCurrentPercentage, let limiting = limitingWindow else { return [] }
         let active = windows.filter { !hasReset($0) }
-        guard let fiveHour = active.first(where: { $0.minutes == 300 }) else { return [limiting] }
+        guard let fiveHour = active.filter({ $0.minutes == 300 }).max(by: { $0.used < $1.used }) else {
+            return [limiting]
+        }
         return menuBarLimits == .both ? active : [fiveHour]
     }
 
@@ -210,7 +226,7 @@ struct QuotaDisplay {
             date: Calendar.current.isDate(date, inSameDayAs: now) ? .omitted : .abbreviated, time: .shortened)
     }
 
-    var tooltipReading: String {
+    var accessibilityReading: String {
         guard hasCurrentPercentage, let reading else { return accessibilityTitle }
         let source = provider == .claude ? " · Claude Code report " : " · Codex read "
         return accessibilityTitle + source + reportTime(reading.fetchedAt)

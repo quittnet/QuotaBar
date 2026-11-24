@@ -25,14 +25,17 @@ final class ClaudeTokenHistory {
     private var index: ClaudeHistoryIndex?
 
     convenience init(profile home: URL = ClaudeProfile.directory) {
+        self.init(home: home, cacheURL: Self.cacheFile(for: home))
+    }
+
+    static func cacheFile(for home: URL) -> URL? {
         let homeID = SHA256.hash(data: Data(home.resolvingSymlinksInPath().standardizedFileURL.path.utf8)).map {
             String(format: "%02x", $0)
         }
         .joined()
-        let cacheURL = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+        return FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
             .appendingPathComponent("app.quotabar.QuotaBar", isDirectory: true)
-            .appendingPathComponent("claude-history-v1-" + homeID + ".sqlite")
-        self.init(home: home, cacheURL: cacheURL)
+            .appendingPathComponent("claude-history-v2-" + homeID + ".sqlite")
     }
 
     init(home: URL, cacheURL: URL? = nil, calendar: Calendar? = nil, didReadBytes: ((Int) -> Void)? = nil) {
@@ -46,6 +49,7 @@ final class ClaudeTokenHistory {
     }
 
     func read(now: Date = Date()) throws -> TokenTotals {
+        if !cacheLocations.isEmpty, index?.needsReopening == true { index = nil }
         while true {
             let url = cacheLocations.first
             do {
@@ -116,8 +120,8 @@ final class ClaudeTokenHistory {
             }
             guard readable > 0 || (candidates == 0 && !partial) else { return try statsOnly() }
             try index.pruneInvisible()
-            let days = TokenDayBoundaries(now: now, calendar: calendar ?? .current)
-            return try index.totals(now: now, days: days, partial: partial, stats: readStatsLifetime())
+            return try index.totals(
+                now: now, calendar: calendar ?? .current, partial: partial, stats: readStatsLifetime())
         }
     }
 
@@ -241,19 +245,23 @@ final class ClaudeTokenHistory {
             return
         }
         guard let message = row.message, message.model != "<synthetic>" else { return }
-        guard let id = message.id, !id.isEmpty, let usage = message.usage, let count = usage.total else {
+        guard let id = message.id, !id.isEmpty, let sample = message.sample else {
             transcript.partial = true
             return
         }
+        if sample.partial { transcript.partial = true }
         let date = row.timestamp.flatMap { fractionalDates.date(from: $0) ?? wholeDates.date(from: $0) }
         try index.append(
-            key: key, id: Self.identifier(id.precomposedStringWithCanonicalMapping), date: date, count: count,
-            finished: message.stopReason != nil)
+            key: key, id: Self.identifier(id.precomposedStringWithCanonicalMapping), date: date, count: sample.count,
+            finished: message.stopReason != nil, usd: sample.usd)
     }
 }
 
 private struct Transcript: Codable {
+    static let currentUsageRevision = 2
+    var usageRevision: Int? = Self.currentUsageRevision
     var revision: ClaudeTranscriptRevision
+    var pricingRevision: Int? = TokenPricing.revision
     var offset: UInt64 = 0
     var anchor = Data()
     var samples: Data?
@@ -263,7 +271,10 @@ private struct Transcript: Codable {
     /// Rows were reused after a sampled check, so an edit between the windows may be hidden.
     var sampled: Bool?
 
-    var isValid: Bool { revision.size >= 0 && offset <= UInt64(revision.size) && anchor.count == 32 }
+    var isValid: Bool {
+        usageRevision == Self.currentUsageRevision && pricingRevision == TokenPricing.revision && revision.size >= 0
+            && offset <= UInt64(revision.size) && anchor.count == 32
+    }
 
     func verificationExpired(at now: Date) -> Bool {
         // A clock moved backward also forces a full check instead of trusting a future timestamp.
@@ -356,16 +367,116 @@ struct ClaudeTranscriptRevision: Codable, Equatable {
 private struct AssistantRow: Decodable {
     struct Message: Decodable {
         enum CodingKeys: String, CodingKey {
-            case id
-            case model
+            case id, model, usage, content
             case stopReason = "stop_reason"
-            case usage
+            case stopDetails = "stop_details"
         }
 
         let id: String?
         let model: String?
         let stopReason: String?
-        let usage: Usage?
+        let sample: (count: Int64, usd: Double?, partial: Bool)?
+
+        init(from decoder: Decoder) throws {
+            let message = try decoder.container(keyedBy: CodingKeys.self)
+            id = try message.decodeIfPresent(String.self, forKey: .id)
+            model = try message.decodeIfPresent(String.self, forKey: .model)
+            stopReason = try message.decodeIfPresent(String.self, forKey: .stopReason)
+            guard model != "<synthetic>", message.contains(.usage) else {
+                sample = nil
+                return
+            }
+            let usage = try message.superDecoder(forKey: .usage)
+            let top = try? Usage(from: usage)
+            let fields = try usage.container(keyedBy: UsageKeys.self)
+            var iterations: [Iteration]
+            do {
+                iterations = try fields.decodeIfPresent([Iteration].self, forKey: .iterations) ?? []
+            } catch {
+                // The top-level counters still describe retained usage, but can omit other attempts.
+                sample = top?.total.map { ($0, nil, true) }
+                return
+            }
+            let messageIndices = iterations.indices.filter { iterations[$0].type != "compaction" }
+            let hasFallbackStep = iterations.contains { $0.type == "fallback_message" }
+            let inspectContent = stopReason == "refusal" || hasFallbackStep || messageIndices.count > 1
+            let content = inspectContent ? try? message.decode(RefusalContent.self, forKey: .content) : nil
+            let handoffs = content?.handoffs ?? []
+            let fallback = hasFallbackStep || !handoffs.isEmpty
+            // The streaming message_start can name the declined model. Ordered handoffs identify
+            // the models that actually ran, even if the saved iteration fields are sparse.
+            let hopModels = handoffs.map(\.from) + handoffs.suffix(1).map(\.to)
+            let hasHopModels = !handoffs.isEmpty && hopModels.count == messageIndices.count
+            var hop = 0
+            let details = try? message.decode(RefusalDetails.self, forKey: .stopDetails)
+            let finalRefusal =
+                stopReason == "refusal"
+                ? Refusal(billedBeforeOutput: details?.billedBeforeOutput, hasContent: content?.trailingOutput) : nil
+            guard !iterations.isEmpty else {
+                if let top, let count = top.total {
+                    sample = (count, top.estimatedUSD(model: model, refusal: finalRefusal), false)
+                } else {
+                    sample = nil
+                }
+                return
+            }
+
+            // Each entry is a distinct sampling step. Top-level usage overlaps the returned message.
+            var count: Int64 = 0
+            var usd: Double? = 0
+            // Top-level usage aggregates non-compaction sampling steps when server tools run.
+            // Recover any cache totals retained only at the top level, once across those steps.
+            if !fallback, messageIndices.count > 1, let top {
+                top.attributeCacheReads(in: &iterations, messageIndices: messageIndices)
+            }
+            let messageSteps = messageIndices.map { iterations[$0] }
+            let aggregate = !fallback && messageSteps.count > 1 ? top?.reconcilingCache(in: messageSteps) : nil
+            if let aggregate {
+                guard let tokens = aggregate.usage.total else {
+                    sample = nil
+                    return
+                }
+                count = tokens
+                let responseModel = model
+                let models = Set(
+                    messageSteps.map { ($0.model ?? responseModel).map(TokenPricing.canonicalClaudeModel) })
+                usd =
+                    models.count == 1 && finalRefusal == nil
+                    ? aggregate.usage.estimatedUSD(
+                        model: models.first ?? nil, refusal: nil, promptRange: aggregate.prompts)
+                    : nil
+            }
+            for (i, iteration) in iterations.enumerated() {
+                if aggregate != nil && iteration.type != "compaction" { continue }
+                let last = i == iterations.count - 1
+                let matchesReturnedUsage = iteration.type != "compaction" && (fallback ? last : messageSteps.count == 1)
+                var counters = iteration.usage
+                if matchesReturnedUsage, let top { counters.fillMissingCache(from: top) }
+                guard let tokens = counters.total, let sum = tokenTotal([count, tokens]) else {
+                    sample = top?.total.map { ($0, nil, true) }
+                    return
+                }
+                count = sum
+                let boundaryModel = hasHopModels && iteration.type != "compaction" ? hopModels[hop] : nil
+                if iteration.type != "compaction" { hop += 1 }
+                let inferredModel = fallback && messageSteps.count > 1 ? boundaryModel : model
+                let attemptModel = iteration.model ?? inferredModel
+                var refusal: Refusal?
+                if iteration.type != "compaction" {
+                    if last {
+                        refusal = finalRefusal
+                    } else if fallback {
+                        refusal = attemptModel.flatMap { content?.declines[$0] } ?? Refusal()
+                    }
+                }
+                if let known = usd, let cost = counters.estimatedUSD(model: attemptModel, refusal: refusal) {
+                    usd = known + cost
+                } else {
+                    usd = nil
+                }
+            }
+            sample = (count, usd, false)
+        }
     }
 
     enum CodingKeys: String, CodingKey { case type, timestamp, message }
@@ -385,18 +496,211 @@ private struct AssistantRow: Decodable {
     }
 }
 
+private enum UsageKeys: String, CodingKey { case iterations }
+
+private struct Iteration: Decodable {
+    enum CodingKeys: String, CodingKey { case type, model }
+    let type: String?
+    let model: String?
+    var usage: Usage
+
+    init(from decoder: Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        type = try fields.decodeIfPresent(String.self, forKey: .type)
+        model = try fields.decodeIfPresent(String.self, forKey: .model)
+        usage = try Usage(from: decoder)
+    }
+}
+
+private struct Refusal {
+    var billedBeforeOutput: Bool?
+    var hasContent: Bool?
+}
+
+private struct RefusalDetails: Decodable {
+    enum CodingKeys: String, CodingKey { case category, type }
+    let billedBeforeOutput: Bool?
+    let type: String?
+
+    init(from decoder: Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        type = try fields.decodeIfPresent(String.self, forKey: .type)
+        // An explicit null is an unbilled category. An absent category carries no billing evidence.
+        if let category = try fields.decodeIfPresent(String.self, forKey: .category) {
+            billedBeforeOutput = ["bio", "frontier_llm", "reasoning_extraction"].contains(category)
+        } else {
+            billedBeforeOutput = fields.contains(.category) ? false : nil
+        }
+    }
+}
+
+private struct RefusalContent: Decodable {
+    enum CodingKeys: String, CodingKey { case type, from, to, trigger }
+    private struct Source: Decodable { let model: String }
+    var handoffs = [(from: String, to: String?)]()
+    var declines = [String: Refusal]()
+    var trailingOutput = false
+
+    init(from decoder: Decoder) throws {
+        var blocks = try decoder.unkeyedContainer()
+        while !blocks.isAtEnd {
+            let block = try blocks.nestedContainer(keyedBy: CodingKeys.self)
+            if try block.decode(String.self, forKey: .type) == "fallback" {
+                let model = try block.decode(Source.self, forKey: .from).model
+                let next = try block.decodeIfPresent(Source.self, forKey: .to)?.model
+                handoffs.append((model, next))
+                let trigger = try block.decode(RefusalDetails.self, forKey: .trigger)
+                if trigger.type == "refusal" {
+                    declines[model] = Refusal(
+                        billedBeforeOutput: trigger.billedBeforeOutput, hasContent: trailingOutput)
+                }
+                trailingOutput = false
+            } else {
+                trailingOutput = true
+            }
+        }
+    }
+}
+
 private struct Usage: Decodable {
     enum CodingKeys: String, CodingKey {
         case inputTokens = "input_tokens"
         case cacheCreationInputTokens = "cache_creation_input_tokens"
         case cacheReadInputTokens = "cache_read_input_tokens"
         case outputTokens = "output_tokens"
+        case cacheCreation = "cache_creation"
     }
 
     let inputTokens: Int64
-    let cacheCreationInputTokens: Int64?
-    let cacheReadInputTokens: Int64?
+    var cacheCreationInputTokens: Int64?
+    var cacheReadInputTokens: Int64?
     let outputTokens: Int64
+
+    private var cacheCreation: CacheCreation?
+
+    private struct CacheCreation: Decodable {
+        struct Breakdown: Decodable {
+            enum CodingKeys: String, CodingKey {
+                case fiveMinute = "ephemeral_5m_input_tokens"
+                case oneHour = "ephemeral_1h_input_tokens"
+            }
+
+            let fiveMinute: Int64?
+            let oneHour: Int64?
+        }
+
+        let breakdown: Breakdown?
+
+        init?(reconciling steps: [Usage], total: Int64, reported: CacheCreation?) {
+            var shortTotal: Int64 = 0
+            var longTotal: Int64 = 0
+            for step in steps {
+                // A readable aggregate can supply a split omitted or unreadable on this step.
+                guard let split = step.cacheCreation?.breakdown else { continue }
+                let writes = step.cacheCreationInputTokens ?? 0
+                let short = split.fiveMinute ?? 0
+                let long = split.oneHour ?? 0
+                guard short >= 0, short <= writes, writes - short == long else { return nil }
+                // Each duration is bounded by the checked sum of all step writes.
+                shortTotal += short
+                longTotal += long
+            }
+            if let reported {
+                guard let split = reported.breakdown, (split.fiveMinute ?? 0) >= shortTotal,
+                    (split.oneHour ?? 0) >= longTotal
+                else { return nil }
+                breakdown = split
+            } else {
+                guard total - shortTotal == longTotal else { return nil }
+                breakdown = Breakdown(fiveMinute: shortTotal, oneHour: longTotal)
+            }
+        }
+
+        init(from decoder: Decoder) {
+            // A malformed optional pricing detail must not discard an otherwise countable response.
+            breakdown = try? Breakdown(from: decoder)
+        }
+    }
+
+    mutating func fillMissingCache(from top: Usage) {
+        guard inputTokens == top.inputTokens, outputTokens == top.outputTokens else { return }
+        cacheReadInputTokens = cacheReadInputTokens ?? top.cacheReadInputTokens
+        cacheCreationInputTokens = cacheCreationInputTokens ?? top.cacheCreationInputTokens
+        if cacheCreationInputTokens == top.cacheCreationInputTokens {
+            cacheCreation = cacheCreation ?? top.cacheCreation
+        }
+    }
+
+    // When exactly one server-tool step omits cache reads, the aggregate determines
+    // its count. Keep the individual prompts and models for tiered per-step pricing.
+    func attributeCacheReads(in iterations: inout [Iteration], messageIndices: [Int]) {
+        guard let totalReads = cacheReadInputTokens, totalReads > 0 else { return }
+        let missing = messageIndices.filter { iterations[$0].usage.cacheReadInputTokens == nil }
+        guard missing.count == 1, let index = missing.first,
+            tokenTotal(messageIndices.map { iterations[$0].usage.inputTokens }) == inputTokens,
+            tokenTotal(messageIndices.map { iterations[$0].usage.outputTokens }) == outputTokens,
+            let known = tokenTotal(messageIndices.map { iterations[$0].usage.cacheReadInputTokens ?? 0 }),
+            totalReads > known
+        else { return }
+        if let reported = cacheCreation {
+            // Preserve aggregate write-duration evidence when allocating reads would otherwise
+            // bypass reconciliation. Every recorded per-step duration must explain that split.
+            let steps = messageIndices.map { iterations[$0].usage }
+            guard let writes = tokenTotal(steps.map { $0.cacheCreationInputTokens ?? 0 }),
+                writes == cacheCreationInputTokens ?? 0, let split = reported.breakdown,
+                let recorded = CacheCreation(reconciling: steps, total: writes, reported: nil)?.breakdown,
+                (split.fiveMinute ?? 0) == (recorded.fiveMinute ?? 0),
+                (split.oneHour ?? 0) == (recorded.oneHour ?? 0)
+            else { return }
+        }
+        iterations[index].usage.cacheReadInputTokens = totalReads - known
+    }
+
+    func reconcilingCache(in steps: [Iteration]) -> (usage: Usage, prompts: ClosedRange<Int64>)? {
+        let usages = steps.map(\.usage)
+        guard tokenTotal(usages.map(\.inputTokens)) == inputTokens,
+            tokenTotal(usages.map(\.outputTokens)) == outputTokens,
+            let reads = tokenTotal(usages.map { $0.cacheReadInputTokens ?? 0 }),
+            let writes = tokenTotal(usages.map { $0.cacheCreationInputTokens ?? 0 })
+        else { return nil }
+        let allReads = max(cacheReadInputTokens ?? 0, reads)
+        let allWrites = max(cacheCreationInputTokens ?? 0, writes)
+        let missingTTL =
+            cacheCreation != nil
+            && usages.contains {
+                ($0.cacheCreationInputTokens ?? 0) > 0 && $0.cacheCreation == nil
+            }
+        guard allReads > reads || allWrites > writes || missingTTL else { return nil }
+        let knownPrompts = usages.compactMap {
+            tokenTotal([$0.inputTokens, $0.cacheReadInputTokens ?? 0, $0.cacheCreationInputTokens ?? 0])
+        }
+        guard knownPrompts.count == usages.count, let smallest = knownPrompts.min(),
+            let largest = knownPrompts.max(),
+            let upper = tokenTotal([largest, allReads - reads, allWrites - writes])
+        else { return nil }
+        var aggregate = self
+        aggregate.cacheReadInputTokens = allReads
+        aggregate.cacheCreationInputTokens = allWrites
+        if allWrites > 0 {
+            // Aggregate-only reads can coexist with write durations recorded exclusively on each step.
+            let reported = cacheCreationInputTokens == allWrites ? cacheCreation : nil
+            aggregate.cacheCreation = CacheCreation(reconciling: usages, total: allWrites, reported: reported)
+        }
+        return (aggregate, smallest...upper)
+    }
+
+    func estimatedUSD(model: String?, refusal: Refusal?, promptRange: ClosedRange<Int64>? = nil) -> Double? {
+        // A mid-stream refusal bills normal input/output rates, even if partial output was omitted.
+        if let refusal, outputTokens == 0, refusal.hasContent != true, refusal.billedBeforeOutput != true {
+            return refusal.hasContent == false && refusal.billedBeforeOutput == false ? 0 : nil
+        }
+        if let cacheCreation, cacheCreation.breakdown == nil { return nil }
+        return TokenPricing.claude(
+            model: model, input: inputTokens, cacheRead: cacheReadInputTokens ?? 0,
+            cacheWrite: cacheCreationInputTokens ?? 0,
+            write5m: cacheCreation?.breakdown?.fiveMinute,
+            write1h: cacheCreation?.breakdown?.oneHour, output: outputTokens, promptRange: promptRange)
+    }
 
     var total: Int64? {
         // Cache breakdowns and output details describe tokens already counted in these four fields.

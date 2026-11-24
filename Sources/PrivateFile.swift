@@ -1,7 +1,15 @@
 import Darwin
 import Foundation
+import SQLite3
 
 enum PrivateFile {
+    static func databaseNeedsReopening(_ database: OpaquePointer) -> Bool {
+        var moved: Int32 = 0
+        let status = sqlite3_file_control(database, "main", SQLITE_FCNTL_HAS_MOVED, &moved)
+        // Apple's SQLite can report a vnode I/O error when the open file has been unlinked or replaced.
+        return status == SQLITE_OK ? moved != 0 : (status & 0xff) == SQLITE_IOERR
+    }
+
     static func databasePath(_ url: URL) throws -> String {
         let directory = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(

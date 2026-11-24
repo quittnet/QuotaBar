@@ -126,6 +126,8 @@ final class NetworkChanges: NSObject, CWEventDelegate {
 
     private func scheduleChange() {
         guard let connected = current.connected, onChange != nil else { return }
+        // Let the first reachable path through while VPN and route details continue to settle.
+        if connected, delivered?.connected != true, pending != nil { return }
         pending?.invalidate()
         pending = nil
         if !connected {

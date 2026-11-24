@@ -39,7 +39,8 @@ enum ClaudeQuotaSource {
     static func read(file: URL = cacheFile, now: Date = Date()) throws -> QuotaReading? {
         guard let snapshot = try load(file), (snapshot.lastRecordedAt ?? snapshot.observedAt) <= now else { return nil }
         guard let limits = snapshot.limits, !limits.activeWindows(at: now).isEmpty else { return nil }
-        let windows = limits.windows
+        // Keep deadlines crossed since the observation so a cached report still expires normally.
+        let windows = limits.activeWindows(at: snapshot.observedAt)
         return QuotaReading(fetchedAt: snapshot.observedAt, windows: windows)
     }
 
@@ -55,8 +56,9 @@ enum ClaudeQuotaSource {
             try invalidate(file: file, order: order, now: now, currentDate: currentDate)
             throw error
         }
-        let limits = payload.rateLimits.flatMap { $0.activeWindows(at: now).isEmpty ? nil : $0 }
-        try record(limits, sessionID: payload.sessionID, file: file, order: order, now: now, currentDate: currentDate)
+        try record(
+            payload.rateLimits, sessionID: payload.sessionID, file: file, order: order, now: now,
+            currentDate: currentDate)
     }
 
     static func invalidate(
@@ -67,7 +69,7 @@ enum ClaudeQuotaSource {
     }
 
     private static func record(
-        _ limits: Limits?, sessionID: String?, file: URL, order: CaptureOrder?, now: Date, currentDate: () -> Date
+        _ reported: Limits?, sessionID: String?, file: URL, order: CaptureOrder?, now: Date, currentDate: () -> Date
     ) throws {
         try FileManager.default.createDirectory(
             at: file.deletingLastPathComponent(), withIntermediateDirectories: true,
@@ -94,22 +96,34 @@ enum ClaudeQuotaSource {
             }
             if saved.observedAt > now { previous = nil }
         }
-        var accepted = limits
+        let limits = reported.flatMap { $0.activeWindows(at: now).isEmpty ? nil : $0 }
+        let retained = previous.flatMap { saved in
+            reported?.retainingNewerPeriods(from: saved, at: now)
+        }
+        var accepted = retained ?? limits
         var sessions = previous?.recentSessions ?? []
         if let id = sessionID, !id.isEmpty {
             let key = Data(SHA256.hash(data: Data(id.utf8))).base64EncodedString()
             // An idle terminal can redraw its old snapshot, including after Claude drops an expired window.
+            var requiresExactReplay = retained != nil
             if let last = sessions.first(where: { $0.key == key }), last.limits != previous?.limits,
-                last.limits?.activeWindows(at: now) == limits?.activeWindows(at: now)
+                retained == nil || last.requiresExactReplay == true, last.matches(reported, normalized: limits, at: now)
             {
                 accepted = previous?.limits
+                requiresExactReplay = last.requiresExactReplay == true
             }
             sessions.removeAll { $0.key == key }
-            sessions.append(SessionReport(key: key, limits: limits))
+            sessions.append(
+                SessionReport(
+                    key: key, limits: requiresExactReplay ? reported : limits,
+                    requiresExactReplay: requiresExactReplay ? true : nil))
             sessions = Array(sessions.suffix(64))
         }
+        // A new report may add an expired window without changing the active balance or its observation date.
+        // An unchanged report or suppressed idle redraw must retain the original deadlines.
+        if accepted != previous?.limits { accepted?.removeExpired(at: now) }
         let sameBalance = previous?.limits?.activeWindows(at: now) == accepted?.activeWindows(at: now)
-        let observedAt = sameBalance ? previous?.observedAt ?? now : now
+        let observedAt = sameBalance || retained != nil ? previous?.observedAt ?? now : now
         // Even an unchanged report advances ordering, without advancing the time of the quota observation.
         let snapshot = Snapshot(
             observedAt: observedAt, lastRecordedAt: now, order: order, limits: accepted, unavailable: accepted == nil,
@@ -170,11 +184,18 @@ enum ClaudeQuotaSource {
     private struct SessionReport: Codable {
         let key: String
         let limits: Limits?
+        let requiresExactReplay: Bool?
+
+        func matches(_ reported: Limits?, normalized: Limits?, at now: Date) -> Bool {
+            // After an obsolete period, distinguish the same old callback from a genuine omission or empty report.
+            if requiresExactReplay == true { return limits == reported }
+            return limits?.activeWindows(at: now) == normalized?.activeWindows(at: now)
+        }
     }
 
     private struct Limits: Codable, Equatable {
-        let fiveHour: Window?
-        let sevenDay: Window?
+        var fiveHour: Window?
+        var sevenDay: Window?
 
         private enum CodingKeys: String, CodingKey {
             case fiveHour = "five_hour"
@@ -193,6 +214,32 @@ enum ClaudeQuotaSource {
 
         func activeWindows(at date: Date) -> [QuotaWindow] {
             windows.filter { $0.resetsAt.map { $0 > date } ?? true }
+        }
+
+        /// An old terminal can report a window that had already ended when the next period was observed.
+        func retainingNewerPeriods(from saved: Snapshot, at now: Date) -> Self? {
+            guard let prior = saved.limits else { return nil }
+            func superseded(_ window: Window?, by successor: Window?) -> Bool {
+                guard let ended = window?.resetsAt, let current = successor?.resetsAt else { return false }
+                return ended <= saved.observedAt.timeIntervalSince1970 && current > now.timeIntervalSince1970
+            }
+            let short = superseded(fiveHour, by: prior.fiveHour)
+            let week = superseded(sevenDay, by: prior.sevenDay)
+            guard short || week else { return nil }
+
+            // A changed live sibling is a separate observation. Keep its own values and timestamp.
+            var retained = self
+            retained.removeExpired(at: now)
+            if let live = retained.fiveHour, live != prior.fiveHour { return nil }
+            if let live = retained.sevenDay, live != prior.sevenDay { return nil }
+            if short { retained.fiveHour = prior.fiveHour }
+            if week { retained.sevenDay = prior.sevenDay }
+            return retained
+        }
+
+        mutating func removeExpired(at date: Date) {
+            if let reset = fiveHour?.resetsAt, reset <= date.timeIntervalSince1970 { fiveHour = nil }
+            if let reset = sevenDay?.resetsAt, reset <= date.timeIntervalSince1970 { sevenDay = nil }
         }
     }
 

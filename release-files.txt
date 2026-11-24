@@ -8,6 +8,7 @@ release-update.sh
 sign-quotabar.sh
 release-files.txt
 Helpers/ClaudeDisconnect.swift
+Helpers/PublishArchives.py
 Resources/AppIcon.icns
 Resources/Info.plist
 Resources/UpdatePublicKey.txt
@@ -36,6 +37,7 @@ Sources/ProviderProcess.swift
 Sources/ProviderLogo.swift
 Sources/QuotaCore.swift
 Sources/TokenHistory.swift
+Sources/TokenPricing.swift
 Sources/TokenTracking.swift
 Sources/UsageResets.swift
 Sources/Updater.swift
@@ -54,6 +56,7 @@ Tests/LiveTokenHistoryChecks.swift
 Tests/NetworkChecks.swift
 Tests/NetworkSignalChecks.swift
 Tests/OnboardingChecks.swift
+Tests/PackagePublishingChecks.py
 Tests/PreferenceDomainChecks.py
 Tests/PresentationChecks.swift
 Tests/ProviderProcessChecks.swift
@@ -62,8 +65,10 @@ Tests/RefreshChecks.swift
 Tests/ResetContentionChecks.swift
 Tests/ResetFlowChecks.swift
 Tests/ResetLogicStressChecks.swift
+Tests/SparkleCacheChecks.py
 Tests/TestPreferences.swift
 Tests/TokenChecks.swift
+Tests/TokenPricingChecks.swift
 Tests/UpdateFeedChecks.swift
 Tests/UpdateProbeChecks.py
 Tests/UpdateStateChecks.swift

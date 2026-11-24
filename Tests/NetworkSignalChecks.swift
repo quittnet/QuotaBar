@@ -69,6 +69,20 @@ enum NetworkSignalChecks {
         try await expect([true, true])
         wifi.ssidDidChangeForWiFiInterface?(withName: "en0")
         try await expect([true, true, true])
+        monitor.updatePath(connected: false, interfaceTypes: [], wifiInterfaces: [])
+        events.removeAll()
+        monitor.updatePath(connected: true, interfaceTypes: [.wifi, .other], wifiInterfaces: ["en0"])
+        for index in 0..<10 {
+            monitor.updateRoutes(route("vpn-\(index)", interface: "utun3"))
+            try await Task.sleep(for: .milliseconds(150))
+        }
+        precondition(events == [true], "Ongoing route updates must not postpone the reconnect signal")
+        try await expect([true, true])
+        monitor.updatePath(connected: false, interfaceTypes: [], wifiInterfaces: [])
+        monitor.updatePath(connected: true, interfaceTypes: [.wifi], wifiInterfaces: ["en0"])
+        monitor.updatePath(connected: false, interfaceTypes: [], wifiInterfaces: [])
+        try await Task.sleep(for: .seconds(1))
+        try await expect([true, true, false])
         print("Network signals ignored link and roaming noise and delivered switches, disconnect and reconnect.")
     }
 }

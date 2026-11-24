@@ -53,23 +53,26 @@ final class ClaudeHistoryIndex {
                     """
                     CREATE TABLE files (key TEXT PRIMARY KEY, checkpoint BLOB NOT NULL) WITHOUT ROWID;
                     CREATE TABLE samples (file TEXT NOT NULL, message TEXT NOT NULL, date REAL,
-                                          count INTEGER NOT NULL, finished INTEGER NOT NULL);
+                                          count INTEGER NOT NULL, finished INTEGER NOT NULL, usd REAL);
                     CREATE INDEX samples_file ON samples(file);
-                    CREATE INDEX samples_message ON samples(message, file, date, finished, count);
-                    PRAGMA user_version = 1;
+                    CREATE INDEX samples_message ON samples(message, finished, count, date, file, usd);
+                    PRAGMA user_version = 2;
                     """)
-            case 1: break
+            case 2: break
             default: throw Failure(code: SQLITE_SCHEMA)
             }
         }
         try execute("CREATE TEMP TABLE visible (key TEXT PRIMARY KEY) WITHOUT ROWID")
-        insertSample = try prepare("INSERT INTO samples(file, message, date, count, finished) VALUES (?, ?, ?, ?, ?)")
+        insertSample = try prepare(
+            "INSERT INTO samples(file, message, date, count, finished, usd) VALUES (?, ?, ?, ?, ?, ?)")
     }
 
     deinit {
         sqlite3_finalize(insertSample)
         sqlite3_close(database)
     }
+
+    var needsReopening: Bool { PrivateFile.databaseNeedsReopening(database) }
 
     func transaction<T>(_ operation: () throws -> T) throws -> T {
         try execute("BEGIN IMMEDIATE")
@@ -118,7 +121,7 @@ final class ClaudeHistoryIndex {
         try run("DELETE FROM files WHERE key = ?", key: key)
     }
 
-    func append(key: String, id: String, date: Date?, count: Int64, finished: Bool) throws {
+    func append(key: String, id: String, date: Date?, count: Int64, finished: Bool, usd: Double?) throws {
         guard let insertSample else { throw Failure(code: SQLITE_MISUSE) }
         defer {
             sqlite3_reset(insertSample)
@@ -133,6 +136,7 @@ final class ClaudeHistoryIndex {
         }
         try check(sqlite3_bind_int64(insertSample, 4, count))
         try check(sqlite3_bind_int(insertSample, 5, finished ? 1 : 0))
+        if let usd { try check(sqlite3_bind_double(insertSample, 6, usd)) }
         try check(sqlite3_step(insertSample), expecting: SQLITE_DONE)
     }
 
@@ -156,9 +160,12 @@ final class ClaudeHistoryIndex {
             """)
     }
 
-    func totals(now: Date, days: TokenDayBoundaries, partial: Bool, stats: Int64?) throws -> TokenTotals {
+    func totals(now: Date, calendar: Calendar, partial: Bool, stats: Int64?) throws -> TokenTotals {
+        let days = TokenDayBoundaries(now: now, calendar: calendar)
+        var daily = TokenDailyUsage(calendar: calendar)
         var incomplete = partial
         var retained = false
+        var spend = TokenSpendTotals()
         var all: Int64 = 0
         var month: Int64 = 0
         var week: Int64 = 0
@@ -171,14 +178,30 @@ final class ClaudeHistoryIndex {
             total = overflow ? .max : sum
         }
 
-        // Group globally by response ID. Filtering future samples before grouping lets them become
-        // eligible later without reparsing a transcript. Only one group's results enter Swift at a time.
+        // The first pass keeps the earliest eligible date and selects the smallest final count
+        // (or largest in-progress count). Only copies matching that choice may supply its price.
+        // A matching copy can fill in missing details, but conflicting known prices stay unpriced.
+        // Summing steps can round differently from pricing their aggregate. Half a nanodollar
+        // is below the smallest charge difference in the bundled rates.
+        // With one eligible copy, its own price needs no second index lookup.
         let sql = """
-            SELECT MIN(date), MIN(CASE WHEN finished THEN count END),
-                   MAX(CASE WHEN finished THEN count END), MAX(count)
-            FROM samples INDEXED BY samples_message
-            WHERE (date IS NULL OR date <= ?) AND file IN visible
-            GROUP BY message
+            WITH messages AS (
+                SELECT message, MIN(date) AS firstDate, MIN(count) FILTER (WHERE finished) AS smallestFinal,
+                       MAX(count) FILTER (WHERE finished) AS largestFinal, MAX(count) AS largestCount,
+                       COUNT(*) AS copies, CASE WHEN finished IN (0, 1) THEN usd END AS singlePrice
+                FROM samples INDEXED BY samples_message
+                WHERE (date <= ?1 OR date IS NULL) AND file IN visible
+                GROUP BY message
+            )
+            SELECT firstDate, COALESCE(smallestFinal, largestCount),
+                   CASE WHEN copies = 1 THEN singlePrice ELSE
+                       (SELECT CASE WHEN MAX(usd) - MIN(usd) < 5e-10 THEN MIN(usd) END
+                        FROM samples WHERE message = messages.message AND finished = (smallestFinal IS NOT NULL)
+                                      AND count = COALESCE(smallestFinal, largestCount)
+                                      AND (date <= ?1 OR date IS NULL) AND file IN visible)
+                   END,
+                   smallestFinal IS NOT NULL, largestFinal
+            FROM messages
             """
         try statement(sql) { query in
             try check(sqlite3_bind_double(query, 1, now.timeIntervalSinceReferenceDate))
@@ -187,15 +210,20 @@ final class ClaudeHistoryIndex {
                 if step == SQLITE_DONE { break }
                 try check(step, expecting: SQLITE_ROW)
                 retained = true
-                let finished = sqlite3_column_type(query, 1) != SQLITE_NULL
-                let count = sqlite3_column_int64(query, finished ? 1 : 3)
-                if !finished || count != sqlite3_column_int64(query, 2) { incomplete = true }
+                let count = sqlite3_column_int64(query, 1)
+                let usd = sqlite3_column_type(query, 2) == SQLITE_NULL ? nil : sqlite3_column_double(query, 2)
+                let finished = sqlite3_column_int(query, 3) != 0
+                if !finished || count != sqlite3_column_int64(query, 4) { incomplete = true }
+                let date =
+                    sqlite3_column_type(query, 0) == SQLITE_NULL
+                    ? nil : Date(timeIntervalSinceReferenceDate: sqlite3_column_double(query, 0))
+                spend.record(usd, tokens: count, date: date, now: now, days: days)
                 add(count, to: &all)
-                guard sqlite3_column_type(query, 0) != SQLITE_NULL else {
+                guard let date else {
                     incomplete = true
                     continue
                 }
-                let date = Date(timeIntervalSinceReferenceDate: sqlite3_column_double(query, 0))
+                daily.add(count, on: date, partial: &incomplete)
                 if date >= days.month { add(count, to: &month) }
                 if date >= days.week { add(count, to: &week) }
                 if date >= days.today {
@@ -207,7 +235,8 @@ final class ClaudeHistoryIndex {
         }
         return TokenTotals(
             allTime: all, month: month, week: week, yesterday: yesterday, today: today,
-            partial: incomplete, hasRetainedUsage: retained, claudeStatsLifetime: stats)
+            partial: incomplete, hasRetainedUsage: retained, claudeStatsLifetime: stats, spend: spend,
+            peakDay: daily.peak)
     }
 
     private func check(_ code: Int32, expecting: Int32 = SQLITE_OK) throws {

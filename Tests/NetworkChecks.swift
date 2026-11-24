@@ -66,6 +66,7 @@ private final class ClaudeNetworkReadings: @unchecked Sendable {
             calls += 1
             return calls
         }
+        if call == 1 { precondition(finishOldReading.wait(timeout: .now() + 10) == .success) }
         if call == 3 {
             precondition(finishOldReading.wait(timeout: .now() + 10) == .success)
             lock.withLock { finishedOld = true }
@@ -128,11 +129,12 @@ enum NetworkChecks {
         var failedAt = Date.distantPast
         let claudeReadings = ClaudeNetworkReadings()
         var claudeController: AppDelegate?
+        var pairedFrames: [NSImage] = []
         let timer = Timer(timeInterval: 0.05, repeats: true) { _ in
             MainActor.assumeIsolated {
                 let preferences = UserDefaults(suiteName: suite)!
                 precondition(Date() < deadline, "Network check timed out at stage \(stage)")
-                guard let button = controller.item?.button, let label = button.toolTip else { return }
+                guard let button = controller.item?.button, let label = button.accessibilityLabel() else { return }
                 precondition(!controller.dropdown.isVisible)
                 precondition(disabledClaude.count == 0, "A disabled provider must never be queried")
                 switch stage {
@@ -236,7 +238,7 @@ enum NetworkChecks {
                     stage = 9
                 case 9:
                     guard let next = raceController, launchRace.count == 2,
-                        next.item.button?.toolTip?.contains("80% remaining") == true
+                        next.item.button?.accessibilityLabel()?.contains("80% remaining") == true
                     else { return }
                     print(
                         "A reconnect during an in-flight read discarded its response and fetched from the new connection."
@@ -299,17 +301,32 @@ enum NetworkChecks {
                     claudeController = claude
                     claude.applicationDidFinishLaunching(
                         Notification(name: NSApplication.didFinishLaunchingNotification))
+                    // Pin the fixture's appearance before the asynchronous Codex result sets the stable title.
+                    claude.item.button?.appearance = NSAppearance(named: .aqua)
+                    stage = 22
+                case 22:
+                    guard let button = claudeController?.item.button, let image = button.image,
+                        button.accessibilityLabel()?.contains("75% remaining") == true
+                    else { return }
+                    if pairedFrames.isEmpty { animationStarted = Date() }
+                    if !pairedFrames.contains(where: { $0 === image }) { pairedFrames.append(image) }
+                    precondition(pairedFrames.count <= 3, "A stable loading badge should reuse its three frames")
+                    guard Date().timeIntervalSince(animationStarted) >= 1.8 else { return }
+                    let expectedFrames = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 1 : 3
+                    precondition(pairedFrames.count == expectedFrames)
+                    claudeReadings.releaseOldReading()
                     stage = 14
                 case 14:
                     guard let claude = claudeController,
-                        claude.item.button?.toolTip?.contains("64% remaining") == true
+                        claude.item.button?.accessibilityLabel()?.contains("64% remaining") == true
                     else { return }
                     precondition(claudeReadings.count == 1, "Enabled Claude must refresh at launch")
+                    precondition(!pairedFrames.contains(where: { $0 === claude.item.button?.image }))
                     claude.dashboard.rootView.refresh()
                     stage = 15
                 case 15:
                     guard let claude = claudeController,
-                        claude.item.button?.toolTip?.contains("54% remaining") == true
+                        claude.item.button?.accessibilityLabel()?.contains("54% remaining") == true
                     else { return }
                     precondition(claudeReadings.count == 2, "Manual refresh must query enabled Claude")
                     claude.networkChanged(available: true)
@@ -326,19 +343,19 @@ enum NetworkChecks {
                         Date().timeIntervalSince(offlineAt) > 0.5
                     else { return }
                     precondition(claudeReadings.count == 3, "Claude must remain idle while offline")
-                    precondition(claude.item.button?.toolTip?.contains("99% remaining") == false)
+                    precondition(claude.item.button?.accessibilityLabel()?.contains("99% remaining") == false)
                     claude.networkChanged(available: true)
                     stage = 18
                 case 18:
                     guard let claude = claudeController,
-                        claude.item.button?.toolTip?.contains("44% remaining") == true
+                        claude.item.button?.accessibilityLabel()?.contains("44% remaining") == true
                     else { return }
                     precondition(claudeReadings.count == 4, "Reconnect must fetch a current Claude reading")
                     claude.networkChanged(available: true)
                     stage = 19
                 case 19:
                     guard let claude = claudeController,
-                        claude.item.button?.toolTip?.contains("34% remaining") == true
+                        claude.item.button?.accessibilityLabel()?.contains("34% remaining") == true
                     else { return }
                     precondition(claudeReadings.count == 5, "A network switch must refresh enabled Claude")
                     print(
@@ -348,14 +365,14 @@ enum NetworkChecks {
                     claude.dashboard.rootView.refresh()
                     stage = 20
                 case 20:
-                    guard let claude = claudeController, let label = claude.item.button?.toolTip,
+                    guard let claude = claudeController, let label = claude.item.button?.accessibilityLabel(),
                         label.contains("Current Claude limits unavailable")
                     else { return }
                     precondition(!label.contains("34% remaining") && label.contains("75% remaining"))
                     claude.dashboard.rootView.refresh()
                     stage = 21
                 default:
-                    guard let claude = claudeController, let label = claude.item.button?.toolTip,
+                    guard let claude = claudeController, let label = claude.item.button?.accessibilityLabel(),
                         label.contains("5-hour limit, 100% remaining")
                     else { return }
                     let windows = claude.makePanel().summaries.first { $0.display.provider == .claude }?.display

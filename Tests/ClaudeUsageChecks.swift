@@ -165,17 +165,20 @@ struct ClaudeUsageChecks {
             _ = try ClaudeUsageClient.parse(Data(#"{"rate_limits_available":false,"rate_limits":null}"#.utf8), now: now)
         }
         let executable = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
-        for mode in ["success", "interleaved", "unsupported", "denied", "invalid", "oversized", "hang", "exit"] {
+        for mode in [
+            "success", "interleaved", "final-eof", "partial-eof", "unsupported", "denied", "invalid", "oversized",
+            "hang", "exit",
+        ] {
             setenv("QUOTABAR_CLAUDE_TEST_MODE", mode, 1)
             defer { unsetenv("QUOTABAR_CLAUDE_TEST_MODE") }
-            if mode == "success" || mode == "interleaved" {
+            if ["success", "interleaved", "final-eof"].contains(mode) {
                 let live = try ClaudeUsageClient.read(executable: executable, timeout: 2)
                 precondition(live.windows.first?.remaining == 63)
             } else {
                 let failure: ClaudeUsageClient.Failure
                 switch mode {
                 case "unsupported": failure = .unsupported
-                case "invalid", "oversized": failure = .invalidResponse
+                case "invalid", "oversized", "partial-eof": failure = .invalidResponse
                 case "hang": failure = .timedOut
                 default: failure = .unavailable
                 }
@@ -287,6 +290,21 @@ struct ClaudeUsageChecks {
         let selectedEnv = paths.childEnvironment(
             for: chosen.resolvingSymlinksInPath(), named: provider, defaults: defaults)
         precondition(selectedEnv["PATH"]?.components(separatedBy: ":").first == chosenBin.path)
+        let moved = directory.appendingPathComponent("relocated-" + provider)
+        try files.moveItem(at: chosen, to: moved)
+        precondition(ProviderExecutable.hasSelection(provider, defaults: defaults))
+        precondition(paths.executable(named: provider, preferred: [], defaults: defaults) == nil)
+        try ProviderExecutable.choose(moved, name: provider, defaults: defaults)
+        do {
+            try ProviderExecutable.choose(chosen, name: provider, defaults: defaults)
+            preconditionFailure("Choosing the old, missing path should fail")
+        } catch let error as CocoaError {
+            precondition(error.code == .fileReadNoPermission)
+        }
+        precondition(ProviderExecutable.selected(provider, defaults: defaults) == cliModule.resolvingSymlinksInPath())
+        try files.moveItem(at: moved, to: chosen)
+        precondition(ProviderExecutable.selected(provider, defaults: defaults) == nil)
+        try ProviderExecutable.choose(chosen, name: provider, defaults: defaults)
         try Data("#!/usr/bin/env node\n// new version\n".utf8).write(to: cliModule)
         precondition(paths.executable(named: provider, preferred: [], defaults: defaults) == nil)
         try ProviderExecutable.choose(chosen, name: provider, defaults: defaults)
@@ -438,6 +456,10 @@ struct ClaudeUsageChecks {
             try FileHandle.standardOutput.write(contentsOf: Data(repeating: 0x41, count: 3 * 1024 * 1024))
             return
         }
+        if mode == "partial-eof" {
+            try FileHandle.standardOutput.write(contentsOf: Data(#"{"type":"control_response""#.utf8))
+            return
+        }
         if mode == "invalid" {
             try FileHandle.standardOutput.write(contentsOf: Data("malformed\n".utf8))
             return
@@ -482,16 +504,16 @@ struct ClaudeUsageChecks {
             request,
             body: [
                 "rate_limits_available": true, "rate_limits": ["five_hour": ["utilization": 37, "resets_at": reset]],
-            ])
+            ], appendNewline: mode != "final-eof")
     }
 
-    private static func respond(_ request: [String: Any], body: [String: Any]) throws {
+    private static func respond(_ request: [String: Any], body: [String: Any], appendNewline: Bool = true) throws {
         let response: [String: Any] = [
             "type": "control_response",
             "response": ["subtype": "success", "request_id": request["request_id"]!, "response": body],
         ]
         var data = try JSONSerialization.data(withJSONObject: response)
-        data.append(0x0A)
+        if appendNewline { data.append(0x0A) }
         try FileHandle.standardOutput.write(contentsOf: data)
     }
 }

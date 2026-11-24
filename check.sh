@@ -78,6 +78,8 @@ logic_stress() {
     offline_run "${checks_dir}/reset-logic"
 }
 update_stress() {
+    python3 Tests/PackagePublishingChecks.py
+    python3 Tests/SparkleCacheChecks.py
     sparkle=$(./fetch-sparkle.sh)
     mkdir -p "${checks_dir}/Probe.app/Contents/MacOS"
     compile -F "${sparkle}" -framework Sparkle -Xlinker -rpath -Xlinker "${sparkle}" \
@@ -139,7 +141,7 @@ compile Sources/NetworkChanges.swift Tests/NetworkSignalChecks.swift -o "${check
 offline_run "${checks_dir}/network-signals"
 compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/ProviderExecutable.swift Sources/ProviderProcess.swift Sources/QuotaCore.swift Sources/Presentation.swift Sources/UsageResets.swift Tests/ResetFlowChecks.swift -o "${checks_dir}/resets"
 offline_run "${checks_dir}/resets"
-compile Sources/PrivateFile.swift Sources/CodexHistoryCache.swift Sources/TokenHistory.swift Tests/TokenChecks.swift -o "${checks_dir}/tokens"
+compile Sources/PrivateFile.swift Sources/CodexHistoryCache.swift Sources/TokenPricing.swift Sources/TokenHistory.swift Tests/TokenPricingChecks.swift Tests/TokenChecks.swift -o "${checks_dir}/tokens"
 offline_run "${checks_dir}/tokens"
 compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/ProviderExecutable.swift Sources/ProviderProcess.swift Sources/QuotaCore.swift Sources/ClaudeQuota.swift Tests/ClaudeQuotaChecks.swift -o "${checks_dir}/claude-quota"
 offline_run "${checks_dir}/claude-quota"
@@ -148,12 +150,12 @@ offline_run "${checks_dir}/claude-usage"
 compile Sources/ClaudeProfile.swift Sources/ProviderExecutable.swift Sources/ProviderProcess.swift Sources/QuotaCore.swift Sources/Presentation.swift Sources/ClaudeUsageClient.swift \
     Tests/ProviderProcessChecks.swift -o "${checks_dir}/provider-process"
 offline_run "${checks_dir}/provider-process"
-compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/CodexHistoryCache.swift Sources/TokenHistory.swift Sources/ClaudeHistoryIndex.swift Sources/ClaudeTokenHistory.swift Tests/ClaudeTokenChecks.swift -o "${checks_dir}/claude-tokens"
+compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/CodexHistoryCache.swift Sources/TokenPricing.swift Sources/TokenHistory.swift Sources/ClaudeHistoryIndex.swift Sources/ClaudeTokenHistory.swift Tests/ClaudeTokenChecks.swift -o "${checks_dir}/claude-tokens"
 offline_run "${checks_dir}/claude-tokens"
-compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/CodexHistoryCache.swift Sources/TokenHistory.swift Sources/ClaudeHistoryIndex.swift Sources/ClaudeTokenHistory.swift \
+compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/CodexHistoryCache.swift Sources/TokenPricing.swift Sources/TokenHistory.swift Sources/ClaudeHistoryIndex.swift Sources/ClaudeTokenHistory.swift \
     Tests/LiveTokenHistoryChecks.swift -o "${checks_dir}/live-token-history"
 offline_run "${checks_dir}/live-token-history"
-compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/CodexHistoryCache.swift Sources/TokenHistory.swift Sources/ClaudeHistoryIndex.swift Sources/ClaudeTokenHistory.swift \
+compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/CodexHistoryCache.swift Sources/TokenPricing.swift Sources/TokenHistory.swift Sources/ClaudeHistoryIndex.swift Sources/ClaudeTokenHistory.swift \
     Tests/ClaudeHistoryMemoryChecks.swift -o "${checks_dir}/claude-history-memory"
 offline_run "${checks_dir}/claude-history-memory"
 if [ "${1:-}" = "--stress" ]; then
@@ -162,7 +164,7 @@ if [ "${1:-}" = "--stress" ]; then
     offline_run python3 Tests/ClaudeCaptureOrderChecks.py "${checks_dir}/QuotaBar"
     echo 'Exercising quota and token histories under load.'
     compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/ProviderExecutable.swift Sources/ProviderProcess.swift Sources/QuotaCore.swift Sources/Presentation.swift Sources/ClaudeUsageClient.swift \
-        Sources/CodexHistoryCache.swift Sources/TokenHistory.swift Sources/ClaudeHistoryIndex.swift Sources/ClaudeTokenHistory.swift Tests/DataStressChecks.swift -o "${checks_dir}/data-stress"
+        Sources/CodexHistoryCache.swift Sources/TokenPricing.swift Sources/TokenHistory.swift Sources/ClaudeHistoryIndex.swift Sources/ClaudeTokenHistory.swift Tests/DataStressChecks.swift -o "${checks_dir}/data-stress"
     offline_run "${checks_dir}/data-stress"
     echo 'Racing reset confirmations from separate processes.'
     compile Sources/PrivateFile.swift Sources/ClaudeProfile.swift Sources/ProviderExecutable.swift Sources/ProviderProcess.swift Sources/QuotaCore.swift Sources/Presentation.swift Sources/UsageResets.swift \

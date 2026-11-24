@@ -44,6 +44,7 @@ struct QuotaResetCredits: Sendable {
     let availableCount: Int
     private let backendSelectsCredit: Bool
     private let credits: [Credit]
+    private let redeemedIDs: Set<String>
 
     fileprivate struct Credit: Sendable {
         let id: String
@@ -51,11 +52,12 @@ struct QuotaResetCredits: Sendable {
     }
 
     init(availableCount: Int) {
-        self.init(availableCount: availableCount, credits: [], backendSelectsCredit: true)
+        self.init(availableCount: availableCount, credits: [], redeemedIDs: [], backendSelectsCredit: true)
     }
 
-    fileprivate init(availableCount: Int, credits: [Credit], backendSelectsCredit: Bool) {
+    fileprivate init(availableCount: Int, credits: [Credit], redeemedIDs: Set<String>, backendSelectsCredit: Bool) {
         self.backendSelectsCredit = backendSelectsCredit
+        self.redeemedIDs = redeemedIDs
         self.availableCount = max(0, availableCount)
         self.credits = credits.sorted { left, right in
             guard let leftExpiration = left.expiresAt else { return false }
@@ -83,6 +85,7 @@ struct QuotaResetCredits: Sendable {
 
     func reportedAvailability(of id: String) -> Bool? {
         if credits.contains(where: { $0.id == id }) { return true }
+        if redeemedIDs.contains(id) { return false }
         // Only a complete set of unique, available detail rows can establish absence.
         return credits.count == availableCount ? false : nil
     }
@@ -470,8 +473,9 @@ struct RateLimitsResponse: Decodable {
             selected = compatible ? legacy : nil
         }
         windows = selected?.windows ?? []
-        let ordinary = try values.decodeIfPresent(Bool.self, forKey: .ordinaryUsageAllowed)
-        ordinaryUsageAllowed = selected?.hasExplicitRestriction == true ? false : ordinary
+        ordinaryUsageAllowed =
+            selected?.hasExplicitRestriction == true
+            ? false : try values.decodeIfPresent(Bool.self, forKey: .ordinaryUsageAllowed)
         let credits = try? values.decode(ResetCreditsSummary.self, forKey: .rateLimitResetCredits)
         quotaResetCredits = credits?.quotaResetCredits
         if let accountId = try? values.decode(String.self, forKey: .accountId),
@@ -495,15 +499,20 @@ struct RateLimitsResponse: Decodable {
         init(from decoder: Decoder) throws {
             let values = try decoder.container(keyedBy: CodingKeys.self)
             limitId = try values.decodeIfPresent(String.self, forKey: .limitId)
-            let primary = try values.decodeIfPresent(Window.self, forKey: .primary)?.quotaWindow()
-            let secondary = try values.decodeIfPresent(Window.self, forKey: .secondary)?.quotaWindow()
-            let spendControlReached = try values.decodeIfPresent(Bool.self, forKey: .spendControlReached)
             // A non-null reason signals a restriction even if the server changes its representation.
             let hasReason =
                 try values.contains(.rateLimitReachedType) && !values.decodeNil(forKey: .rateLimitReachedType)
-            hasExplicitRestriction = spendControlReached == true || hasReason
-            let reported = primary == secondary ? [primary] : [primary, secondary]
-            windows = reported.compactMap { $0 }.sorted { ($0.minutes ?? Int.max) < ($1.minutes ?? Int.max) }
+            hasExplicitRestriction =
+                try hasReason || values.decodeIfPresent(Bool.self, forKey: .spendControlReached) == true
+            do {
+                let primary = try values.decodeIfPresent(Window.self, forKey: .primary)?.quotaWindow()
+                let secondary = try values.decodeIfPresent(Window.self, forKey: .secondary)?.quotaWindow()
+                let reported = primary == secondary ? [primary] : [primary, secondary]
+                windows = reported.compactMap { $0 }.sorted { ($0.minutes ?? Int.max) < ($1.minutes ?? Int.max) }
+            } catch  where hasExplicitRestriction {
+                // Unreadable percentages cannot override an explicit restriction on this bucket.
+                windows = []
+            }
         }
     }
 
@@ -557,13 +566,16 @@ struct RateLimitsResponse: Decodable {
         var quotaResetCredits: QuotaResetCredits? {
             var seen: [String: Credit] = [:]
             var availableCredits: [QuotaResetCredits.Credit] = []
+            var redeemedIDs: Set<String> = []
             for credit in credits {
                 guard !credit.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
                 if let previous = seen.updateValue(credit, forKey: credit.id) {
                     guard previous == credit else { return nil }
                     continue
                 }
-                guard credit.resetType == "codexRateLimits", credit.status == "available" else { continue }
+                guard credit.resetType == "codexRateLimits" else { continue }
+                if credit.status == "redeemed" { redeemedIDs.insert(credit.id) }
+                guard credit.status == "available" else { continue }
                 let expiration = credit.expiresAt.map { Date(timeIntervalSince1970: Double($0)) }
                 guard expiration.map({ $0.timeIntervalSince1970 > 0 && $0 < .distantFuture }) ?? true else {
                     return nil
@@ -572,15 +584,20 @@ struct RateLimitsResponse: Decodable {
             }
             guard availableCredits.count <= availableCount else { return nil }
             return QuotaResetCredits(
-                availableCount: availableCount, credits: availableCredits, backendSelectsCredit: countOnly)
+                availableCount: availableCount, credits: availableCredits, redeemedIDs: redeemedIDs,
+                backendSelectsCredit: countOnly)
         }
     }
 
     func reading(fetchedAt: Date, resetCountOnlyFingerprint: String? = nil) throws -> QuotaReading {
         guard !windows.isEmpty || ordinaryUsageAllowed == false else { throw QuotaError.quotaUnavailable }
+        let active = windows.filter { $0.resetsAt.map { $0 > fetchedAt } ?? true }
+        // An expired sibling must not hide a current limit or a fresh restriction. If every window
+        // expired, retain those deadlines so percentages stay stale while the credit balance can still reconcile.
+        let reported = active.isEmpty && ordinaryUsageAllowed != false ? windows : active
         return QuotaReading(
             fetchedAt: fetchedAt,
-            windows: windows,
+            windows: reported,
             resetCredits: quotaResetCredits,
             resetAccountFingerprint: resetAccountFingerprint,
             resetCountOnlyFingerprint: resetCountOnlyFingerprint,
@@ -683,6 +700,12 @@ private struct CodexTransport {
             var bytes = [UInt8](repeating: 0, count: 8192)
             let count = Darwin.read(fd, &bytes, bytes.count)
             if count < 0, errno == EINTR { continue }
+            if count == 0, !buffer.isEmpty {
+                // EOF terminates the last record when a CLI exits without a trailing newline.
+                let line = buffer
+                buffer = Data()
+                return line
+            }
             guard count > 0 else { throw QuotaError.transportFailed }
             buffer.append(contentsOf: bytes.prefix(count))
         }

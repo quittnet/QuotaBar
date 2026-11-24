@@ -50,6 +50,7 @@ struct ResetLogicStressChecks {
         var retrying = false
         var seenKeys: Set<UUID> = []
         var lastRead: Input?
+        var needsOutcomeOwner = false
 
         func eligible(_ input: Input) -> Bool {
             guard input.usable, phase == .ready || phase == .uncertain else { return false }
@@ -60,6 +61,7 @@ struct ResetLogicStressChecks {
         }
         mutating func prepare(_ input: Input) {
             guard eligible(input) else { return }
+            needsOutcomeOwner = false
             selection =
                 pending.map { Intent(owner: $0.accountFingerprint, count: $0.startingCount) }
                 ?? Intent(owner: input.account, count: input.count)
@@ -96,7 +98,7 @@ struct ResetLogicStressChecks {
             pending = actual
             phase = .submitting
         }
-        mutating func finish(_ outcome: QuotaResetClaimResult) {
+        mutating func finish(_ outcome: QuotaResetClaimResult, current input: Input) {
             guard phase == .submitting, let pending else { return }
             selection = nil
             if outcome == .unknown
@@ -109,10 +111,16 @@ struct ResetLogicStressChecks {
                 receipts[pending.accountFingerprint!] = pending.startingCount!
                 blockedByReceipt = true
             }
+            // The next successful read identifies the owner of a displayed terminal outcome,
+            // including an empty balance with no claimable credits.
+            needsOutcomeOwner =
+                !input.missingReading && input.account == pending.accountFingerprint
+                && [.reset, .nothingToReset, .noCredit].contains(outcome)
             self.pending = nil
             phase = .ready
         }
         mutating func restore() {
+            needsOutcomeOwner = false
             lastRead = nil
             selection = nil
             phase = pending == nil ? .ready : .uncertain
@@ -120,6 +128,7 @@ struct ResetLogicStressChecks {
         }
         mutating func received(_ input: Input) {
             guard !input.missingReading else { return }
+            needsOutcomeOwner = false
             if phase == .uncertain { restore() }
             lastRead = input
             guard phase == .ready || phase == .confirming else { return }
@@ -148,6 +157,7 @@ struct ResetLogicStressChecks {
         ]
         var events = 0
         var dispatched = 0
+        var outcomeOnlyOwnerChecks = 0
         var retries = 0
         var completions = 0
         var relaunches = 0
@@ -164,7 +174,7 @@ struct ResetLogicStressChecks {
                 if model.phase == .submitting {
                     let index = random.next(outcomes.count)
                     store.finish(outcomes[index], reading: input.display.reading)
-                    model.finish(outcomes[index])
+                    model.finish(outcomes[index], current: input)
                     outcomeCounts[index] += 1
                     if outcomes[index] == .reset { completions += 1 }
                 } else {
@@ -209,8 +219,10 @@ struct ResetLogicStressChecks {
                 }
                 require(String(describing: store.phase) == model.phase.rawValue, "phase diverged", context)
                 require(store.isRetry == (model.pending != nil), "pending indicator diverged", context)
+                let needsDurableOwner = model.pending != nil || !model.receipts.isEmpty
+                if model.needsOutcomeOwner && !needsDurableOwner { outcomeOnlyOwnerChecks += 1 }
                 require(
-                    store.needsCountOnlyIdentityRefresh == (model.pending != nil || !model.receipts.isEmpty),
+                    store.needsCountOnlyIdentityRefresh == (needsDurableOwner || model.needsOutcomeOwner),
                     "identity refresh requirement diverged", context)
                 require(store.awaitingUpdatedBalance == model.blockedByReceipt, "balance gate diverged", context)
                 require(store.canPrepare(input.display) == model.eligible(input), "eligibility diverged", context)
@@ -226,6 +238,7 @@ struct ResetLogicStressChecks {
         require(
             dispatched > 500 && retries > 100 && completions > 50 && relaunches > 1000,
             "trace did not exercise enough successful transitions", "coverage")
+        require(outcomeOnlyOwnerChecks > 0, "no independent terminal-outcome owner checks", "coverage")
         require(outcomeCounts.allSatisfy { $0 > 50 }, "missing finish outcome coverage", "coverage")
         try storageRecovery(in: directory)
         try detailedReceipts(in: directory)

@@ -4,9 +4,14 @@ import AppKit
 struct MenuBarBadges {
     static let loadingDots = "···"
     let loadingPhase: Int?
-    let codex: String
-    let claude: String
-    let logos: Bool
+    struct Style: Equatable {
+        let codex: String
+        let claude: String
+        let logos: Bool
+        let font: NSFont
+        let appearance: NSAppearance
+    }
+    let style: Style
     let image: NSImage
     private let split: CGFloat
 
@@ -21,11 +26,10 @@ struct MenuBarBadges {
         return text
     }
 
-    init(codex: String, claude: String, font: NSFont, loadingPhase: Int?, logos: Bool = true) {
+    init(style: Style, loadingPhase: Int?) {
+        self.style = style
         self.loadingPhase = loadingPhase
-        self.codex = codex
-        self.claude = claude
-        self.logos = logos
+        let logos = style.logos
         // Without logos, Codex stays on the left in the menu bar's text color and Claude on the right in coral.
         let logoSide = logos ? ProviderLogo.menuBarSize : 0
         let innerGap: CGFloat = logos ? 3 : 0
@@ -33,8 +37,8 @@ struct MenuBarBadges {
         let height: CGFloat = 18
         let codexColor = logos ? NSColor.black : UsageProvider.codex.menuBarColor
         let claudeColor = logos ? NSColor.black : UsageProvider.claude.menuBarColor
-        let first = Self.label(codex, font: font, color: codexColor, loadingPhase: loadingPhase)
-        let second = Self.label(claude, font: font, color: claudeColor, loadingPhase: loadingPhase)
+        let first = Self.label(style.codex, font: style.font, color: codexColor, loadingPhase: loadingPhase)
+        let second = Self.label(style.claude, font: style.font, color: claudeColor, loadingPhase: loadingPhase)
         let firstWidth = logoSide + innerGap + ceil(first.size().width)
         let secondStart = firstWidth + pairGap
         let width = secondStart + logoSide + innerGap + ceil(second.size().width)

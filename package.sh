@@ -4,10 +4,12 @@ cd "$(dirname "$0")"
 output_dir=${1:-release}
 mkdir -p "${output_dir}"
 output_dir=$(cd "${output_dir}" && pwd)
+python3 Helpers/PublishArchives.py package "${output_dir}"
 stage=$(mktemp -d "${output_dir}/.quotabar-package.XXXXXX")
-trap 'rm -r "${stage}"' EXIT HUP INT TERM
+trap 'rm -r "${stage}"' EXIT
+trap 'exit 1' HUP INT TERM
 mkdir -p "${stage}/source/QuotaBar"
-while IFS= read -r file; do
+while IFS= read -r file || [ -n "${file}" ]; do
     case "${file}" in
         /*|../*|*/../*|*/..) echo "Invalid release path" >&2; exit 1 ;;
         *) ;;
@@ -33,6 +35,5 @@ done < release-files.txt
 (cd "${stage}/source" && zip -X -q -r "${stage}/QuotaBar-source.zip" QuotaBar)
 unzip -t -q "${stage}/QuotaBar-macOS.zip"
 unzip -t -q "${stage}/QuotaBar-source.zip"
-mv "${stage}/QuotaBar-macOS.zip" "${output_dir}/QuotaBar-macOS.zip"
-mv "${stage}/QuotaBar-source.zip" "${output_dir}/QuotaBar-source.zip"
+python3 Helpers/PublishArchives.py package "${output_dir}" "${stage}"
 printf 'Release archives saved in %s\n' "${output_dir}"

@@ -5,10 +5,21 @@ import Security
 
 /// Automatic discovery accepts the provider's signed CLI. Other installations require an explicit file choice.
 enum ProviderExecutable {
-    private struct Selection: Codable {
-        let path: String
-        let target: String
-        let digest: Data
+    struct Selection: Codable, Sendable {
+        fileprivate let path: String
+        fileprivate let target: String
+        fileprivate let digest: Data
+
+        init(_ url: URL) throws {
+            guard let (target, hash) = ProviderExecutable.digest(url) else { throw CocoaError(.fileReadNoPermission) }
+            path = url.path
+            self.target = target
+            digest = hash
+        }
+
+        func save(name: String, defaults: UserDefaults) throws {
+            defaults.set(try JSONEncoder().encode(self), forKey: ProviderExecutable.key(name))
+        }
     }
 
     private struct Revision: Hashable {
@@ -61,9 +72,7 @@ enum ProviderExecutable {
     }
 
     static func choose(_ url: URL, name: String, defaults: UserDefaults = .standard) throws {
-        guard let (target, hash) = digest(url) else { throw CocoaError(.fileReadNoPermission) }
-        let choice = Selection(path: url.path, target: target, digest: hash)
-        defaults.set(try JSONEncoder().encode(choice), forKey: key(name))
+        try Selection(url).save(name: name, defaults: defaults)
     }
 
     static func selected(_ name: String, defaults: UserDefaults = .standard) -> URL? {

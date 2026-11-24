@@ -6,7 +6,7 @@ struct HelpView: View {
             Text("Using the menu bar")
                 .font(.headline)
                 .accessibilityAddTraits(.isHeader)
-            entry("Left-click", "Open or close the dropdown. With two badges, click a provider to view its details.")
+            entry("Left-click", "Open or close the dropdown. Expanded Details remembers the provider you last viewed.")
             entry(
                 "Right-click",
                 "Switch a current percentage between amount left and amount used. A two-finger click or Control-click does the same. You can also click a percentage inside the dropdown."
@@ -25,7 +25,7 @@ struct HelpView: View {
             )
             entry(
                 "Providers and tokens",
-                "Choose your providers in Settings. Expand Details to switch between their token totals and reset controls. Token totals cover usage recorded on this Mac."
+                "In Settings, choose Daily usage to show today’s tokens, estimated spend, or both. Expand Details for local history and reset controls."
             )
             entry(
                 "Resets",

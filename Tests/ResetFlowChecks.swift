@@ -53,7 +53,9 @@ enum ResetFlowChecks {
             resumed.phase == .uncertain && resumed.canPrepare(display(0)) && resumed.needsCountOnlyIdentityRefresh)
         precondition(!resumed.canPrepare(display(3, account: "other")))
         for failure in [QuotaResetClaimResult.failedBeforeSending, .accountChanged, .unavailable] {
+            let previousConfirmation = resumed.confirmationGeneration
             resumed.prepare(valid)
+            precondition(resumed.confirmationGeneration != previousConfirmation)
             precondition(resumed.begin(valid) == original)
             resumed.finish(failure, reading: valid.reading)
             precondition(resumed.phase == .uncertain && FileManager.default.fileExists(atPath: file.path))
@@ -87,12 +89,37 @@ enum ResetFlowChecks {
             resumed.finish(outcome, reading: valid.reading)
             precondition(resumed.phase == .ready && !FileManager.default.fileExists(atPath: file.path))
         }
+        // A terminal outcome belongs to the account that requested it, even after its receipt settles.
+        for outcome in [QuotaResetClaimResult.reset, .noCredit, .nothingToReset] {
+            for nextOwner: String? in ["other-user", nil] {
+                let local = UsageResets(file: dir.appendingPathComponent(UUID().uuidString))
+                let before = display(2, account: "owner", observedAt: Date())
+                local.received(before.reading!, generation: local.readGeneration())
+                local.prepare(before)
+                _ = try require(local.begin(before))
+                local.finish(outcome, reading: before.reading)
+                precondition(
+                    local.needsCountOnlyIdentityRefresh, "Verify the owner even when the new balance is zero")
+                let own = display(1, account: "owner", observedAt: Date())
+                local.received(own.reading!, generation: local.readGeneration())
+                precondition(
+                    !local.awaitingUpdatedBalance && local.notice != nil
+                        && !local.needsCountOnlyIdentityRefresh)
+                let other = display(0, account: nextOwner, observedAt: Date())
+                local.received(other.reading!, generation: local.readGeneration())
+                precondition(local.notice == nil, "The next user saw the previous account’s reset outcome")
+            }
+        }
         let detailFile = dir.appendingPathComponent("detailed.json")
         let detailedStore = UsageResets(file: detailFile)
-        func detailed(_ ids: [String], count: Int = 2, date: Date = Date(), account: String? = "fixture") throws
+        func detailed(
+            _ ids: [String], redeemed: [String] = [], count: Int = 2, date: Date = Date(), account: String? = "fixture"
+        ) throws
             -> QuotaDisplay
         {
-            let rows = ids.map { ["id": $0, "resetType": "codexRateLimits", "status": "available"] }
+            let rows =
+                ids.map { ["id": $0, "resetType": "codexRateLimits", "status": "available"] }
+                + redeemed.map { ["id": $0, "resetType": "codexRateLimits", "status": "redeemed"] }
             let data = try JSONSerialization.data(withJSONObject: [
                 "accountId": account as Any, "rateLimits": ["primary": ["usedPercent": 70]],
                 "rateLimitResetCredits": ["availableCount": count, "credits": rows],
@@ -140,6 +167,19 @@ enum ResetFlowChecks {
         let replaced = try detailed(["B", "C"], date: after)
         detailObserver.received(replaced.reading!, generation: detailObserver.readGeneration())
         precondition(detailObserver.canPrepare(replaced), "A complete list confirms removal even at the same count")
+        let cappedFile = dir.appendingPathComponent("capped-credits.json")
+        let capped = UsageResets(file: cappedFile)
+        capped.received(before.reading!, generation: capped.readGeneration())
+        capped.prepare(before)
+        precondition(capped.begin(before)?.creditID == "A")
+        capped.finish(.reset, reading: before.reading)
+        let spent = try detailed(["B"], redeemed: ["A"], date: after)
+        let reopened = UsageResets(file: cappedFile)
+        reopened.received(spent.reading!, generation: reopened.readGeneration())
+        precondition(reopened.canPrepare(spent) && !reopened.awaitingUpdatedBalance)
+        reopened.prepare(spent)
+        precondition(reopened.begin(spent)?.creditID == "B")
+        reopened.finish(.nothingToReset, reading: spent.reading)
         let receiptFile = dir.appendingPathComponent("account-receipts.json")
         let accountStore = UsageResets(file: receiptFile)
         accountStore.received(valid.reading!, generation: accountStore.readGeneration())
@@ -216,12 +256,116 @@ enum ResetFlowChecks {
         fifoLock.received(valid.reading!, generation: fifoLock.readGeneration())
         fifoLock.prepare(valid)
         precondition(fifoLock.begin(valid) == nil && fifoLock.phase == .ready)
+        try checkPendingRefresh(in: dir, original: valid, other: display(3, account: "other"))
+        try checkInterruptedCompletion(in: dir, original: valid)
         try checkReconciledGenerations(in: dir)
         try checkBalancePolling(in: dir)
         try checkManualRecovery(in: dir)
         print(
             "Reset confirmation, cancellation, double-click, relaunch, account switch, polling budget and clean failures passed."
         )
+    }
+
+    @MainActor static func checkPendingRefresh(in dir: URL, original: QuotaDisplay, other: QuotaDisplay) throws {
+        let file = dir.appendingPathComponent("concurrent-pending.json")
+        let writer = UsageResets(file: file)
+        let observer = UsageResets(file: file)
+        observer.received(other.reading!, generation: observer.readGeneration())
+        precondition(observer.canPrepare(other))
+
+        writer.received(original.reading!, generation: writer.readGeneration())
+        writer.prepare(original)
+        let request = try require(writer.begin(original))
+        writer.finish(.unknown, reading: original.reading)
+
+        observer.received(other.reading!, generation: observer.readGeneration())
+        precondition(observer.phase == .uncertain, "A fresh balance must surface another instance’s pending reset")
+        precondition(observer.isRetry && !observer.canPrepare(other) && !observer.canReviewRecovery(other))
+        let switchNotice = observer.notice
+        let relaunched = UsageResets(file: file)
+        let retryNotice = relaunched.notice
+        precondition(switchNotice != nil && retryNotice != nil && switchNotice != retryNotice)
+        writer.prepare(original)
+        precondition(writer.begin(original) == request)
+        observer.received(original.reading!, generation: observer.readGeneration())
+        precondition(observer.canReviewRecovery(original) && observer.notice == retryNotice)
+        observer.prepare(original)
+        precondition(observer.begin(original) == nil, "Account verification must still respect another window's lock")
+        writer.finish(.unknown, reading: original.reading)
+        let unknownOwner = QuotaReading(
+            fetchedAt: original.now, windows: original.reading!.windows, resetCredits: .init(availableCount: 2))
+        let unidentified = QuotaDisplay(reading: unknownOwner, now: original.now, failed: false, refreshing: false)
+        relaunched.received(unknownOwner, generation: relaunched.readGeneration())
+        precondition(relaunched.notice != nil && relaunched.notice != retryNotice && relaunched.notice != switchNotice)
+        precondition(!relaunched.canPrepare(unidentified) && !relaunched.canReviewRecovery(unidentified))
+        relaunched.received(original.reading!, generation: relaunched.readGeneration())
+        precondition(relaunched.notice == retryNotice && relaunched.canPrepare(original))
+        observer.prepare(original)
+        observer.cancel()
+        precondition(observer.phase == .uncertain && observer.isRetry)
+        observer.prepare(original)
+        precondition(observer.begin(original) == request)
+        observer.finish(.unavailable, reading: original.reading)
+        let updateNotice = observer.notice
+        precondition(updateNotice != nil && updateNotice != retryNotice)
+        observer.received(other.reading!, generation: observer.readGeneration())
+        precondition(observer.notice == switchNotice && !observer.canPrepare(other))
+        observer.received(original.reading!, generation: observer.readGeneration())
+        precondition(observer.notice == updateNotice && observer.canPrepare(original))
+        observer.prepare(original)
+        precondition(observer.begin(original) == request)
+        observer.finish(.accountChanged, reading: original.reading)
+        precondition(observer.notice == switchNotice)
+        observer.received(original.reading!, generation: observer.readGeneration())
+        precondition(observer.notice == retryNotice && observer.canPrepare(original))
+        observer.prepare(original)
+        precondition(observer.begin(original) == request)
+        observer.finish(.nothingToReset, reading: original.reading)
+
+        writer.received(other.reading!, generation: writer.readGeneration())
+        precondition(writer.phase == .ready && !writer.isRetry && writer.canPrepare(other))
+    }
+
+    @MainActor static func checkInterruptedCompletion(in dir: URL, original: QuotaDisplay) throws {
+        let file = dir.appendingPathComponent("interrupted-completion")
+        let history = file.appendingPathExtension("completed")
+        let writer = UsageResets(file: file)
+        let reading = try require(original.reading)
+        writer.received(reading, generation: writer.readGeneration())
+        writer.prepare(original)
+        let request = try require(writer.begin(original))
+        let pendingBytes = try Data(contentsOf: file)
+        writer.finish(.unknown, reading: reading)
+        let observer = UsageResets(file: file)
+        observer.received(reading, generation: observer.readGeneration())
+        observer.prepare(original)
+        let cleanObserver = UsageResets(file: file)
+        cleanObserver.received(reading, generation: cleanObserver.readGeneration())
+        cleanObserver.prepare(original)
+        writer.prepare(original)
+        precondition(writer.begin(original) == request)
+        writer.finish(.reset, reading: reading)
+        precondition(cleanObserver.begin(original) == nil && cleanObserver.awaitingUpdatedBalance)
+        precondition(!cleanObserver.isRetry && !cleanObserver.canPrepare(original))
+        let receiptBytes = try Data(contentsOf: history)
+
+        // Recreate the two durable files from immediately before the pending record was removed.
+        try pendingBytes.write(to: file, options: .atomic)
+        precondition(observer.begin(original) == nil, "An open confirmation replayed a recorded success")
+        try pendingBytes.write(to: file, options: .atomic)
+        let relaunched = UsageResets(file: file)
+        precondition(relaunched.awaitingUpdatedBalance && !relaunched.isRetry && !relaunched.canPrepare(original))
+        let preserved = try Data(contentsOf: history)
+        precondition(preserved == receiptBytes && !FileManager.default.fileExists(atPath: file.path))
+
+        let other = ResetAttempt(
+            key: UUID(), creditID: request.creditID, accountFingerprint: request.accountFingerprint,
+            startingCount: request.startingCount)
+        try JSONEncoder().encode(other).write(to: file, options: .atomic)
+        let uncertain = UsageResets(file: file)
+        uncertain.prepare(original)
+        precondition(uncertain.begin(original) == other, "A separate pending request lost its original retry")
+        uncertain.finish(.unknown, reading: reading)
     }
 
     @MainActor static func checkReconciledGenerations(in dir: URL) throws {

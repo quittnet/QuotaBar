@@ -36,6 +36,11 @@ private struct CompletedReset: Codable, Equatable {
     let requestKey: UUID?
     var reconciledGeneration: UUID?
 
+    func confirms(_ attempt: ResetAttempt) -> Bool {
+        requestKey == attempt.key && account == attempt.accountFingerprint && credit == attempt.creditID
+            && (attempt.startingCount == nil || count == attempt.startingCount)
+    }
+
     func isOtherAccount(_ reading: QuotaReading) -> Bool {
         guard let account, let owner = reading.resetOwner(for: credit) else { return false }
         return owner != account
@@ -213,7 +218,31 @@ final class UsageResets {
     }
 
     private(set) var phase: Phase = .ready
-    private(set) var notice: String?
+    // Each confirmation is distinct, including a second review of the same pending request.
+    private(set) var confirmationGeneration: UInt64 = 0
+    private static let retryNotice = "The last reset is unconfirmed. Retry the same request to check it."
+    private static let differentAccountNotice = "Return to the original Codex account to check the pending reset."
+    private var actionNotice: String?
+    private var balanceNoticeOwner: (attempt: ResetAttempt, verifyOnNextRead: Bool)?
+    private var pendingAccountNotice: String?
+    private(set) var notice: String? {
+        get { phase == .uncertain ? pendingAccountNotice ?? actionNotice : actionNotice }
+        set {
+            actionNotice = newValue
+            balanceNoticeOwner = nil
+            pendingAccountNotice = nil
+        }
+    }
+    private func setBalanceNotice(_ message: String, for attempt: ResetAttempt) {
+        notice = message
+        balanceNoticeOwner = (attempt, true)
+    }
+
+    func clearUnverifiedBalanceNotice(for reading: QuotaReading?) {
+        guard let balanceNoticeOwner, reading.map(balanceNoticeOwner.attempt.matchesOwner(in:)) != true else { return }
+        notice = nil
+    }
+
     private let file: URL
     private var lockFD: Int32 = -1
     private var pending: ResetAttempt?
@@ -227,6 +256,7 @@ final class UsageResets {
     var awaitingUpdatedBalance: Bool { completedBalance != nil }
     var needsCountOnlyIdentityRefresh: Bool {
         (pending.map { $0.creditID == nil } ?? false) || hasCountOnlyReceipt
+            || (balanceNoticeOwner.map { $0.verifyOnNextRead && $0.attempt.creditID == nil } ?? false)
     }
 
     func nextBalancePoll(for reading: QuotaReading, at now: Date) -> BalancePoll? {
@@ -242,7 +272,7 @@ final class UsageResets {
         restore()
     }
 
-    private func restore() {
+    private func restore(holdingLock: Bool = false) {
         do {
             let latest = try Self.read(Fence.self, at: fenceFile)
             if latest != recoveryFence { verifiedBalance = nil }
@@ -254,21 +284,43 @@ final class UsageResets {
             let receipts = try readCompletions()
             knownReceipts = receipts
             if let saved = try Self.read(ResetAttempt.self, at: file) {
-                if pending != saved || phase != .uncertain {
-                    notice =
-                        saved.hasBoundOwner
-                        ? "The last reset is unconfirmed. Retry the same request to check it."
-                        : "The pending reset has no saved account identity. QuotaBar can’t safely retry it."
+                if let confirmed = receipts.first(where: { $0.confirms(saved) }) {
+                    completedBalance = confirmed.reconciledGeneration == nil ? confirmed : nil
+                    pending = nil
+                    verifiedBalance = nil
+                    // Finish an interrupted unlink without sending the confirmed request a second time.
+                    // Recheck both files under the same lock used to publish the receipt.
+                    if !holdingLock {
+                        try withRecoveryLock { restore(holdingLock: true) }
+                        return
+                    }
+                    let directory = file.deletingLastPathComponent()
+                    do {
+                        try Self.syncDirectory(directory)
+                        try FileManager.default.removeItem(at: file)
+                        try Self.syncDirectory(directory)
+                    } catch {
+                        throw RecoveryFailure(
+                            "Reset applied. QuotaBar couldn’t clear the saved request. Restore write access and refresh."
+                        )
+                    }
+                } else {
+                    if pending != saved || phase != .uncertain {
+                        notice =
+                            saved.hasBoundOwner
+                            ? Self.retryNotice
+                            : "The pending reset has no saved account identity. QuotaBar can’t safely retry it."
+                    }
+                    pending = saved
+                    completedBalance = nil
+                    phase = .uncertain
+                    return
                 }
-                pending = saved
-                completedBalance = nil
-                phase = .uncertain
-            } else {
-                completedBalance = receipts.first { $0.reconciledGeneration == nil }
-                pending = nil
-                phase = .ready
-                notice = nil
             }
+            completedBalance = receipts.first { $0.reconciledGeneration == nil }
+            pending = nil
+            phase = .ready
+            notice = nil
         } catch {
             phase = .storageUnavailable
             notice = (error as? RecoveryFailure)?.message ?? "The saved reset records could not be read."
@@ -370,6 +422,7 @@ final class UsageResets {
         confirmationFence = recoveryFence
         confirmationHistoryID = verifiedHistoryID
         confirmationReceipts = knownReceipts.filter { !$0.isOtherAccount(reading) }
+        confirmationGeneration &+= 1
         phase = .confirming
         notice = nil
     }
@@ -381,15 +434,14 @@ final class UsageResets {
         if pending != nil { notice = "The last reset is still unconfirmed." }
     }
 
-    // Persist the operation ID before dispatch so a relaunch cannot turn a retry into a new spend.
-    func begin(_ display: QuotaDisplay) -> ResetAttempt? {
-        guard phase == .confirming, let attempt = selection else { return nil }
+    func cancelInvalidConfirmation(_ display: QuotaDisplay) {
+        guard phase == .confirming, let attempt = selection else { return }
         guard let reading = display.reading, !display.stale, !display.refreshing,
             attempt.matchesOwner(in: reading)
         else {
             cancel()
             notice = "Refresh the account limits, then check the reset again."
-            return nil
+            return
         }
         if pending == nil {
             guard let credits = reading.resetCredits, credits.availableCount == attempt.startingCount,
@@ -398,9 +450,15 @@ final class UsageResets {
             else {
                 cancel()
                 notice = "Your available resets changed. Review the updated balance."
-                return nil
+                return
             }
         }
+    }
+
+    // Persist the operation ID before dispatch so a relaunch cannot turn a retry into a new spend.
+    func begin(_ display: QuotaDisplay) -> ResetAttempt? {
+        cancelInvalidConfirmation(display)
+        guard phase == .confirming, let attempt = selection, let reading = display.reading else { return nil }
         do {
             try FileManager.default.createDirectory(
                 at: file.deletingLastPathComponent(), withIntermediateDirectories: true,
@@ -428,6 +486,14 @@ final class UsageResets {
                 return nil
             }
             let saved = try Self.read(ResetAttempt.self, at: file)
+            let history = try Self.read(ReceiptHistory.self, at: completedFile)
+            if let previous = saved ?? pending, history?.receipts.contains(where: { $0.confirms(previous) }) == true {
+                verifiedBalance = nil
+                cancel()
+                restore(holdingLock: true)
+                releaseLock()
+                return nil
+            }
             guard saved == pending else {
                 pending = saved
                 cancel()
@@ -440,7 +506,6 @@ final class UsageResets {
             }
             if saved == nil {
                 // Another instance may have completed its reset after our confirmation opened.
-                let history = try Self.read(ReceiptHistory.self, at: completedFile)
                 knownReceipts = history?.receipts ?? []
                 let relevant = knownReceipts.filter { !$0.isOtherAccount(reading) }
                 completedBalance = relevant.first { $0.reconciledGeneration == nil }
@@ -490,8 +555,9 @@ final class UsageResets {
             case .accountChanged:
                 notice =
                     retryingSubmission
-                    ? "Return to the original account to check this reset."
+                    ? Self.retryNotice
                     : "The signed-in account changed. Check the current balance before using a reset."
+                if retryingSubmission { pendingAccountNotice = Self.differentAccountNotice }
             case .unavailable: notice = "This Codex client does not support resets. Update Codex to retry."
             default: notice = "Couldn’t reach Codex. Try again."
             }
@@ -504,13 +570,15 @@ final class UsageResets {
                 account: attempt.accountFingerprint,
                 count: attempt.startingCount ?? reading?.resetCredits?.availableCount ?? 0,
                 credit: attempt.creditID, time: Date(), requestKey: attempt.key)
-            notice = "Reset applied."
+            setBalanceNotice("Reset applied.", for: attempt)
         case .nothingToReset:
-            notice = "No current limit is eligible. This request spent no reset."
+            setBalanceNotice("No current limit is eligible. This request spent no reset.", for: attempt)
         case .noCredit:
-            notice =
-                attempt.creditID == nil ? "Codex reported no available resets." : "That reset is no longer available."
+            setBalanceNotice(
+                attempt.creditID == nil ? "Codex reported no available resets." : "That reset is no longer available.",
+                for: attempt)
         }
+        clearUnverifiedBalanceNotice(for: reading)
         do {
             if outcome == .reset, let completedBalance {
                 let history = try Self.read(ReceiptHistory.self, at: completedFile)
@@ -526,6 +594,7 @@ final class UsageResets {
         } catch {
             phase = .uncertain
             notice = "The request finished, but its saved record could not be cleared."
+            if outcome == .reset { restore(holdingLock: true) }
         }
     }
 
@@ -688,7 +757,7 @@ final class UsageResets {
             selection = nil
             confirmationFence = nil
             retryingSubmission = false
-            restore()
+            restore(holdingLock: true)
             notice = "Reset record archived. Refresh the account and balance before using a reset."
             return archive
         }
@@ -747,15 +816,31 @@ final class UsageResets {
     }
 
     func received(_ reading: QuotaReading, generation: ReadGeneration) {
+        clearUnverifiedBalanceNotice(for: reading)
+        balanceNoticeOwner?.verifyOnNextRead = false
         if phase == .uncertain || phase == .storageUnavailable || (!generation.valid && phase != .submitting) {
             restore()
         }
         verifiedBalance = nil
         do {
+            // Another instance can leave a request pending without changing the receipt history.
+            if phase == .ready || phase == .confirming, try Self.read(ResetAttempt.self, at: file) != pending {
+                cancel()
+                restore()
+            }
             let latest = try Self.read(Fence.self, at: fenceFile)
             if latest != recoveryFence, phase != .submitting {
                 cancel()
                 restore()
+            }
+            if phase == .uncertain, let pending, pending.hasBoundOwner {
+                // The reading identifies the active account even when another window holds the reset lock.
+                // Keep the request's own outcome for the owner's return.
+                if let owner = reading.resetOwner(for: pending.creditID) {
+                    pendingAccountNotice = owner == pending.accountFingerprint ? nil : Self.differentAccountNotice
+                } else {
+                    pendingAccountNotice = "Refresh limits so Codex can verify the account for the pending reset."
+                }
             }
             if let recoveryFence {
                 guard generation.valid, generation.id == recoveryFence.generation,
@@ -767,14 +852,8 @@ final class UsageResets {
             }
         } catch {
             phase = .storageUnavailable
-            notice = "QuotaBar couldn’t verify local reset recovery. Check the saved records."
+            notice = "QuotaBar couldn’t verify the saved reset records."
             return
-        }
-        if phase == .uncertain, let pending,
-            pending.hasBoundOwner,
-            !pending.matchesOwner(in: reading)
-        {
-            notice = "Return to the original Codex account to check the pending reset."
         }
         guard phase == .ready || phase == .confirming || phase == .uncertain else { return }
         func update(_ receipts: [CompletedReset]) -> [CompletedReset] {

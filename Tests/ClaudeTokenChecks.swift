@@ -160,7 +160,304 @@ struct ClaudeTokenChecks {
         try expect(history, now: now, all: 8, month: 8, week: 8, today: 8)
         try checkCacheRecovery(home: home, calendar: calendar, now: now)
         try checkLockedCache(home: home, calendar: calendar, now: now)
+        try checkSpend(home: home.appendingPathComponent("spend"), calendar: calendar, now: now)
+        try checkForkPrices(home: home.appendingPathComponent("fork-prices"), calendar: calendar, now: now)
+        try checkIterationsAndRefusals(home: home.appendingPathComponent("iterations"), calendar: calendar, now: now)
         print("Claude Code token history checks passed.")
+    }
+
+    private static func checkSpend(home: URL, calendar: Calendar, now: Date) throws {
+        let project = home.appendingPathComponent("projects/example")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let transcript = project.appendingPathComponent("main.jsonl")
+        let copy = project.appendingPathComponent("fork.jsonl")
+        let model = "claude-sonnet-4-5"
+        let today = "2026-11-18T06:00:00Z"
+        let yesterday = "2026-11-18T04:00:00Z"
+        let split =
+            #"{"cache_read_input_tokens":3000,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":750,"ephemeral_1h_input_tokens":250}}"#
+        let winner = response(today, id: "shared", input: 1000, output: 400, model: model, extraUsage: split)
+        try write(
+            [
+                response(yesterday, id: "shared", input: 10, output: 9999, finished: false, model: model),
+                winner,
+                response(today, id: "shared", input: 0, output: 6000, model: model),
+                response(today, id: "separate", input: 10, output: 20, model: model),
+                response("2026-11-19T05:00:00Z", id: "separate", input: 20, output: 10, model: model),
+                response("2026-11-19T05:00:00Z", id: "future", input: 999, output: 999, model: model),
+            ], to: transcript)
+        try write([winner], to: copy)
+        let cache = home.appendingPathComponent("history.sqlite")
+        var bytesRead = 0
+        func reader() -> ClaudeTokenHistory {
+            ClaudeTokenHistory(home: home, cacheURL: cache, calendar: calendar, didReadBytes: { bytesRead += $0 })
+        }
+        let history = reader()
+        let initial = try history.read(now: now)
+        let sharedUSD = 0.0142125
+        let separateUSD = 0.00033
+        let expectedUSD = sharedUSD + separateUSD
+        precondition(initial.yesterday == 5400 && initial.today == 30 && initial.partial)
+        precondition(abs(initial.spend.yesterday.usd - sharedUSD) < 1e-12)
+        precondition(abs(initial.spend.today.usd - separateUSD) < 1e-12)
+        precondition(abs(initial.spend.allTime.usd - expectedUSD) < 1e-12)
+        precondition(initial.spend.allTime.hasPricedUsage && !initial.spend.allTime.partial)
+        bytesRead = 0
+        let restart = try reader().read(now: now)
+        precondition(restart == initial && bytesRead == 0)
+
+        // The conflicting price becomes eligible tomorrow. The message keeps its earliest date.
+        let tomorrow = try history.read(now: now.addingTimeInterval(86_400))
+        precondition(tomorrow.yesterday == 30 && tomorrow.spend.yesterday.partial)
+        precondition(!tomorrow.spend.yesterday.hasPricedUsage && tomorrow.spend.yesterday.usd == 0)
+
+        let unsplit = #"{"cache_creation_input_tokens":400}"#
+        let malformed = #"{"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":"invalid"}}"#
+        try append(
+            [
+                response("2026-10-01T05:00:00Z", id: "unknown-model", output: 1),
+                response("2026-10-30T05:00:00Z", id: "missing-ttl", output: 3, model: model, extraUsage: unsplit),
+                response("2026-11-12T05:00:00Z", id: "bad-ttl", output: 5, model: model, extraUsage: malformed),
+            ].joined(separator: "\n") + "\n", to: transcript)
+        let mixed = try history.read(now: now)
+        precondition(mixed.allTime == initial.allTime + 2 + 404 + 106)
+        for period in [mixed.spend.allTime, mixed.spend.month, mixed.spend.week] {
+            precondition(period.hasPricedUsage && period.partial && abs(period.usd - expectedUSD) < 1e-12)
+        }
+        precondition(!mixed.spend.today.partial && !mixed.spend.yesterday.partial)
+
+        // An equally final, equal-count copy may fill in missing prices. A contradictory
+        // breakdown for that same count makes this request unpriceable whichever file came first.
+        let ties = project.appendingPathComponent("ties.jsonl")
+        let priced = response(today, id: "same-count", input: 10, output: 20, model: model)
+        try write([response(today, id: "same-count", input: 15, output: 15), priced], to: ties)
+        let supplemented = try history.read(now: now)
+        precondition(supplemented.today == mixed.today + 30 && !supplemented.spend.today.partial)
+        precondition(abs(supplemented.spend.today.usd - 2 * separateUSD) < 1e-12)
+        try append(response(today, id: "same-count", input: 20, output: 10, model: model) + "\n", to: ties)
+        let conflicted = try history.read(now: now)
+        precondition(conflicted.today == supplemented.today && conflicted.spend.today.partial)
+        precondition(abs(conflicted.spend.today.usd - separateUSD) < 1e-12)
+
+        // Reprice old rate tables and checkpoints parsed before per-step price reconciliation.
+        for legacy in [
+            "json_set(CAST(checkpoint AS TEXT), '$.pricingRevision', -1)",
+            "json_remove(CAST(checkpoint AS TEXT), '$.usageRevision')",
+        ] {
+            var db: OpaquePointer?
+            precondition(sqlite3_open(cache.path, &db) == SQLITE_OK)
+            let stale = """
+                UPDATE files SET checkpoint = CAST(\(legacy) AS BLOB);
+                UPDATE samples SET usd = 987;
+                """
+            precondition(sqlite3_exec(db, stale, nil, nil, nil) == SQLITE_OK)
+            precondition(sqlite3_close(db) == SQLITE_OK)
+            bytesRead = 0
+            let repriced = try reader().read(now: now)
+            precondition(repriced == conflicted && bytesRead > 0)
+            bytesRead = 0
+            let warm = try reader().read(now: now)
+            precondition(warm == conflicted && bytesRead == 0)
+        }
+    }
+
+    private static func checkForkPrices(home: URL, calendar: Calendar, now: Date) throws {
+        let project = home.appendingPathComponent("projects/example")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let parent = project.appendingPathComponent("main.jsonl")
+        let fork = project.appendingPathComponent("fork.jsonl")
+        let cache = home.appendingPathComponent("history.sqlite")
+        let today = "2026-11-18T06:00:00Z"
+        let model = "claude-sonnet-4-5"
+        let iterations =
+            #"{"iterations":[{"type":"message","input_tokens":30000,"output_tokens":500},{"type":"message","input_tokens":19500,"output_tokens":401}]}"#
+        let plain = response(today, id: "shared", input: 49_500, output: 901, model: model)
+        let detailed = response(today, id: "shared", input: 49_500, output: 901, model: model, extraUsage: iterations)
+        let reader = ClaudeTokenHistory(home: home, cacheURL: cache, calendar: calendar)
+        try write([plain], to: parent)
+        let initial = try reader.read(now: now)
+        precondition(initial.today == 50_401 && abs(initial.spend.today.usd - 0.162015) < 1e-12)
+        try write([detailed], to: fork)
+        let copied = try reader.read(now: now)
+        precondition(copied == initial)
+        let restarted = try ClaudeTokenHistory(home: home, cacheURL: cache, calendar: calendar).read(now: now)
+        precondition(restarted == copied)
+
+        // An actual five-nanodollar difference still makes a single request ambiguous.
+        let cheap = "claude-haiku-5-5"
+        let split =
+            #"{"cache_read_input_tokens":2,"cache_creation_input_tokens":7,"cache_creation":{"ephemeral_5m_input_tokens":7}}"#
+        try write([response(today, id: "small", input: 9, output: 0, model: cheap)], to: parent)
+        try write([response(today, id: "small", input: 0, output: 0, model: cheap, extraUsage: split)], to: fork)
+        let conflict = try reader.read(now: now)
+        precondition(conflict.today == 9 && conflict.spend.today.partial && !conflict.spend.today.hasPricedUsage)
+    }
+
+    private static func checkIterationsAndRefusals(home: URL, calendar: Calendar, now: Date) throws {
+        let projects = home.appendingPathComponent("projects")
+        try FileManager.default.createDirectory(at: projects, withIntermediateDirectories: true)
+        let file = projects.appendingPathComponent("main.jsonl")
+        let cache = home.appendingPathComponent("history.sqlite")
+        let opus = "claude-opus-5-5"
+        let fable = "claude-fable-5"
+        let fallback = "claude-opus-4-8"
+
+        func check(
+            _ label: String, _ usage: [String: Any], model: String = "claude-opus-5-5",
+            stop: String = "end_turn", metadata: [String: Any] = [:],
+            tokens: Int64, usd: Double?, partial: Bool = false
+        ) throws {
+            var message = metadata
+            message["id"] = label
+            message["model"] = model
+            message["stop_reason"] = stop
+            message["usage"] = usage
+            let row: [String: Any] = ["type": "assistant", "message": message, "timestamp": "2026-11-18T06:00:00Z"]
+            // Two copies of the same complete response still represent one request.
+            let data = try JSONSerialization.data(withJSONObject: row) + Data([10])
+            try (data + data).write(to: file, options: .atomic)
+            for warm in [false, true] {
+                var bytes = 0
+                let reader = ClaudeTokenHistory(home: home, cacheURL: cache, calendar: calendar) { bytes += $0 }
+                let totals = try reader.read(now: now)
+                let cost = totals.spend.today
+                precondition(totals.allTime == tokens && totals.today == tokens && totals.partial == partial, label)
+                precondition(cost.hasPricedUsage == (usd != nil) && cost.partial == (usd == nil), label)
+                precondition(abs(cost.usd - (usd ?? 0)) < 1e-12 && (bytes == 0) == warm, label)
+            }
+        }
+
+        let compact: [String: Any] = ["type": "compaction", "input_tokens": 180_000, "output_tokens": 3500]
+        let reply: [String: Any] = ["type": "message", "input_tokens": 23_000, "output_tokens": 1000]
+        try check(
+            "threshold", ["input_tokens": 23_000, "output_tokens": 1000, "iterations": [compact, reply]],
+            tokens: 207_500, usd: 0.902)
+        let toolStep: [String: Any] = ["type": "message", "input_tokens": 3000, "output_tokens": 100]
+        let smallCompaction: [String: Any] = ["type": "compaction", "input_tokens": 10_000, "output_tokens": 50]
+        var aggregate: [String: Any] = [
+            "input_tokens": 6000, "output_tokens": 200, "cache_read_input_tokens": 12_000,
+            "iterations": [toolStep, smallCompaction, toolStep],
+        ]
+        try check("aggregate cache reads", aggregate, tokens: 28_250, usd: 0.0714)
+        var aliasStep = toolStep
+        aliasStep["model"] = "claude-sonnet-4-5"
+        var snapshotStep = toolStep
+        snapshotStep["model"] = "claude-sonnet-4-5-20250929"
+        var aliases = aggregate
+        aliases["iterations"] = [aliasStep, snapshotStep]
+        try check("aggregate alias and snapshot", aliases, tokens: 18_200, usd: 0.0246)
+        snapshotStep["model"] = "anthropic/claude-sonnet-4-5"
+        aliases["iterations"] = [aliasStep, snapshotStep]
+        try check("aggregate deployment prefix", aliases, tokens: 18_200, usd: nil)
+
+        var fiveMinuteStep = toolStep
+        fiveMinuteStep["cache_creation_input_tokens"] = 100
+        fiveMinuteStep["cache_creation"] = ["ephemeral_5m_input_tokens": 100]
+        var oneHourStep = toolStep
+        oneHourStep["cache_creation_input_tokens"] = 200
+        oneHourStep["cache_creation"] = ["ephemeral_1h_input_tokens": 200]
+        var writes = aggregate
+        writes["iterations"] = [fiveMinuteStep, oneHourStep]
+        try check("aggregate reads with per-step write durations", writes, tokens: 18_500, usd: 0.0325)
+        writes["cache_creation_input_tokens"] = 300
+        writes["cache_creation"] = ["ephemeral_1h_input_tokens": 300]
+        try check("contradictory aggregate write durations", writes, tokens: 18_500, usd: nil)
+        fiveMinuteStep["cache_creation"] = ["ephemeral_5m_input_tokens": "unreadable"]
+        writes["iterations"] = [fiveMinuteStep, oneHourStep]
+        writes["cache_creation"] = ["ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 200]
+        try check("aggregate durations with an unreadable step split", writes, tokens: 18_500, usd: 0.0325)
+        aggregate["cache_read_input_tokens"] = 100_000
+        try check(
+            "aggregate crosses possible price tier", aggregate, model: "claude-haiku-5-5", tokens: 116_250, usd: nil)
+        var expensiveStep: [String: Any] = [
+            "type": "message", "input_tokens": 100_000, "output_tokens": 100,
+            "cache_read_input_tokens": 0,
+        ]
+        let smallStep: [String: Any] = ["type": "message", "input_tokens": 10, "output_tokens": 100]
+        var oneMissing: [String: Any] = [
+            "input_tokens": 100_010, "output_tokens": 200, "cache_read_input_tokens": 200,
+            "iterations": [expensiveStep, smallStep],
+        ]
+        try check(
+            "cache reads attributable to one step", oneMissing, model: "claude-haiku-5-5",
+            tokens: 100_410, usd: 0.010103)
+        expensiveStep["model"] = "claude-haiku-5-5"
+        expensiveStep["cache_read_input_tokens"] = 100
+        oneMissing["iterations"] = [smallStep, smallCompaction, expensiveStep]
+        try check(
+            "attributable cache reads across models and a compaction", oneMissing,
+            tokens: 110_460, usd: 0.093315)
+        expensiveStep["cache_creation_input_tokens"] = 10
+        expensiveStep["cache_creation"] = ["ephemeral_5m_input_tokens": 10]
+        oneMissing["iterations"] = [smallStep, expensiveStep]
+        oneMissing["cache_creation_input_tokens"] = 10
+        oneMissing["cache_creation"] = ["ephemeral_1h_input_tokens": 10]
+        try check(
+            "cache read allocation preserves conflicting write durations", oneMissing, tokens: 100_420,
+            usd: nil)
+        var first: [String: Any] = ["type": "message", "model": fable, "input_tokens": 20_000, "output_tokens": 100]
+        let last: [String: Any] = [
+            "type": "fallback_message", "model": fallback, "input_tokens": 20_000, "output_tokens": 500,
+        ]
+        func hops(_ first: [String: Any], _ last: [String: Any]) -> [String: Any] {
+            ["input_tokens": 20_000, "output_tokens": last["output_tokens"]!, "iterations": [first, last]]
+        }
+        let boundary: [String: Any] = [
+            "type": "fallback", "from": ["model": fable], "to": ["model": fallback],
+            "trigger": ["type": "refusal", "category": NSNull()],
+        ]
+        let blocks: [String: Any] = ["content": [boundary, ["type": "text"]]]
+        // A non-streaming handoff can drop partial text but retain the declined model's output count.
+        try check("mid-stream", hops(first, last), model: fallback, metadata: blocks, tokens: 40_600, usd: 0.3175)
+        var sparseLast = last
+        sparseLast["model"] = nil
+        try check(
+            "streaming handoff model", hops(first, sparseLast), model: fable, metadata: blocks, tokens: 40_600,
+            usd: 0.3175)
+        sparseLast["type"] = nil
+        var sparseFirst = first
+        sparseFirst["model"] = nil
+        try check(
+            "handoff with sparse iterations", hops(sparseFirst, sparseLast), model: fallback, metadata: blocks,
+            tokens: 40_600, usd: 0.3175)
+        first["output_tokens"] = 0
+        try check("free first hop", hops(first, last), model: fallback, metadata: blocks, tokens: 40_500, usd: 0.1125)
+        try check("missing handoff", hops(first, last), model: fallback, tokens: 40_500, usd: nil)
+        var cacheHop = first
+        cacheHop["output_tokens"] = 100
+        cacheHop["cache_creation_input_tokens"] = 150
+        cacheHop["cache_creation"] = ["ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 50]
+        var cacheReply = last
+        cacheReply["cache_read_input_tokens"] = 300
+        try check("per-model cache", hops(cacheHop, cacheReply), model: fallback, tokens: 41_050, usd: 0.3199)
+        cacheHop["cache_creation"] = ["ephemeral_5m_input_tokens": "bad"]
+        try check("invalid TTL", hops(cacheHop, cacheReply), model: fallback, tokens: 41_050, usd: nil)
+        first["model"] = "unknown"
+        first["output_tokens"] = 100
+        try check("unknown earlier model", hops(first, last), model: fallback, tokens: 40_600, usd: nil)
+        first["model"] = nil
+        try check("missing earlier model", hops(first, last), model: fallback, tokens: 40_600, usd: nil)
+        try check(
+            "malformed iterations", ["input_tokens": 20_000, "output_tokens": 500, "iterations": [first, "bad"]],
+            tokens: 20_500, usd: nil, partial: true)
+
+        let refusal: [String: Any] = ["input_tokens": 50_000, "output_tokens": 0]
+        for (category, cost): (Any, Double) in [
+            (NSNull(), 0), ("cyber", 0), ("general_harms", 0),
+            ("bio", 0.2), ("frontier_llm", 0.2), ("reasoning_extraction", 0.2),
+        ] {
+            try check(
+                "refusal category " + String(describing: category), refusal, stop: "refusal",
+                metadata: ["stop_details": ["category": category], "content": []], tokens: 50_000, usd: cost)
+        }
+        try check("missing category", refusal, stop: "refusal", metadata: ["content": []], tokens: 50_000, usd: nil)
+        try check(
+            "missing content", refusal, stop: "refusal", metadata: ["stop_details": ["category": NSNull()]],
+            tokens: 50_000, usd: nil)
+        try check(
+            "partial refusal output", ["input_tokens": 50_000, "output_tokens": 10], model: opus, stop: "refusal",
+            metadata: ["stop_details": ["category": NSNull()], "content": []], tokens: 50_010, usd: 0.2002)
+        try check("ordinary zero output", refusal, tokens: 50_000, usd: 0.2)
     }
 
     private static func checkLockedCache(home: URL, calendar: Calendar, now: Date) throws {
@@ -186,6 +483,22 @@ struct ClaudeTokenChecks {
         try expect(warm, now: now, all: 8, month: 8, week: 8, today: 8)
         try expect(reader(), now: now, all: 8, month: 8, week: 8, today: 8)
         precondition(bytesRead == 0, "A temporary lock must not trigger another scan")
+
+        try FileManager.default.removeItem(at: cache)
+        try expect(warm, now: now, all: 8, month: 8, week: 8, today: 8)
+        precondition(bytesRead > 0)
+        bytesRead = 0
+        try expect(reader(), now: now, all: 8, month: 8, week: 8, today: 8)
+        precondition(bytesRead == 0, "A rebuilt primary cache must be available after restart")
+
+        let replacement = home.appendingPathComponent("replacement.sqlite")
+        _ = try ClaudeHistoryIndex(url: replacement)
+        precondition(rename(replacement.path, cache.path) == 0)
+        try expect(warm, now: now, all: 8, month: 8, week: 8, today: 8)
+        precondition(bytesRead > 0)
+        bytesRead = 0
+        try expect(reader(), now: now, all: 8, month: 8, week: 8, today: 8)
+        precondition(bytesRead == 0, "An atomically replaced index must be available after restart")
         precondition(!FileManager.default.fileExists(atPath: cache.appendingPathExtension("rebuilt").path))
     }
 
@@ -221,12 +534,21 @@ struct ClaudeTokenChecks {
         stats: Int64? = nil,
         line: UInt = #line
     ) throws {
+        let actual = try history.read(now: now)
         let expected = TokenTotals(
             allTime: all, month: month, week: week, yesterday: yesterday, today: today, partial: partial,
             hasRetainedUsage: retained,
-            claudeStatsLifetime: stats
+            claudeStatsLifetime: stats, spend: actual.spend,
+            peakDay: today > 0
+                ? TokenPeakDay(date: ISO8601DateFormatter().date(from: "2026-11-18T05:00:00Z")!, tokens: today) : nil
         )
-        let actual = try history.read(now: now)
+        // Legacy fixtures all use an unknown model. Stats-only totals have no priced request data.
+        for (period, tokens) in [
+            (actual.spend.allTime, all), (actual.spend.month, month), (actual.spend.week, week),
+            (actual.spend.yesterday, yesterday), (actual.spend.today, today),
+        ] {
+            precondition(!period.hasPricedUsage && period.usd == 0 && period.partial == (tokens > 0))
+        }
         precondition(actual == expected, "Line \(line), expected \(expected) and received \(actual)")
     }
 
@@ -239,12 +561,12 @@ struct ClaudeTokenChecks {
 
     private static func response(
         _ date: String, id: String, input: Int64 = 1, output: Int64, finished: Bool = true,
-        extraUsage: String = "{}", content: String = ""
+        model: String = "claude-model", extraUsage: String = "{}", content: String = ""
     ) -> String {
         let stop = finished ? "\"end_turn\"" : "null"
         let extra = extraUsage == "{}" ? "" : "," + extraUsage.dropFirst().dropLast()
         return
-            #"{"parentUuid":"parent","isSidechain":false,"message":{"id":"\#(id)","model":"claude-model","stop_reason":\#(stop),"content":"\#(content)","usage":{"input_tokens":\#(input),"output_tokens":\#(output)\#(extra)}},"type":"assistant","timestamp":"\#(date)"}"#
+            #"{"parentUuid":"parent","isSidechain":false,"message":{"id":"\#(id)","model":"\#(model)","stop_reason":\#(stop),"content":"\#(content)","usage":{"input_tokens":\#(input),"output_tokens":\#(output)\#(extra)}},"type":"assistant","timestamp":"\#(date)"}"#
     }
 
     private static func write(_ lines: [String], to url: URL) throws {
