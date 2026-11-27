@@ -144,6 +144,8 @@ struct QuotaDisplay {
 
     var restrictionUnconfirmed = false
     var menuBarLimits: MenuBarLimits = .fiveHour
+    /// Whether the menu bar shows only whole numbers, without names or percent signs.
+    var compactLimits = false
 
     var windows: [QuotaWindow] {
         (reading?.windows ?? []).sorted { ($0.minutes ?? Int.max) < ($1.minutes ?? Int.max) }
@@ -198,6 +200,20 @@ struct QuotaDisplay {
 
     var menuBarTitle: String {
         let shown = menuBarWindows
+        // The compact style shows whole numbers, shortest window first. Several limits keep a short window
+        // prefix, as in "5:97 7:29"; a single limit is just its number. When two different lengths would share a
+        // prefix, such as 5 hours and 5 days, every prefix keeps its unit ("5h:97 5d:29"). The accessibility
+        // title and the dropdown keep the names and exact values.
+        if compactLimits, !shown.isEmpty {
+            guard shown.count > 1 else { return wholePercentage(for: shown[0]) }
+            let lengths = Set(shown.map(\.minutes))
+            let keepsUnits = Set(shown.map(Self.compactName)).count < lengths.count
+            return shown.map { window in
+                let name = keepsUnits ? Self.shortName(window) : Self.compactName(window)
+                let percentage = wholePercentage(for: window)
+                return name.isEmpty ? percentage : name + ":" + percentage
+            }.joined(separator: " ")
+        }
         guard shown.count > 1 else { return shown.first.map(formattedPercentage) ?? title }
         return shown.map { Self.shortName($0) + " " + formattedPercentage(for: $0) }.joined(separator: " · ")
     }
@@ -238,6 +254,19 @@ struct QuotaDisplay {
         return Self.percent(percentage(for: window))
     }
 
+    /// A whole number without the percent sign that never rounds a partly used window to 0 or 100.
+    func wholePercentage(for window: QuotaWindow) -> String {
+        let value = percentage(for: window)
+        guard value.isFinite, abs(value) < 1e12 else {
+            return formattedPercentage(for: window).replacingOccurrences(of: "%", with: "")
+        }
+        let partlyUsed = window.used > 0 && window.used < 100
+        var whole = Int(value.rounded())
+        if partlyUsed { whole = min(99, max(1, whole)) }
+        if value > 100 { whole = max(101, whole) }
+        return String(whole)
+    }
+
     func percentage(for window: QuotaWindow) -> Double {
         percentageMode == .remaining ? window.remaining : window.used
     }
@@ -265,6 +294,11 @@ struct QuotaDisplay {
         if minutes % 1_440 == 0 { return "\(minutes / 1_440)d" }
         if minutes % 60 == 0 { return "\(minutes / 60)h" }
         return "\(minutes)m"
+    }
+
+    /// The window's length without its unit, such as "5" for 5 hours or "7" for 7 days.
+    static func compactName(_ window: QuotaWindow) -> String {
+        String(shortName(window).prefix { $0.isNumber })
     }
 
     static func percent(_ value: Double) -> String {

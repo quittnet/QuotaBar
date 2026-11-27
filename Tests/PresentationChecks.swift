@@ -72,12 +72,15 @@ enum PresentationChecks {
         precondition(sample([week]).accessibilityReading.contains("Codex read "))
         func shown(
             _ windows: [QuotaWindow], provider: UsageProvider = .claude, limits: MenuBarLimits = .fiveHour,
-            mode: PercentageMode = .remaining, failed: Bool = false
+            mode: PercentageMode = .remaining, failed: Bool = false, compact: Bool = false
         ) -> QuotaDisplay {
             QuotaDisplay(
                 reading: QuotaReading(fetchedAt: now, windows: windows), now: now, failed: failed, refreshing: false,
-                provider: provider, percentageMode: mode, menuBarLimits: limits)
+                provider: provider, percentageMode: mode, menuBarLimits: limits, compactLimits: compact)
         }
+        let unlabeled = QuotaWindow(minutes: nil, remaining: 27, resetsAt: now.addingTimeInterval(600))
+        let compactWithUnknownDuration = shown([session, unlabeled], provider: .codex, limits: .both, compact: true)
+        precondition(compactWithUnknownDuration.menuBarTitle == "5:42 27", compactWithUnknownDuration.menuBarTitle)
         // Either provider shows its 5-hour window by default, even when the weekly window is more used.
         let busyWeek = QuotaWindow(minutes: 10_080, remaining: 30, resetsAt: now.addingTimeInterval(600))
         for provider in UsageProvider.allCases {
@@ -97,6 +100,33 @@ enum PresentationChecks {
                 shown([busyWeek, session], provider: provider, limits: .both, mode: .used).menuBarTitle
                     == "5h 58% · 7d 70%")
             precondition(both.accessibilityTitle.contains("5-hour limit, 42% remaining · Weekly limit, 30% remaining"))
+            // By default three limits keep their names and exact values. The compact style shows only whole
+            // numbers, and a partly used window never reads 0 or 100.
+            let opus = QuotaWindow(minutes: 10_080, used: 0.3, resetsAt: now.addingTimeInterval(600))
+            let fine = QuotaWindow(minutes: 300, used: 41.6, resetsAt: now.addingTimeInterval(600))
+            let three = [busyWeek, opus, fine]
+            precondition(
+                shown(three, provider: provider, limits: .both).menuBarTitle == "5h 58.4% · 7d 30% · 7d 99.7%")
+            precondition(
+                shown(three, provider: provider, limits: .both, compact: true).menuBarTitle == "5:58 7:30 7:99")
+            precondition(
+                shown(three, provider: provider, limits: .both, mode: .used, compact: true).menuBarTitle
+                    == "5:42 7:70 7:1")
+            precondition(shown([busyWeek, session], provider: provider, compact: true).menuBarTitle == "42")
+            // Different lengths never share a compact label: 5 hours and 5 days keep their units.
+            let fiveDay = QuotaWindow(minutes: 7_200, remaining: 29, resetsAt: now.addingTimeInterval(600))
+            let fiveHourWindow = QuotaWindow(minutes: 300, remaining: 97, resetsAt: now.addingTimeInterval(600))
+            let sameDigit = shown([fiveDay, fiveHourWindow], provider: provider, limits: .both, compact: true)
+            precondition(sameDigit.menuBarTitle == "5h:97 5d:29", sameDigit.menuBarTitle)
+            precondition(
+                shown([fiveDay, fiveHourWindow, opus], provider: provider, limits: .both, compact: true).menuBarTitle
+                    == "5h:97 5d:29 7d:99")
+            precondition(
+                shown([busyWeek, session], provider: provider, limits: .both, failed: true, compact: true)
+                    .menuBarTitle == "–%")
+            precondition(
+                shown(three, provider: provider, limits: .both).accessibilityTitle.contains(
+                    "5-hour limit, 58.4% remaining"))
             precondition(
                 shown([busyWeek, session], provider: provider, limits: .both, failed: true).menuBarTitle == "–%")
             // Plans without a 5-hour window keep the most-used window and get no choice.

@@ -910,6 +910,12 @@ struct QuotaLogicChecks {
             launch().menuBarLimits == [.codex: .fiveHour, .claude: .both], "Each provider keeps its own choice.")
         launch().selectMenuBarLimits(.both, for: .codex)
         precondition(defaults.string(forKey: "codexMenuBarLimits") == "both" && launch().menuBarLimits[.codex] == .both)
+        precondition(!launch().compactMenuBarLimits, "The labeled style with exact values is the default.")
+        launch().setCompactMenuBarLimits(true)
+        precondition(defaults.bool(forKey: "compactMenuBarLimits") && launch().compactMenuBarLimits)
+        precondition(!launch().smallMenuBarText, "The menu bar's own text size is the default.")
+        launch().setSmallMenuBarText(true)
+        precondition(defaults.bool(forKey: "smallMenuBarText") && launch().smallMenuBarText)
         print("Menu bar limits settings persisted per provider across relaunch.")
     }
 

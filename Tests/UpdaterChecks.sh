@@ -121,7 +121,10 @@ wait_for() {
         # A missing window is expected while Sparkle prepares its UI. Both ui commands return errors explicitly.
         # shellcheck disable=SC2310
         window_text=$(ui read 2>/dev/null) || window_text=
-        if printf '%s\n' "${window_text}" | grep -Eiq "${expected}"; then return; fi
+        if printf '%s\n' "${window_text}" | grep -Eiq "${expected}"; then
+            matched_text=${window_text}
+            return
+        fi
         sleep 0.2
     done
     ui read
@@ -183,6 +186,6 @@ feed.write_text(feed.read_text().replace('Test Update', 'Tampered Update'))
 PYCODE
 launch_old invalid-feed 'Update Error'
 assert_installed_build 1
-window_text=$(ui read)
-if printf '%s\n' "${window_text}" | grep -q 'new version'; then exit 1; fi
+# Check the error window's text as it was matched: Sparkle may close or replace the window right after.
+if printf '%s\n' "${matched_text}" | grep -q 'new version'; then exit 1; fi
 printf 'Tampered signed feed rejected before offering an update.\n'

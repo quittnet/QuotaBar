@@ -557,6 +557,11 @@ struct ClaudeTokenChecks {
             ClaudeTokenHistory(home: home, cacheURL: cache, calendar: calendar, didReadBytes: { bytesRead += $0 })
         }
         try expect(reader(), now: now, all: 8, month: 8, week: 8, today: 8)
+        // Root can write a read-only file, so this stand-in failure needs an ordinary user.
+        guard geteuid() != 0 else {
+            try FileManager.default.removeItem(at: cache)
+            return
+        }
         // A read-only cache stands in for a full or failing disk. It must not be abandoned.
         precondition(chmod(cache.path, 0o400) == 0)
         let blocked = reader()

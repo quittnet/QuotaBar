@@ -15,6 +15,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsVisit: UInt64 = 0
     private(set) var detailsExpanded: Bool
     private var showTokenSpend: Bool
+    private(set) var compactMenuBarLimits: Bool
+    private(set) var smallMenuBarText: Bool
     private var dailyUsageMode: DailyUsageMode
     private var updaterObservation: AnyCancellable?
     private var badges: MenuBarBadges?
@@ -141,6 +143,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             })
         self.detailsExpanded = defaults.stringArray(forKey: "expandedDashboardSections")?.contains("details") == true
         self.showTokenSpend = defaults.bool(forKey: "showTokenSpend")
+        self.compactMenuBarLimits = defaults.bool(forKey: Self.compactMenuBarLimitsKey)
+        self.smallMenuBarText = defaults.bool(forKey: Self.smallMenuBarTextKey)
         self.dailyUsageMode = DailyUsageMode.saved(in: defaults)
         self.resets = resetStore ?? UsageResets()
         self.redeem = redeem
@@ -153,7 +157,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             reading: state.reading, now: quotaNow(), failed: state.failure != nil || state.needsVerification,
             refreshing: state.refreshing && networkAvailable != false, provider: source,
             percentageMode: percentageMode,
-            restrictionUnconfirmed: state.restrictionUnconfirmed, menuBarLimits: menuBarLimits[source] ?? .fiveHour)
+            restrictionUnconfirmed: state.restrictionUnconfirmed, menuBarLimits: menuBarLimits[source] ?? .fiveHour,
+            compactLimits: compactMenuBarLimits)
     }
 
     var display: QuotaDisplay { display(for: provider) }
@@ -283,6 +288,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menuBarLimits: menuBarLimits,
             fiveHourChoices: enabledProviders.filter { display(for: $0).offersFiveHourChoice },
             selectMenuBarLimits: { owner()?.selectMenuBarLimits($0, for: $1) },
+            compactLimits: compactMenuBarLimits, setCompactLimits: { owner()?.setCompactMenuBarLimits($0) },
+            smallText: smallMenuBarText, setSmallText: { owner()?.setSmallMenuBarText($0) },
             page: page, selectPage: { owner()?.selectPage($0) },
             detailsExpanded: detailsExpanded, setDetailsExpanded: { owner()?.setDetailsExpanded($0) },
             showSpend: showTokenSpend, setShowSpend: { owner()?.setShowSpend($0) },
@@ -540,6 +547,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     static func menuBarLimitsKey(_ source: UsageProvider) -> String { source.rawValue + "MenuBarLimits" }
 
+    static let compactMenuBarLimitsKey = "compactMenuBarLimits"
+
+    func setCompactMenuBarLimits(_ compact: Bool) {
+        guard compact != compactMenuBarLimits else { return }
+        compactMenuBarLimits = compact
+        defaults.set(compact, forKey: Self.compactMenuBarLimitsKey)
+        updateViews()
+    }
+
+    static let smallMenuBarTextKey = "smallMenuBarText"
+
+    func setSmallMenuBarText(_ small: Bool) {
+        guard small != smallMenuBarText else { return }
+        smallMenuBarText = small
+        defaults.set(small, forKey: Self.smallMenuBarTextKey)
+        updateViews()
+    }
+
     func selectMenuBarLimits(_ next: MenuBarLimits, for source: UsageProvider) {
         guard next != menuBarLimits[source] else { return }
         menuBarLimits[source] = next
@@ -636,7 +661,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func renderMenuBar(_ button: NSStatusBarButton) {
-        let font = button.font ?? NSFont.menuBarFont(ofSize: 0)
+        let standardFont = button.font ?? NSFont.menuBarFont(ofSize: 0)
+        // The small option draws the readings two points smaller, keeping equal-width digits so the item stays put.
+        let font =
+            smallMenuBarText
+            ? NSFont.monospacedDigitSystemFont(ofSize: standardFont.pointSize - 2, weight: .regular) : standardFont
         func title(_ value: QuotaDisplay) -> String {
             if modeFeedbackTimer != nil && value.hasCurrentPercentage {
                 return value.menuBarTitle + (percentageMode == .remaining ? " left" : " used")
@@ -705,7 +734,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 title =
                     text == MenuBarBadges.loadingDots
                     ? MenuBarBadges.label(text, font: font, color: .labelColor, loadingPhase: phase)
-                    : NSAttributedString(string: text)
+                    : smallMenuBarText
+                        ? NSAttributedString(string: text, attributes: [.font: font]) : NSAttributedString(string: text)
             }
             if !button.attributedTitle.isEqual(to: title) { button.attributedTitle = title }
         }

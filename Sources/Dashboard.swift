@@ -77,6 +77,10 @@ struct Dashboard: View {
     /// Providers whose latest report includes a 5-hour window alongside another limit.
     var fiveHourChoices: [UsageProvider] = []
     var selectMenuBarLimits: (@MainActor @Sendable (MenuBarLimits, UsageProvider) -> Void)? = nil
+    var compactLimits = false
+    var setCompactLimits: (@MainActor @Sendable (Bool) -> Void)? = nil
+    var smallText = false
+    var setSmallText: (@MainActor @Sendable (Bool) -> Void)? = nil
     let page: Page
     let selectPage: @MainActor @Sendable (Page) -> Void
     let detailsExpanded: Bool
@@ -207,8 +211,13 @@ struct Dashboard: View {
 
             Divider().padding(.top, 12)
             if detailsExpanded {
-                detailsDisclosure.padding(.top, 12)
-                details.padding(.top, 8)
+                // The provider switch shares the Details row, directly above the Tokens/Spend switch.
+                HStack(spacing: 8) {
+                    detailsDisclosure
+                    detailsProviderPicker
+                }
+                .padding(.top, 12)
+                details.padding(.top, 4)
             }
         }
         .padding([.top, .horizontal], 17)
@@ -310,16 +319,28 @@ struct Dashboard: View {
         }
     }
 
+    @ViewBuilder private var detailsProviderPicker: some View {
+        if providerSelection == .both {
+            DetailsProviderPicker(provider: Binding(get: { display.provider }, set: selectProvider))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(width: DetailsSwitch.width)
+                .disabled(resetPhase == .submitting)
+                .help(
+                    menuLayout.showsBoth
+                        ? "Choose which provider’s details to view" : "Choose the provider shown in the menu bar")
+        }
+    }
+
     private var details: some View {
         VStack(alignment: .leading, spacing: 9) {
-            if providerSelection == .both {
-                DetailsProviderPicker(provider: Binding(get: { display.provider }, set: selectProvider))
-                    .fixedSize()
-                    .disabled(resetPhase == .submitting)
-                    .help(
-                        menuLayout.showsBoth
-                            ? "Choose which provider’s details to view" : "Choose the provider shown in the menu bar")
-            }
+            // Token history comes first so its Tokens/Spend switch sits right under the provider switch.
+            TokenHistoryHeader(provider: display.provider, showSpend: Binding(get: { showSpend }, set: setShowSpend))
+            tokenSection
+                .help(
+                    showSpend
+                        ? "Estimated USD at standard API token rates for local \(display.provider.name) history. Excludes subscription charges and tool fees."
+                        : "Includes input, output and cached tokens recorded in local \(display.provider.name) history. Day boundaries use your Mac’s time zone."
+                )
 
             if display.stale || display.restrictionMessage != nil, !display.windows.isEmpty {
                 Text(display.stale ? "Last reported limits" : "Reported quota windows").font(.headline)
@@ -339,22 +360,30 @@ struct Dashboard: View {
                 .fixedSize(horizontal: false, vertical: true)
             }
 
-            if isPresented && display.provider == .codex
-                && (display.reading?.resetCredits != nil || resetPhase != .ready || resetNotice != nil
-                    || resetBalanceUnconfirmed || canReviewReset)
-            {
-                Text("Usage resets").font(.headline).accessibilityAddTraits(.isHeader)
+            if showsResetArea {
+                Divider().padding(.top, 2)
+                // The usual Use Reset button shares the heading's row to keep the section short.
+                HStack(spacing: 8) {
+                    Text("Usage resets").font(.headline).accessibilityAddTraits(.isHeader)
+                    Spacer(minLength: 0)
+                    if let resetCountText {
+                        Text(resetCountText).font(.callout).foregroundStyle(.secondary)
+                            .help("Available Codex usage resets")
+                    }
+                    if showsUseResetButton {
+                        Button("Use Reset", action: prepareReset).disabled(!canUseReset).controlSize(.small)
+                    }
+                }
                 resetSection
             }
-
-            TokenHistoryHeader(provider: display.provider, showSpend: Binding(get: { showSpend }, set: setShowSpend))
-            tokenSection
-                .help(
-                    showSpend
-                        ? "Estimated USD at standard API token rates for local \(display.provider.name) history. Excludes subscription charges and tool fees."
-                        : "Includes input, output and cached tokens recorded in local \(display.provider.name) history. Day boundaries use your Mac’s time zone."
-                )
         }
+    }
+
+    /// Whether the Codex Usage resets section shows in Details.
+    private var showsResetArea: Bool {
+        isPresented && display.provider == .codex
+            && (display.reading?.resetCredits != nil || resetPhase != .ready || resetNotice != nil
+                || resetBalanceUnconfirmed || canReviewReset)
     }
 
     var footerControls: some View {
@@ -540,6 +569,24 @@ struct Dashboard: View {
                     }
                 }
             }
+            if let setCompactLimits {
+                Toggle(isOn: Binding(get: { compactLimits }, set: setCompactLimits)) {
+                    Text("Compact Numbers").frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .toggleStyle(.switch)
+                .help(
+                    "Show whole numbers in the menu bar, like 42 5:97 7:29, with short window labels and no percent signs."
+                )
+                .accessibilityIdentifier("settings-compact-limits")
+            }
+            if let setSmallText {
+                Toggle(isOn: Binding(get: { smallText }, set: setSmallText)) {
+                    Text("Small Menu Bar Text").frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .toggleStyle(.switch)
+                .help("Draw the menu bar readings in a smaller font.")
+                .accessibilityIdentifier("settings-small-menu-bar-text")
+            }
             settingsChoice("Show Percentage As", compact: compact) {
                 Picker(
                     "Show Percentage As", selection: Binding(get: { display.percentageMode }, set: selectPercentageMode)
@@ -641,6 +688,22 @@ struct Dashboard: View {
         .help(status)
     }
 
+    /// The available reset count shown on the Usage resets heading row, when the balance is current.
+    private var resetCountText: String? {
+        guard resetPhase != .confirming, !resetBalanceUnconfirmed, !display.stale,
+            let credits = display.reading?.resetCredits
+        else { return nil }
+        return "\(credits.availableCount(at: display.now)) available"
+    }
+
+    /// Whether the ordinary Use Reset button shows, beside the Usage resets heading.
+    private var showsUseResetButton: Bool {
+        guard resetPhase != .confirming, resetPhase != .submitting, resetPhase != .uncertain,
+            let credits = display.reading?.resetCredits
+        else { return false }
+        return credits.canClaim(at: display.now)
+    }
+
     private var resetSection: some View {
         VStack(alignment: .leading, spacing: 7) {
             if resetPhase == .confirming {
@@ -664,15 +727,11 @@ struct Dashboard: View {
                     Text("Waiting for Codex to confirm the reset balance.").font(.callout).foregroundStyle(.secondary)
                 } else if display.stale && display.reading?.resetCredits != nil {
                     Text("Refresh to check your reset balance.").font(.callout).foregroundStyle(.secondary)
-                } else if let credits = display.reading?.resetCredits {
-                    let count = credits.availableCount(at: display.now)
-                    let nextExpiry = credits.nextExpiration(at: display.now)
-                    let expiry = nextExpiry?.formatted(.dateTime.month(.abbreviated).day())
-                    Text(expiry.map { "\(count) available · Next known expiry \($0)" } ?? "\(count) available")
+                } else if let nextExpiry = display.reading?.resetCredits?.nextExpiration(at: display.now) {
+                    // The count sits beside Use Reset on the heading row; the expiry gets its own line.
+                    Text("Next known expiry " + nextExpiry.formatted(.dateTime.month(.abbreviated).day()))
                         .font(.callout).foregroundStyle(.secondary)
-                        .help(
-                            nextExpiry.map { "Expires " + $0.formatted(date: .long, time: .shortened) }
-                                ?? "Available Codex usage resets")
+                        .help("Expires " + nextExpiry.formatted(date: .long, time: .shortened))
                 }
                 if let resetNotice {
                     Text(resetNotice).font(.callout).foregroundStyle(.secondary)
@@ -687,8 +746,6 @@ struct Dashboard: View {
                     ProgressView().controlSize(.small).accessibilityLabel("Using reset")
                 } else if resetPhase == .uncertain {
                     Button("Retry Same Reset…", action: prepareReset).disabled(!canUseReset)
-                } else if let credits = display.reading?.resetCredits, credits.canClaim(at: display.now) {
-                    Button("Use Reset", action: prepareReset).disabled(!canUseReset)
                 }
             }
         }
@@ -857,6 +914,7 @@ private struct DetailsProviderPicker: NSViewRepresentable {
             labels: UsageProvider.allCases.map(\.name), trackingMode: .selectOne,
             target: context.coordinator, action: #selector(Coordinator.changed(_:)))
         control.segmentStyle = .rounded
+        control.segmentDistribution = .fillEqually
         control.setAccessibilityLabel("Details provider")
         control.setAccessibilityIdentifier("details-provider-picker")
         return control
@@ -906,6 +964,11 @@ private struct HistoryMetricPicker: NSViewRepresentable {
     }
 }
 
+/// The provider and Tokens/Spend switches stack in Details, so they share one width and line up as a column.
+enum DetailsSwitch {
+    static let width: CGFloat = 136
+}
+
 struct TokenHistoryHeader: View {
     let provider: UsageProvider
     @Binding var showSpend: Bool
@@ -916,7 +979,8 @@ struct TokenHistoryHeader: View {
                 .font(.headline).accessibilityAddTraits(.isHeader)
             Spacer()
             HistoryMetricPicker(provider: provider, showSpend: $showSpend)
-                .fixedSize()
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(width: DetailsSwitch.width)
                 .help("Choose token counts or estimated spend at standard API rates.")
         }
     }

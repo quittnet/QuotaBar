@@ -50,18 +50,9 @@ struct ClaudeUsageChecks {
             defer { isolated.removePersistentDomain(forName: suite) }
             do {
                 let reading = try ClaudeUsageClient.read(defaults: isolated)
-                let now = Date()
-                guard let peak = reading.windows.map(\.used).max() else { throw ClaudeUsageClient.Failure.unavailable }
-                for mode in PercentageMode.allCases {
-                    let display = QuotaDisplay(
-                        reading: reading, now: now, failed: false, refreshing: false,
-                        provider: .claude, percentageMode: mode)
-                    let expected = mode == .used ? peak : max(0, 100 - peak)
-                    let suffix = mode == .used ? " used" : " remaining"
-                    guard display.hasCurrentPercentage, let window = display.limitingWindow,
-                        display.percentage(for: window) == expected, display.title != "–%",
-                        display.accessibilityTitle.contains(display.title + suffix)
-                    else { throw ClaudeUsageClient.Failure.unavailable }
+                guard checkPercentageModes(reading, now: Date()) else {
+                    print("Claude live usage read succeeded, but the percentage display check failed.")
+                    exit(1)
                 }
                 print("Claude live usage read and both percentage modes passed.")
             } catch {
@@ -102,10 +93,26 @@ struct ClaudeUsageChecks {
                 Data(idleSession.replacingOccurrences(of: "null", with: #""bad-date""#).utf8), now: now)
         }
         let expiredSession =
-            #"{"rate_limits_available":true,"rate_limits":{"five_hour":{"utilization":100,"resets_at":"2020-01-01T00:00:00Z"},"seven_day":{"utilization":1,"resets_at":"2027-01-22T10:00:00Z"}}}"#
+            #"{"rate_limits_available":true,"rate_limits":{"five_hour":{"utilization":100,"resets_at":"2027-01-15T08:00:00Z"},"seven_day":{"utilization":1,"resets_at":"2027-01-22T10:00:00Z"}}}"#
+        // A period that has ended is dropped; the next report brings the new period.
         let currentWeek = try ClaudeUsageClient.parse(Data(expiredSession.utf8), now: now)
         precondition(currentWeek.windows.map(\.minutes) == [10_080])
-        precondition(currentWeek.windows.first?.remaining == 99)
+        precondition(currentWeek.windows.map(\.remaining) == [99])
+        let expiredWeek =
+            #"{"rate_limits_available":true,"rate_limits":{"five_hour":{"utilization":10,"resets_at":null},"seven_day":{"utilization":100,"resets_at":"2027-01-15T08:00:00Z"}}}"#
+        let staleWeek = try ClaudeUsageClient.parse(Data(expiredWeek.utf8), now: now)
+        precondition(staleWeek.windows.map(\.minutes) == [300])
+        for session in ["", #""five_hour":null,"#] {
+            let weeklyOnly = """
+                {"rate_limits_available":true,"rate_limits":{
+                \(session)"seven_day":{"utilization":1,"resets_at":null}}}
+                """
+            let reading = try ClaudeUsageClient.parse(Data(weeklyOnly.utf8), now: now)
+            precondition(reading.windows.map(\.minutes) == [10_080])
+            precondition(checkPercentageModes(reading, now: now))
+        }
+        precondition(
+            checkPercentageModes(currentWeek, now: now), "Weekly usage can exceed the menu bar's five-hour usage")
         for minutes in [300, 10_080] {
             let key = minutes == 300 ? "five_hour" : "seven_day"
             for used in [0.0, 0.2, 42.0, 100.0] {
@@ -195,6 +202,22 @@ struct ClaudeUsageChecks {
         print(
             "Claude control checks passed: no conversation turns, exact aggregate windows, malformed data rejection, unsupported protocol, bounded output, EOF, and timeout cleanup."
         )
+    }
+
+    private static func checkPercentageModes(_ reading: QuotaReading, now: Date) -> Bool {
+        guard let peak = reading.windows.map(\.used).max() else { return false }
+        for mode in PercentageMode.allCases {
+            let display = QuotaDisplay(
+                reading: reading, now: now, failed: false, refreshing: false,
+                provider: .claude, percentageMode: mode)
+            let expected = mode == .used ? peak : max(0, 100 - peak)
+            let suffix = mode == .used ? " used" : " remaining"
+            guard display.hasCurrentPercentage, let window = display.limitingWindow,
+                display.percentage(for: window) == expected, display.title != "–%",
+                display.accessibilityTitle.contains(display.menuBarTitle + suffix)
+            else { return false }
+        }
+        return true
     }
 
     private static func checkNPMCLI(provider: String) throws {

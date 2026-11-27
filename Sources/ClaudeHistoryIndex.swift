@@ -23,6 +23,7 @@ final class ClaudeHistoryIndex {
     }
 
     private let database: OpaquePointer
+    private let isTemporary: Bool
     private var insertSample: OpaquePointer?
     private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
@@ -40,6 +41,7 @@ final class ClaudeHistoryIndex {
             throw Failure(code: code)
         }
         database = connection
+        isTemporary = url == nil
         // Keys are fixed-size hashes and checkpoints are small. Reject corrupt oversized fields inside SQLite.
         sqlite3_limit(database, SQLITE_LIMIT_LENGTH, 128 * 1024)
         try check(sqlite3_busy_timeout(database, 5_000))
@@ -81,7 +83,8 @@ final class ClaudeHistoryIndex {
         sqlite3_close(database)
     }
 
-    var needsReopening: Bool { PrivateFile.databaseNeedsReopening(database) }
+    // A temporary database has no cache file of its own that could be moved or replaced.
+    var needsReopening: Bool { !isTemporary && PrivateFile.databaseNeedsReopening(database) }
 
     func transaction<T>(_ operation: () throws -> T) throws -> T {
         try execute("BEGIN IMMEDIATE")

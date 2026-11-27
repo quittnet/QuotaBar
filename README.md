@@ -7,7 +7,7 @@
 
 **Install on Apple Silicon Macs running macOS 14 or later.** Download **QuotaBar-macOS.zip**, unzip it, move **QuotaBar.app** to Applications, and try opening it once. That first attempt makes the approval option appear if Gatekeeper blocks the app. [Download the latest public Mac build](https://github.com/quittnet/QuotaBar/releases/latest)
 
-**QuotaBar 1.9.2 (43)** matches the Tokens/Spend switch in **Details** to the provider switch and flags history totals as partial when a response could fall on either side of a day, week or month boundary. Choose Tokens, Spend, Both, or Off in **Settings → Daily usage**. To update, open **Settings → Check for Updates…**. To check your installed version in Finder, select QuotaBar.app and press ⌘I.
+**QuotaBar 1.9.3 (44)** adds an optional compact menu bar: turn on **Settings → Compact Numbers** to show only whole numbers, like 42 5:97 7:29, with short window labels and no percent signs. **Settings → Small Menu Bar Text** draws the readings in a smaller font. Both are off by default. In **Details**, the Codex and Claude switch now shares the Details row, so the dropdown is shorter. To update, open **Settings → Check for Updates…**. To check your installed version in Finder, select QuotaBar.app and press ⌘I.
 
 The downloadable app uses an ad hoc signature and hasn’t been notarized by Apple. If the alert says the app **will damage your computer**, stop and follow Apple’s guidance. [Apple’s guide to opening Mac apps safely](https://support.apple.com/en-us/102445)
 
